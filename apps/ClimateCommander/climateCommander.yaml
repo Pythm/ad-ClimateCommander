@@ -51,9 +51,12 @@ klimakontroll:
         - start: '10:00:00'
           stop: '14:00:00'
           presence: 
-            - person.camilla
-            - person.anders
-      
+            - person.wife
+            - person.myself
+      daytime_increasing:
+        - start: '05:00:00'
+          stop: '07:00:00'
+
       # Other temperature configurations
       hvac_fan_only_above: 23 # Fan Only and Screening/cover auto close above value. Default: 24
       hvac_cooling_above: 30 # Kjøling over gitt innetemperatur. Ingen automatikk, kun notify... Default: 28
@@ -67,7 +70,7 @@ klimakontroll:
           lux_close: 40000 # Close cover if temperatures is above target and lux is above
           lux_trigger_open: 7000 # Open cover again when lux goes below
           not_when_home: # Only close cover automatically if persons are not at home
-            - person.camilla
+            - person.wife
         - screen: cover.stue_screen_vindu
           lux_close: 25000
           lux_open: 7000
@@ -90,15 +93,15 @@ klimakontroll:
 
       # Notifications for when temperatures is low and window is open, or hot and windows are closed
       notify_reciever:
-        - mobile_app_heibos_telefon
-      notify_title: 'Varmepumpe Stue'
-      notify_message_cold: 'Vindu eller verandadør er åpen og temperaturen er '
-      notify_message_warm: 'Det er varmt i stua. Vinduene er lukket og temperaturen er '
+        - mobile_app_your_phone
+      notify_title: 'Heatpump'
+      notify_message_cold: 'It\'s getting cold inside and window is open. Temperature is '
+      notify_message_warm: 'It\'s getting hot inside and temperature is '
       hvac_notify_above: 26 # Sends you a notification to open a window if indoor temperature exceeds. Defaults to 28
 
       # Add another AC/Heatpump
-    - climate: climate.daikin_nathaniel
-      indoor_temp: sensor.nath_multisensor_seng_air_temperature
+    - climate: climate.daikin_two
+      indoor_temp: sensor.air_temperature
       target_indoor_temp: 23.6
       temperatures:
         - out: -3
@@ -122,24 +125,7 @@ klimakontroll:
         - out: 18
           normal: 16
           away: 14
-      windowsensors:
-        - binary_sensor.sov_vindu_window_door_is_open # Soverom vindu
-        - binary_sensor.sov_takvindu_anders_window_door_is_open # Soverom Takvindu Anders
-        - binary_sensor.sov_takvindu_camilla_window_door_is_open # Soverom Takvindu Camilla
-        - binary_sensor.nath_vindu_window_door_is_open # Soverom Vindu Nathaniel
-      daytime_savings:
-        - start: '09:00:00'
-          stop: '14:00:00'
-          presence: 
-            - person.nathaniel
 
       hvac_fan_only_above: 24.3
       hvac_cooling_above: 30
       hvac_cooling_temp: 22
-
-      notify_reciever:
-        - mobile_app_heibos_telefon
-      notify_title: 'Varmepumpe Nathaniels rom'
-      notify_message_cold: 'Vindu på Nathaniels rom er åpent og temperaturen er '
-      notify_message_warm: 'Det er varmt på Nathaniels rom. Vinduene er lukket og temperaturen er '
-      hvac_notify_above: 26
