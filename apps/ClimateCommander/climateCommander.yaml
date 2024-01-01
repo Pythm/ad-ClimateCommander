@@ -1,0 +1,145 @@
+klimakontroll:
+  module: climateCommander
+  class: Climate
+  log: info_log
+  MQTT_namespace: mqtt
+  away_state: input_boolean.vekk_reist_ac # HA Vacation switch
+  outside_temperature: sensor.netatmo_ute_temperature
+  rain_sensor: sensor.netatmo_regnsensor_rain
+  anemometer: sensor.netatmo_anemometer_wind_strength
+  anemometer_speed: 20 # Increases temperature inside when anemometer exceeds this amount
+  OutLuxMQTT: zigbee2mqtt/OutdoorHueLux
+    # Airconditions
+  airconditions:
+    - climate: climate.daikin_stue
+      indoor_temp: sensor.stue_temperature # External indoor temperature sensor
+      target_indoor_temp: 22.7 # Target for external indoor temperature. Optional. Default value 23
+      temperatures: # List of outdoor temperatures with dictionary normal and away temperatures
+        - out: -10   # First out temperature will also be set if temperature falls below this, but also including up to next. I set first temperature based on how low I feel condident the ac will keep house warm with normal temperature, for easy inputting more data if temperature falls even further
+          normal: 25 # Normal temperature for app to adjust from. 
+          away: 17   # Temperature to set when on holliday
+        - out: -3
+          normal: 24
+          away: 17
+        - out: 1
+          normal: 23
+          away: 16
+        - out: 4
+          normal: 22
+          away: 16
+        - out: 6
+          normal: 21
+          away: 16
+        - out: 9
+          normal: 20
+          away: 15
+        - out: 16
+          normal: 19
+          away: 15
+        - out: 18
+          normal: 16
+          away: 15
+      # Optional additional settings:
+      windowsensors: # Will set fan_only when window is opened for more than 120 seconds
+        - binary_sensor.stue_vindu_window_door_is_open # Stuevindu
+        - binary_sensor.stue_verandadoor_window_door_is_open # Veranda dør
+        - binary_sensor.tvstue_vindu1_window_door_is_open # TV Stue Vindu 1
+        - binary_sensor.tvstue_vindu2_window_door_is_open # TV Stue Vindu 2
+
+      # Power savings option. Reduce temp by 1 degree. IF statement with Appdaemon API inherited as ADapi.
+      daytime_savings:
+        - start: '10:00:00'
+          stop: '14:00:00'
+          presence: 
+            - person.camilla
+            - person.anders
+      
+      # Other temperature configurations
+      hvac_fan_only_above: 23 # Fan Only and Screening/cover auto close above value. Default: 24
+      hvac_cooling_above: 30 # Kjøling over gitt innetemperatur. Ingen automatikk, kun notify... Default: 28
+      hvac_cooling_temp: 22 # AC temperatur ved kjøling. Default: 22
+      screening_temp: 12 # Outside temperature needs to be over this to automatically close screen
+      # Cover your windows if indoor temperature and outdoor lux gets above target to stop the sun from heating even more
+      screening:
+        - screen: cover.stue_screen_veranda
+          windowsensors: # If a window needs to be closed in order for the cover to open/close
+          - binary_sensor.stue_verandadoor_window_door_is_open
+          lux_close: 40000 # Close cover if temperatures is above target and lux is above
+          lux_trigger_open: 7000 # Open cover again when lux goes below
+          not_when_home: # Only close cover automatically if persons are not at home
+            - person.camilla
+        - screen: cover.stue_screen_vindu
+          lux_close: 25000
+          lux_open: 7000
+          lux_open_media: 2000 # Will keep cover closed until lux goes below this if one of the mediaplayers is on
+          mediaplayers:
+          - switch.sony_vlp_hw65
+          - media_player.samsung_q6_series_82
+          - media_player.samsung_s95ba_55_tv
+        - screen: cover.tvstue_screen
+          windowsensors:
+          - binary_sensor.tvstue_vindu1_window_door_is_open # TV Stue Vindu 1
+          - binary_sensor.tvstue_vindu2_window_door_is_open # TV Stue Vindu 2
+          lux_close: 25000
+          lux_open: 7000
+          lux_open_media: 200
+          mediaplayers:
+          - switch.sony_vlp_hw65
+          - media_player.samsung_q6_series_82
+          - media_player.samsung_s95ba_55_tv
+
+      # Notifications for when temperatures is low and window is open, or hot and windows are closed
+      notify_reciever:
+        - mobile_app_heibos_telefon
+      notify_title: 'Varmepumpe Stue'
+      notify_message_cold: 'Vindu eller verandadør er åpen og temperaturen er '
+      notify_message_warm: 'Det er varmt i stua. Vinduene er lukket og temperaturen er '
+      hvac_notify_above: 26 # Sends you a notification to open a window if indoor temperature exceeds. Defaults to 28
+
+      # Add another AC/Heatpump
+    - climate: climate.daikin_nathaniel
+      indoor_temp: sensor.nath_multisensor_seng_air_temperature
+      target_indoor_temp: 23.6
+      temperatures:
+        - out: -3
+          normal: 24
+          away: 17
+        - out: -2
+          normal: 23
+          away: 16
+        - out: 0
+          normal: 22
+          away: 15
+        - out: 11
+          normal: 21
+          away: 14
+        - out: 12
+          normal: 20
+          away: 14
+        - out: 16
+          normal: 18
+          away: 14
+        - out: 18
+          normal: 16
+          away: 14
+      windowsensors:
+        - binary_sensor.sov_vindu_window_door_is_open # Soverom vindu
+        - binary_sensor.sov_takvindu_anders_window_door_is_open # Soverom Takvindu Anders
+        - binary_sensor.sov_takvindu_camilla_window_door_is_open # Soverom Takvindu Camilla
+        - binary_sensor.nath_vindu_window_door_is_open # Soverom Vindu Nathaniel
+      daytime_savings:
+        - start: '09:00:00'
+          stop: '14:00:00'
+          presence: 
+            - person.nathaniel
+
+      hvac_fan_only_above: 24.3
+      hvac_cooling_above: 30
+      hvac_cooling_temp: 22
+
+      notify_reciever:
+        - mobile_app_heibos_telefon
+      notify_title: 'Varmepumpe Nathaniels rom'
+      notify_message_cold: 'Vindu på Nathaniels rom er åpent og temperaturen er '
+      notify_message_warm: 'Det er varmt på Nathaniels rom. Vinduene er lukket og temperaturen er '
+      hvac_notify_above: 26
