@@ -127,9 +127,9 @@ class Climate(hass.Hass):
             self.mqtt.mqtt_subscribe(out_lux_sensor)
             self.mqtt.listen_event(self.out_lux_event_MQTT2, "MQTT_MESSAGE", topic = out_lux_sensor, namespace = MQTT_namespace)
 
-            # Configuration of airconditions
+            # Configuration of items to command
         self.airconditions:list = []
-        climate = self.args.get('airconditions')
+        climate = self.args.get('Command')
         for ac in climate :
             aircondition = Aircondition(self,
                 ac = ac['climate'],

@@ -10,7 +10,7 @@ klimakontroll:
   anemometer_speed: 20 # Increases temperature inside when anemometer exceeds this amount
   OutLuxMQTT: zigbee2mqtt/OutdoorHueLux
     # Airconditions
-  airconditions:
+  Command:
     - climate: climate.daikin_stue
       indoor_temp: sensor.stue_temperature # External indoor temperature sensor
       target_indoor_temp: 22.7 # Target for external indoor temperature. Optional. Default value 23
