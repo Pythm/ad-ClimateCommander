@@ -177,8 +177,8 @@ nameyourClimateCommander:
 
 ```
 
-key | optional | type | default | version | description
--- | -- | -- | -- | --
+key | optional | type | default | introduced in | description
+-- | -- | -- | -- | -- | --
 `module` | False | string | | v1.0.0 | The module name of the app.
 `class` | False | string | | v1.0.0 | The name of the Class.
 `Command` | False | string | | v1.0.0 | The entity_id of the climate.
