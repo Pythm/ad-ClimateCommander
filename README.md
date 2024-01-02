@@ -177,7 +177,7 @@ nameyourClimateCommander:
 
 ```
 
-key | optional | type | default | version introduced | description
+key | optional | type | default | version | description
 -- | -- | -- | -- | --
 `module` | False | string | | v1.0.0 | The module name of the app.
 `class` | False | string | | v1.0.0 | The name of the Class.
