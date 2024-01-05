@@ -7,7 +7,7 @@ klimakontroll:
   outside_temperature: sensor.netatmo_ute_temperature
   rain_sensor: sensor.netatmo_regnsensor_rain
   anemometer: sensor.netatmo_anemometer_wind_strength
-  anemometer_speed: 20 # Increases temperature inside when anemometer exceeds this amount
+  anemometer_speed: 20 # Increases temperature inside when anemometer exceeds this amount. Will also open screens/covers
   OutLuxMQTT: zigbee2mqtt/OutdoorHueLux
     # Airconditions
   Command:
@@ -39,57 +39,39 @@ klimakontroll:
         - out: 18
           normal: 16
           away: 15
-      # Optional additional settings:
       windowsensors: # Will set fan_only when window is opened for more than 120 seconds
-        - binary_sensor.stue_vindu_window_door_is_open # Stuevindu
-        - binary_sensor.stue_verandadoor_window_door_is_open # Veranda dør
-        - binary_sensor.tvstue_vindu1_window_door_is_open # TV Stue Vindu 1
-        - binary_sensor.tvstue_vindu2_window_door_is_open # TV Stue Vindu 2
+        - binary_sensor.window_door_is_open
 
-      # Power savings option. Reduce temp by 1 degree. IF statement with Appdaemon API inherited as ADapi.
+      # Power savings option. Reduce temp by 1 degree. Only if presence is away
       daytime_savings:
         - start: '10:00:00'
           stop: '14:00:00'
           presence: 
             - person.wife
             - person.myself
+       # Increase temp by 1 degree at.
       daytime_increasing:
         - start: '05:00:00'
           stop: '07:00:00'
 
-      # Other temperature configurations
+      # Other temperature configurations reacting to indoor temperature sensor
       hvac_fan_only_above: 23 # Fan Only and Screening/cover auto close above value. Default: 24
-      hvac_cooling_above: 30 # Kjøling over gitt innetemperatur. Ingen automatikk, kun notify... Default: 28
-      hvac_cooling_temp: 22 # AC temperatur ved kjøling. Default: 22
+      hvac_cooling_above: 30 # Cooling above
+      hvac_cooling_temp: 22 # AC temperature when cooling
       screening_temp: 12 # Outside temperature needs to be over this to automatically close screen
       # Cover your windows if indoor temperature and outdoor lux gets above target to stop the sun from heating even more
       screening:
-        - screen: cover.stue_screen_veranda
-          windowsensors: # If a window needs to be closed in order for the cover to open/close
-          - binary_sensor.stue_verandadoor_window_door_is_open
+        - screen: cover.your_screen
+          windowsensors: # If screen is on a window/door that can be opened it will not autoclose when sensor is 'on'
+          - binary_sensor.window_door_is_open
           lux_close: 40000 # Close cover if temperatures is above target and lux is above
-          lux_trigger_open: 7000 # Open cover again when lux goes below
+          lux_open: 7000 # Open cover again when lux goes below
+          lux_open_media: 2000 # Optional lux setting if one of the mediaplayers is on
           not_when_home: # Only close cover automatically if persons are not at home
             - person.wife
-        - screen: cover.stue_screen_vindu
-          lux_close: 25000
-          lux_open: 7000
-          lux_open_media: 2000 # Will keep cover closed until lux goes below this if one of the mediaplayers is on
           mediaplayers:
-          - switch.sony_vlp_hw65
-          - media_player.samsung_q6_series_82
-          - media_player.samsung_s95ba_55_tv
-        - screen: cover.tvstue_screen
-          windowsensors:
-          - binary_sensor.tvstue_vindu1_window_door_is_open # TV Stue Vindu 1
-          - binary_sensor.tvstue_vindu2_window_door_is_open # TV Stue Vindu 2
-          lux_close: 25000
-          lux_open: 7000
-          lux_open_media: 200
-          mediaplayers:
-          - switch.sony_vlp_hw65
-          - media_player.samsung_q6_series_82
-          - media_player.samsung_s95ba_55_tv
+          - switch.projector
+          - media_player.your_tv
 
       # Notifications for when temperatures is low and window is open, or hot and windows are closed
       notify_reciever:
@@ -97,7 +79,7 @@ klimakontroll:
       notify_title: 'Heatpump'
       notify_message_cold: 'It\'s getting cold inside and window is open. Temperature is '
       notify_message_warm: 'It\'s getting hot inside and temperature is '
-      hvac_notify_above: 26 # Sends you a notification to open a window if indoor temperature exceeds. Defaults to 28
+      notify_above: 26 # Sends you a notification to open a window if indoor temperature exceeds. Defaults to 28
 
       # Add another AC/Heatpump
     - climate: climate.daikin_two
@@ -125,7 +107,3 @@ klimakontroll:
         - out: 18
           normal: 16
           away: 14
-
-      hvac_fan_only_above: 24.3
-      hvac_cooling_above: 30
-      hvac_cooling_temp: 22

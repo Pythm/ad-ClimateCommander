@@ -23,7 +23,7 @@ class Climate(hass.Hass):
 
     def initialize(self):
 
-        self.mqtt = self.get_plugin_api("MQTT")
+        self.mqtt = None
 
         # Namespaces for HASS and MQTT
         HASS_namespace = self.args.get('HASS_namespace', 'default')
@@ -47,7 +47,6 @@ class Climate(hass.Hass):
         self.outside_temperature = self.args.get('outside_temperature', None)
         self.backup_temp_handler = None
         self.rain_sensor = self.args.get('rain_sensor', None)
-        self.rain_level = self.args.get('rain_level',3)
         self.anemometer = self.args.get('anemometer', None)
         self.anemometer_speed = self.args.get('anemometer_speed',40)
 
@@ -115,6 +114,8 @@ class Climate(hass.Hass):
             lux_sensor = self.args['OutLux_sensor']
             self.listen_state(self.out_lux_state, lux_sensor, namespace = HASS_namespace)
         if 'OutLuxMQTT' in self.args :
+            if not self.mqtt :
+                self.mqtt = self.get_plugin_api("MQTT")
             out_lux_sensor = self.args['OutLuxMQTT']
             self.mqtt.mqtt_subscribe(out_lux_sensor)
             self.mqtt.listen_event(self.out_lux_event_MQTT, "MQTT_MESSAGE", topic = out_lux_sensor, namespace = MQTT_namespace)
@@ -123,6 +124,8 @@ class Climate(hass.Hass):
             lux_sensor = self.args['OutLux_sensor_2']
             self.listen_state(self.out_lux_state2, lux_sensor, namespace = HASS_namespace)
         if 'OutLuxMQTT_2' in self.args :
+            if not self.mqtt :
+                self.mqtt = self.get_plugin_api("MQTT")
             out_lux_sensor = self.args['OutLuxMQTT_2']
             self.mqtt.mqtt_subscribe(out_lux_sensor)
             self.mqtt.listen_event(self.out_lux_event_MQTT2, "MQTT_MESSAGE", topic = out_lux_sensor, namespace = MQTT_namespace)
@@ -143,14 +146,15 @@ class Climate(hass.Hass):
                 away_state = ac.get('away_state', self.away_state),
                 screens = ac.get('screening', {}),
                 screening_temp = ac.get('screening_temp', 8),
+                hvac_enabled = ac.get('hvac_enabled', True),
                 hvac_fan_only_above = ac.get('hvac_fan_only_above', 24),
-                hvac_notify_above = ac.get('hvac_notify_above', 28),
+                notify_above = ac.get('notify_above', 28),
                 hvac_cooling_above = ac.get('hvac_cooling_above', 28),
                 hvac_cooling_temp = ac.get('hvac_cooling_temp', 22),
                 notify_reciever = ac.get('notify_reciever', None),
-                notify_title = ac.get('notify_title', 'Window'),
-                notify_message_cold = ac.get('notify_message_cold', 'It\'s getting cold inside and window is open. Temperature is '),
-                notify_message_warm = self.args.get('notify_message_warm', 'It\'s getting hot inside and temperature is '))
+                notify_title = ac.get('notify_title', 'ClimateCommander'),
+                notify_message_cold = ac.get('notify_message_cold', 'It\'s getting cold inside and window is open. Temperature is'),
+                notify_message_warm = self.args.get('notify_message_warm', 'It\'s getting hot inside and temperature is'))
             self.airconditions.append(aircondition)
 
 
@@ -278,14 +282,15 @@ class Aircondition():
             away_state = None,
             screens = {},
             screening_temp = 8,
+            hvac_enabled = True,
             hvac_fan_only_above = 24,
-            hvac_notify_above = 28,
+            notify_above = 28,
             hvac_cooling_above = 28,
             hvac_cooling_temp = 22,
             notify_reciever = None,
             notify_title = 'Window',
-            notify_message_cold = 'window opened and temperature is ',
-            notify_message_warm = 'Its hot inside. Temperature is '):
+            notify_message_cold,
+            notify_message_warm):
 
         self.ADapi = api
         self.notify_app = Notify_Mobiles(api)
@@ -326,8 +331,9 @@ class Aircondition():
             self.screening.append(screen)
         self.screening_temp = screening_temp
 
+        self.hvac_enabled = hvac_enabled
         self.hvac_fan_only_above = hvac_fan_only_above
-        self.hvac_notify_above = hvac_notify_above
+        self.notify_above = notify_above
         self.hvac_cooling_above = hvac_cooling_above
         self.hvac_cooling_temp = hvac_cooling_temp
 
@@ -398,21 +404,26 @@ class Aircondition():
 
             # Windows
             if self.windows_is_open :
-                try :
-                    self.ADapi.call_service('climate/set_hvac_mode', entity_id = self.ac, hvac_mode = 'fan_only')
-                except Exception as e:
-                    self.ADapi.log(f"Not able to set hvac_mode to fan_only for {self.ac}. Probably not supported. {e}", level = 'DEBUG')
+                if self.hvac_enabled :
+                    try :
+                        self.ADapi.call_service('climate/set_hvac_mode', entity_id = self.ac, hvac_mode = 'fan_only')
+                    except Exception as e:
+                        self.ADapi.log(f"Not able to set hvac_mode to fan_only for {self.ac}. Probably not supported. {e}", level = 'DEBUG')
+                else :
+                    new_temperature = target_temp['away']
+                    if current_temp != new_temperature :
+                        self.ADapi.call_service('climate/set_temperature', entity_id = self.ac, temperature = new_temperature)
                 if self.notify_reciever :
                     self.notify_on_window_closed = True
                     if self.notify_on_window_open and in_temp < target_temp['normal'] :
-                        self.notify_app.send_notification(f"{self.notify_message_cold}{in_temp}" ,self.notify_title, self.notify_reciever )
+                        self.notify_app.send_notification(f"{self.notify_message_cold} {in_temp}" ,self.notify_title, self.notify_reciever )
                         self.notify_on_window_open = False
                 return
             elif self.windowsensors :
                 if self.notify_reciever :
                     self.notify_on_window_open = True
-                    if self.notify_on_window_closed and in_temp > self.hvac_notify_above :
-                        self.notify_app.send_notification(f"{self.notify_message_warm}{in_temp}" ,self.notify_title, self.notify_reciever )
+                    if self.notify_on_window_closed and in_temp > self.notify_above :
+                        self.notify_app.send_notification(f"{self.notify_message_warm} {in_temp}" ,self.notify_title, self.notify_reciever )
                         self.notify_on_window_closed = False
 
             # Holliday temperature
@@ -422,7 +433,7 @@ class Aircondition():
                     if OUT_TEMP > self.screening_temp :
                         for s in self.screening :
                             s.try_screen_close()
-                    if in_temp > self.hvac_fan_only_above :
+                    if in_temp > self.hvac_fan_only_above and self.hvac_enabled :
                         try :
                             self.ADapi.call_service('climate/set_hvac_mode', entity_id = self.ac, hvac_mode = 'fan_only')
                         except Exception as e:
@@ -466,6 +477,7 @@ class Aircondition():
                                 doDaytimeSaving = False
                 if doDaytimeSaving and new_temperature >= target_temp['normal'] :
                     new_temperature -= 1
+                    in_temp += 1
 
                 # Daytime Increasing temperature
                 doDaytimeIncreasing = False
@@ -474,9 +486,10 @@ class Aircondition():
                         if self.ADapi.now_is_between(daytime['start'], daytime['stop']) :
                             doDaytimeIncreasing = True
                             if 'presence' in daytime :
+                                doDaytimeIncreasing = False
                                 for presence in daytime['presence'] :
-                                    if self.ADapi.get_state(presence) != 'home' :
-                                        doDaytimeIncreasing = False
+                                    if self.ADapi.get_state(presence) == 'home' :
+                                        doDaytimeIncreasing = True
 
                 if doDaytimeIncreasing :
                     new_temperature = target_temp['normal'] + 1
@@ -497,7 +510,7 @@ class Aircondition():
                     if OUT_TEMP > self.screening_temp :
                         for s in self.screening :
                             s.try_screen_close()
-                    if in_temp > self.hvac_fan_only_above :
+                    if in_temp > self.hvac_fan_only_above and self.hvac_enabled :
                         if in_temp > self.hvac_cooling_above :
                             try :
                                 self.ADapi.call_service('climate/set_hvac_mode', entity_id = self.ac, hvac_mode = 'cool')
@@ -562,7 +575,7 @@ class Aircondition():
 
             elif self.windows_is_open and self.notify_on_window_open and in_temp < 20 :
                 if self.notify_reciever :
-                    self.notify_app.send_notification(f"{self.notify_message_cold}{in_temp}" ,self.notify_title, self.notify_reciever )
+                    self.notify_app.send_notification(f"{self.notify_message_cold} {in_temp}" ,self.notify_title, self.notify_reciever )
                     self.notify_on_window_open = False
 
             if in_temp > float(self.target_indoor_temp) :
@@ -655,9 +668,11 @@ class Screen():
         global OUT_LUX
         if self.windowsopened() == 0 and self.position != 100:
             openme = False
-            if RAIN_AMOUNT > 0 or WIND_AMOUNT > self.anemometer_speed or OUT_LUX < self.lux_open :
+            if RAIN_AMOUNT > 0 or WIND_AMOUNT > self.anemometer_speed :
                 openme = True
-            if self.ADapi.get_state(self.screen, attribute='current_position') == self.position and OUT_LUX <= 100 :
+            if self.ADapi.get_state(self.screen, attribute='current_position') != self.position and OUT_LUX <= 100 :
+                openme = True
+            elif self.ADapi.get_state(self.screen, attribute='current_position') == self.position and OUT_LUX < self.lux_open :
                 openme = True
             if openme :
                 self.ADapi.call_service('cover/open_cover', entity_id= self.screen)
