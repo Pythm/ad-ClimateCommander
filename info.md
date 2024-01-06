@@ -3,6 +3,8 @@ an Appdaemon app for controlling `climate` entities in [Home Assistant](https://
 
 This is developed in Norway where we mostly need heating. App will only adjust temperature when heating, but there is some functionality to automatically set to `fan_only` or `cool` in addition to automatically close screens when it is hot and sunny.
 
+![Picture is generated with AI](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
+
 ## Installation
 Download the `ClimateCommander` directory from inside the `apps` directory to your [Appdaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory, then add configuration to a .yaml or .toml file to enable the `climateCommander` module. Minimum required in your configuration is:
 ```yaml
@@ -245,3 +247,52 @@ nameyourClimateCommander:
           away: 14
 
 ```
+
+### Key definitions for defining app
+key | optional | type | default | introduced in | description
+-- | -- | -- | -- | -- | --
+`module` | False | string | | v1.0.0 | The module name of the app.
+`class` | False | string | | v1.0.0 | The name of the Class.
+`HASS_namespace` | True | string | default | v1.0.0 | HASS namespace
+`MQTT_namespace` | True | string | default | v1.0.0 | MQTT namespace
+`away_state` | True | input_boolean | input_boolean.vacation | v1.0.0 | Sets Vacation temperature
+`outside_temperature` | True | sensor | | v1.0.0 | Sensor for outside temperature
+`anemometer` | True | sensor | | v1.0.0 | Sensor for wind speed
+`anemometer_speed` | True | int | 40 | v1.0.0 | windy target
+`rain_sensor` | True | sensor | | v1.0.0 | Sensor for rain detection
+`OutLux_sensor` | True | sensor | | v1.0.0 | Sensor for Lux detection
+`OutLuxMQTT` | True | MQTT sensor | | v1.0.0 | Lux detection via MQTT
+`OutLux_sensor_2` | True | sensor | | v1.0.0 | Secondary Sensor for Lux detection
+`OutLuxMQTT_2` | True | MQTT sensor | | v1.0.0 | Secondary Lux detection via MQTT
+
+### Key definitions for defining climates
+key | optional | type | default | introduced in | description
+-- | -- | -- | -- | -- | --
+`Command` | False | list | | v1.0.0 | Contains climates
+`climate` | False | climate entity | | v1.0.0 | The entity_id of the climate
+`indoor_temp` | False | sensor | | v1.0.0 | External indoor temperature sensor
+`target_indoor_temp` | True | int | 23 | v1.0.0 | Indoor target temperature and Screening/cover auto close
+`temperatures` | False | list | | v1.0.0 | List of outdoor temperatures with dictionary normal and away temperatures
+`windowsensors` | True | list | | v1.0.0 | Will set fan_only when window is opened for more than 2 minutes
+`daytime_savings` | True | dictionary | | v1.0.0 | Contains start / stop and optionally presence to lower temperature
+`daytime_increasing` | True | dictionary | | v1.0.0 | Contains start / stop and optionally presence to increase temperature
+`hvac_fan_only_above` | True | int | 24 | v1.0.0 | Fan Only above value
+`hvac_cooling_above` | True | int | 28 | v1.0.0 | Cooling above
+`hvac_cooling_temp` | True | int | 22 | v1.0.0 | AC temperature when cooling
+`notify_reciever` | True | list | | v1.0.0 | Notify recipients
+`notify_title` | True | string | 'Heatpump' | v1.0.0 | Title
+`notify_message_cold` | True | string | 'It\'s getting cold inside and window is open. Temperature is' | v1.0.0 | Message
+`notify_message_warm` | True | string | 'It\'s getting hot inside and temperature is' | v1.0.0 | Message
+`notify_above` | True | int | 28 | v1.0.0 | Sends you a notification to open a window if indoor temperature exceeds
+
+### Key definitions for defining screens 
+key | optional | type | default | introduced in | description
+-- | -- | -- | -- | -- | --
+`screening_temp` | True | int | 8 | v1.0.0 | Outside temperature needs to be over this to automatically close screen
+`screening` | True | dictionary | | v1.0.0 | Contains a list of cover entities to control
+`windowsensors` | True | list | | v1.0.0 | If screen is on a window/door that can be opened it will not autoclose when sensor is 'on'
+`lux_close` | True | int | 40000 | v1.0.0 | Close cover if temperatures is above target and lux is above
+`lux_open` | True | int | 15000 | v1.0.0 | Open cover when lux goes below
+`lux_open_media` | True | int | 4000 | v1.0.0 | Optional lux open setting if one of the mediaplayers is on
+`not_when_home` | True | list | | v1.0.0 | Only close cover automatically if persons are not at home
+`mediaplayers` | True | list | | v1.0.0 | list of switches/media to use alternative lux open value

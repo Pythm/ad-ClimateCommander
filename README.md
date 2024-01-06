@@ -3,6 +3,8 @@ an Appdaemon app for controlling `climate` entities in [Home Assistant](https://
 
 This is developed in Norway where we mostly need heating. App will only adjust temperature when heating, but there is some functionality to automatically set to `fan_only` or `cool` in addition to automatically close screens when it is hot and sunny.
 
+![Picture is generated with AI](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
+
 ## Installation
 Download the `ClimateCommander` directory from inside the `apps` directory to your [Appdaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory, then add configuration to a .yaml or .toml file to enable the `climateCommander` module. Minimum required in your configuration is:
 ```yaml
