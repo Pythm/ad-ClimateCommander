@@ -289,8 +289,8 @@ class Aircondition():
             hvac_cooling_temp = 22,
             notify_reciever = None,
             notify_title = 'Window',
-            notify_message_cold,
-            notify_message_warm):
+            notify_message_cold = '',
+            notify_message_warm = ''):
 
         self.ADapi = api
         self.notify_app = Notify_Mobiles(api)
