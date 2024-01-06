@@ -3,9 +3,6 @@ an Appdaemon app for controlling `climate` entities in [Home Assistant](https://
 
 This is developed in Norway where we mostly need heating. App will only adjust temperature when heating, but there is some functionality to automatically set to `fan_only` or `cool` in addition to automatically close screens when it is hot and sunny.
 
-> [!NOTE]
-> Readme is under construction. Check back later for more info in setting up the app.
-
 ## Installation
 Download the `ClimateCommander` directory from inside the `apps` directory to your [Appdaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory, then add configuration to a .yaml or .toml file to enable the `climateCommander` module. Minimum required in your configuration is:
 ```yaml
@@ -36,14 +33,14 @@ Climates will adjust +/- 2 degrees from temperature defined in normal. App will 
 ### Outdoor weather sensors climate reacts to
 If you do not have an outdoor temperature sensor the app will try to get temperature from [Met.no](https://www.home-assistant.io/integrations/met) integration.
 
-If you have a drafty house you can use an anemometer to increase the indoor set temperature when it is windy. Define your sensor with `anemometer` and your target with `anemometer_speed`. Anemometer is a Home Assistant sensor.
+You can use an anemometer to increase the indoor set temperature when it is windy. Define your sensor with `anemometer` and your target with `anemometer_speed`. Anemometer is a Home Assistant sensor. It will also open any screens defined if wind is above target.
 
 Outdoor `Lux` and `Rain` sensors are only needed if you also want to control [cover](https://www.home-assistant.io/integrations/cover/) entities like screens or blinds for your windows. You can configure two outdoor lux sensors with the second ending with '_2' and it will keep the highest lux or last if other is not updated last 15 minutes. Both Lux sensors can be either MQTT or Home Assistant sensor. Rain sensor is a Home Assistant sensor.
 
 ```yaml
   outside_temperature: sensor.netatmo_out_temperature
   anemometer: sensor.netatmo_anemometer_wind_strength
-  anemometer_speed: 20 # Increases temperature inside when anemometer exceeds this amount
+  anemometer_speed: 40
   rain_sensor: sensor.netatmo_rain
   OutLux_sensor: sensor.lux_sensor
   OutLuxMQTT_2: zigbee2mqtt/OutdoorHueLux
@@ -59,13 +56,14 @@ You can define an Home Assistant input_boolean helper to lower the temperature w
 > If you have defined a namespace for MQTT other than default you need to define your namespace with `MQTT_namespace`. Same for HASS you need to define your namespace with `HASS_namespace`.
 
 ### Temperature settings for climate
+Define a external indoor temperature sensor with `indoor_temp` and set `target_indoor_temp` for external indoor temperature. Any Screening/cover will auto open above set temperature
 
 ```yaml
-      indoor_temp: sensor.yourIndoorTemperatureSensor # External indoor temperature sensor
-      target_indoor_temp: 22.7 # Target for external indoor temperature and Screening/cover will auto open above temperature
+      indoor_temp: sensor.yourIndoorTemperatureSensor
+      target_indoor_temp: 23
 ```
 
-As mentioned earlier defining a proper temperature scale will improve the climate automation. You define the climate working temperature based on outdoor temperature. The array will be built like this, with a `normal` operations temperature and an `away` temperature based on `out` temperature. Here the climate will heat with 24 degrees up until 1 degree.
+As mentioned earlier defining a proper temperature scale will improve the climate automation. You define the climate working temperature based on outdoor temperature. The array will be built like this, with a `normal` operations temperature and an `away` temperature based on `out` temperature. In this example the climate will heat with 24 degrees up until 1 degree.
 ```yaml
       temperatures:
         - out: -10
@@ -88,15 +86,15 @@ Climates will adjust up until +/- 2 degrees from temperature defined in `normal`
           presence: 
             - person.wife
             - person.myself
-       # Increase temp by 1 degree at.
       daytime_increasing:
         - start: '05:00:00'
           stop: '07:00:00'
 ```
 
-There are different temperatures to define behaviour. `hvac_fan_only_above` will change aircondition to `fan_only` when the external indoor temperature sensor is above value. `hvac_cooling_above` is also dependant on the indoor sensor and will activate `cool` on Aircondition and set temperature defined with `hvac_cooling_temp`. In addition you can configure a minimum outdoor temperature for when the screens will auto close with `screening_temp`.
+There are different temperatures to define behaviour. `hvac_fan_only_above` will change aircondition to `fan_only` when the external indoor temperature sensor is above value. `hvac_cooling_above` is also dependant on the indoor sensor and will activate `cool` on Aircondition and set temperature defined with `hvac_cooling_temp`. In addition you configure a minimum outdoor temperature for when the screens will auto close with `screening_temp`.
 
-If you have a heater that does not have HVAC capabilities `fan_only` and `cool` you can define `hvac_enabled` to False in climate.
+> [!NOTE]
+> If you have a heater that does not have HVAC capabilities `fan_only` and `cool`, you can define `hvac_enabled` to False in climate.
 
 ### Windowsensors
 You can add window/door sensors to turn your HVAC to `fan_only` if any is opened for more than 2 minutes. If you have `hvac_enabled` defined to False heater will set temperature to away temperature.
@@ -107,7 +105,7 @@ Each screen has a lux close and lux open value for automatically closing/opening
 You can prevent covers from closing when a person/tracker is home using a list with `not_when_home`.
 
 > [!TIP]
-> If you adjust your screen manually app will not open cover until outdoor lux is below 100
+> If you adjust your screen manually app will not open cover until outdoor lux is below 100. Rain/wind will allways open covers
 
 ```yaml
       screening:
@@ -125,7 +123,7 @@ You can prevent covers from closing when a person/tracker is home using a list w
 ```
 
 ### Set up notifications
-You can get notifications for when inside temperatures is low and window is open, or if it is hot and windows are closed. It sends notifications thru [Notify integration](https://www.home-assistant.io/integrations/notify/). You can use 'all' or a list with recipients.
+You can get notifications for when inside temperatures is low and window is open, or if it is hot and windows are closed. It sends notifications with [Notify integration](https://www.home-assistant.io/integrations/notify/). You can use 'all' or a list with recipients.
 
 ```yaml
       notify_reciever:
@@ -137,7 +135,7 @@ You can get notifications for when inside temperatures is low and window is open
 ```
 
 # Get started
-Easisest to start off with is to copy this example and update with your sensors and climate entities and build from that. There is a lot of list/dictionaries that needs to be correctly indented.
+Easisest to start off with, is to copy this example and update with your sensors and climate entities, and then add more if needed. There is a lot of list/dictionaries that needs to be correctly indented.
 
 ## Putting it all together in an app
 ```yaml
