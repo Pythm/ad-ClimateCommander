@@ -213,7 +213,7 @@ nameyourClimateCommander:
       # Notifications for when temperatures is low and window is open, or hot and windows are closed
       notify_reciever:
         - mobile_app_your_phone
-      notify_title: 'Heatpump'
+      notify_title: 'ClimateCommander'
       notify_message_cold: 'It\'s getting cold inside and window is open. Temperature is'
       notify_message_warm: 'It\'s getting hot inside and temperature is'
       notify_above: 28 # Sends you a notification to open a window if indoor temperature exceeds
@@ -276,13 +276,14 @@ key | optional | type | default | introduced in | description
 `windowsensors` | True | list | | v1.0.0 | Will set fan_only when window is opened for more than 2 minutes
 `daytime_savings` | True | dictionary | | v1.0.0 | Contains start / stop and optionally presence to lower temperature
 `daytime_increasing` | True | dictionary | | v1.0.0 | Contains start / stop and optionally presence to increase temperature
+`hvac_enabled` | True | bool | True | v1.0.1 | Set to false to disable HVAC possibilities for heating only
 `hvac_fan_only_above` | True | int | 24 | v1.0.0 | Fan Only above value
 `hvac_cooling_above` | True | int | 28 | v1.0.0 | Cooling above
 `hvac_cooling_temp` | True | int | 22 | v1.0.0 | AC temperature when cooling
 `notify_reciever` | True | list | | v1.0.0 | Notify recipients
-`notify_title` | True | string | 'Heatpump' | v1.0.0 | Title
-`notify_message_cold` | True | string | 'It\'s getting cold inside and window is open. Temperature is' | v1.0.0 | Message
-`notify_message_warm` | True | string | 'It\'s getting hot inside and temperature is' | v1.0.0 | Message
+`notify_title` | True | string | ClimateCommander | v1.0.0 | Title
+`notify_message_cold` | True | string | It's getting cold inside and window is open. Temperature is | v1.0.0 | Message
+`notify_message_warm` | True | string | It's getting hot inside and temperature is | v1.0.0 | Message
 `notify_above` | True | int | 28 | v1.0.0 | Sends you a notification to open a window if indoor temperature exceeds
 
 ### Key definitions for defining screens 
