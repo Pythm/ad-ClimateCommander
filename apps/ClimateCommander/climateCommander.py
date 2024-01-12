@@ -1,10 +1,15 @@
 """ CLimate Control by Pythm
     Control your Airconditions / Heat pump based on outside temperature and your Screening covers based on inside temperature and lux sensors
 
+    v1.0.1:
+    ## Whats new:
+    - Refined logic in raising/lowering temperature from normal
+    - Cleaning up
+
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import hassapi as hass
 import datetime
@@ -23,9 +28,9 @@ class Climate(hass.Hass):
 
     def initialize(self):
 
-        self.mqtt = None
+        self.mqtt = None # Only initialize MQTT if needed
 
-        # Namespaces for HASS and MQTT
+            # Namespaces for HASS and MQTT
         HASS_namespace = self.args.get('HASS_namespace', 'default')
         MQTT_namespace = self.args.get('MQTT_namespace', 'default')
     
@@ -39,10 +44,10 @@ class Climate(hass.Hass):
             else :
                 self.log("'away_state' not configured. Using 'input_boolean.vacation' as default away state", level = 'WARNING')
 
+            # Weather sensors
         global RAIN_AMOUNT
         global WIND_AMOUNT
 
-            # Weather sensors
         self.weather_temperature = None
         self.outside_temperature = self.args.get('outside_temperature', None)
         self.backup_temp_handler = None
@@ -50,7 +55,7 @@ class Climate(hass.Hass):
         self.anemometer = self.args.get('anemometer', None)
         self.anemometer_speed = self.args.get('anemometer_speed',40)
 
-            # Outside temperatures
+            # Setup Outside temperatures
         sensor_states = self.get_state(entity='weather')
         for sensor_id, sensor_states in sensor_states.items():
             if 'weather.' in sensor_id :
@@ -81,7 +86,7 @@ class Climate(hass.Hass):
             except Exception as e:
                 self.log(f"Was not able to convert {self.weather_temperature} to a number: {self.get_state(entity_id = self.weather_temperature, attribute = 'temperature')}. {e}", level = 'WARNING')
 
-            # Rain sensor
+            # Setup Rain sensor
         if self.rain_sensor :
             self.listen_state(self.rainSensorUpdated, self.rain_sensor)
             try :
@@ -92,7 +97,7 @@ class Climate(hass.Hass):
             except Exception as e:
                 self.log(f"Rain sensor not valid. {e}", level = 'WARNING')
                 RAIN_AMOUNT = 0.0
-            # Wind sensor
+            # Setup Wind sensor
         if self.anemometer :
             self.listen_state(self.anemometerUpdated, self.anemometer)
             try :
@@ -104,7 +109,7 @@ class Climate(hass.Hass):
                 self.log(f"Anemometer sensor not valid. {e}", level = 'WARNING')
                 WIND_AMOUNT = 0.0
 
-            # Lux sensors
+            # Setup Lux sensors
         self.outLux1:float = 0.0
         self.outLux2:float = 0.0
         self.lux_last_update1 = self.datetime(aware=True) - datetime.timedelta(minutes = 20) # Helpers for last updated when two outdoor lux sensors in use
@@ -158,6 +163,7 @@ class Climate(hass.Hass):
             self.airconditions.append(aircondition)
 
 
+        # Set proper value when weather sensors is updated
     def outsideTemperatureUpdated(self, entity, attribute, old, new, kwargs):
         global OUT_TEMP
         try :
@@ -177,7 +183,6 @@ class Climate(hass.Hass):
                 except Exception as exc :
                     self.log(f"Could not stop {self.backup_temp_handler}", level = 'DEBUG')
                 self.backup_temp_handler = None
-
 
     def outsideBackupTemperatureUpdated(self, entity, attribute, old, new, kwargs):
         global OUT_TEMP
@@ -218,7 +223,7 @@ class Climate(hass.Hass):
             self.log(f"Anemometer sensor not valid. {e}", level = 'WARNING')
 
 
-        # Lux / weather
+        # LUX sensors
     def out_lux_state(self, entity, attribute, old, new, kwargs):
         if self.outLux1 != float(new) :
             self.outLux1 = float(new)
@@ -269,6 +274,8 @@ class Climate(hass.Hass):
 
 
 class Aircondition():
+    """ Class to control room temperature with climate entity and weather/temperature sensors
+    """
 
     def __init__(self, api,
             ac = None,
@@ -293,11 +300,15 @@ class Aircondition():
             notify_message_warm = ''):
 
         self.ADapi = api
-        self.notify_app = Notify_Mobiles(api)
 
+            # Climate entity and if it supports HVAC or only Heating
         self.ac = ac
+        self.hvac_enabled = hvac_enabled
+
+            # Sensors
         self.indoor_temp = indoor_temp
         self.target_indoor_temp = target_indoor_temp
+        self.ac_temp_last_changed = self.ADapi.datetime(aware=True) - datetime.timedelta(hours = 2)
 
         self.window_last_opened = self.ADapi.datetime(aware=True) - datetime.timedelta(hours = 2)
         self.windowsensors = windowsensors
@@ -331,12 +342,14 @@ class Aircondition():
             self.screening.append(screen)
         self.screening_temp = screening_temp
 
-        self.hvac_enabled = hvac_enabled
+            # Target temperatures to change hvac mode
         self.hvac_fan_only_above = hvac_fan_only_above
-        self.notify_above = notify_above
         self.hvac_cooling_above = hvac_cooling_above
         self.hvac_cooling_temp = hvac_cooling_temp
 
+            # Notfification setup
+        self.notify_app = Notify_Mobiles(api)
+        self.notify_above = notify_above
         self.notify_reciever = notify_reciever
         self.notify_title = notify_title
         self.notify_message_cold = notify_message_cold
@@ -345,8 +358,10 @@ class Aircondition():
         self.notify_on_window_open = True
         self.notify_on_window_closed = True
 
+            # Dictionary with temperatures
         self.temperatures = temperatures
 
+            # Setup runtimes
         runtime = datetime.datetime.now()
         addseconds = (round((runtime.minute*60 + runtime.second)/720)+1)*720
         runtime = runtime.replace(minute=0, second=10, microsecond=0) + datetime.timedelta(seconds=addseconds)
@@ -354,6 +369,7 @@ class Aircondition():
         self.ADapi.run_in(self.set_indoortemp, 20)
 
 
+        # Helper function to find correct dictionary element in temperatures
     def find_target_temperatures(self):
         global OUT_TEMP
         target_num = 0
@@ -364,30 +380,32 @@ class Aircondition():
                 return target_num
         return target_num
 
+        # Sets climate temperature based on sensors provided
     def set_indoortemp(self, kwargs):
         global OUT_TEMP
-
         global RAIN_AMOUNT
         global WIND_AMOUNT
+
         in_temp:float = 0.0
-        current_temp:float = 0.0
+        heater_temp:float = 0.0
         ac_state = 'heat'
 
         try :
             in_temp = float(self.ADapi.get_state(self.indoor_temp))
-        except (ValueError, TypeError) :
+        except (ValueError, TypeError) as ve :
             in_temp = self.target_indoor_temp - 0.2
+            self.ADapi.log(f"Not able to set new inside temperature from {self.indoor_temp}. {ve}", level = 'INFO') ###
         except Exception as e:
             in_temp = self.target_indoor_temp
             self.ADapi.log(f"Not able to set new inside temperature from {self.indoor_temp}. {e}", level = 'WARNING')
             
         try :
-            current_temp = float(self.ADapi.get_state(self.ac, attribute='temperature'))
+            heater_temp = float(self.ADapi.get_state(self.ac, attribute='temperature'))
         except (ValueError, TypeError) :
-            current_temp = in_temp
+            heater_temp = in_temp
             ac_state = self.ADapi.get_state(self.ac)
         except Exception as e:
-            current_temp = in_temp
+            heater_temp = in_temp
             self.ADapi.log(f"Not able to set new inside temperature from {self.ac}. {e}", level = 'WARNING')
         else :
             ac_state = self.ADapi.get_state(self.ac)
@@ -411,8 +429,9 @@ class Aircondition():
                         self.ADapi.log(f"Not able to set hvac_mode to fan_only for {self.ac}. Probably not supported. {e}", level = 'DEBUG')
                 else :
                     new_temperature = target_temp['away']
-                    if current_temp != new_temperature :
+                    if heater_temp != new_temperature :
                         self.ADapi.call_service('climate/set_temperature', entity_id = self.ac, temperature = new_temperature)
+                        self.ac_temp_last_changed = self.ADapi.datetime(aware=True)
                 if self.notify_reciever :
                     self.notify_on_window_closed = True
                     if self.notify_on_window_open and in_temp < target_temp['normal'] :
@@ -446,19 +465,20 @@ class Aircondition():
                     self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} New indoor temp set to {in_temp} because wind is {WIND_AMOUNT}") ###
 
                 # Check if windows has been closed for over an hour and it is colder than target
-                if self.ADapi.datetime(aware=True) - self.window_last_opened > datetime.timedelta(hours = 1) :
-                    if in_temp < self.target_indoor_temp -0.5 :
-                        if current_temp == target_temp['normal'] :
-                            new_temperature += 1
-                        else :
-                            new_temperature = current_temp
+                if self.ADapi.datetime(aware=True) - self.window_last_opened > datetime.timedelta(hours = 1) and in_temp < self.target_indoor_temp -0.2 :
+                    if in_temp < self.target_indoor_temp -0.5 and heater_temp == target_temp['normal'] :
+                        self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} It's cold. {in_temp} < {self.target_indoor_temp -0.5}", level = 'INFO') ###
+                        new_temperature += 1
+                    elif heater_temp < target_temp['normal'] :
+                        new_temperature = target_temp['normal']
+                        self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} It's cold. Set temp was below normal target?", level = 'INFO') ###
+                    elif self.ADapi.datetime(aware=True) - self.ac_temp_last_changed > datetime.timedelta(minutes = 40) and in_temp < self.target_indoor_temp -0.6 :
+                        new_temperature += 2
+                        # Logging to inform that the set target is not able to maintain the wanted indoor temperature. 
+                        self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} Increased temp by 2 from normal: {target_temp['normal']}. Indoor temp is {round(in_temp - self.target_indoor_temp,1)} below target. Outdoor temperature is {OUT_TEMP}", level = 'INFO')
+                    elif heater_temp == target_temp['normal'] +1 :
+                        new_temperature += 1
 
-                            if current_temp == target_temp['normal'] +1 and  in_temp < self.target_indoor_temp -0.6 :
-                                new_temperature += 1
-                                # Logging to inform that the set target is not able to maintain the wanted indoor temperature. 
-                                self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} Increased temp by 2 from normal: {target_temp['normal']}. Indoor temp is {round(in_temp - self.target_indoor_temp,1)} below target. Outdoor temperature is {OUT_TEMP}", level = 'INFO')
-
-        
                 # Daytime Savings
                 doDaytimeSaving = False
                 for daytime in self.daytime_savings :
@@ -477,7 +497,7 @@ class Aircondition():
                                 doDaytimeSaving = False
                 if doDaytimeSaving and new_temperature >= target_temp['normal'] :
                     new_temperature -= 1
-                    in_temp += 1
+                    in_temp += 0.4
 
                 # Daytime Increasing temperature
                 doDaytimeIncreasing = False
@@ -493,20 +513,25 @@ class Aircondition():
 
                 if doDaytimeIncreasing :
                     new_temperature = target_temp['normal'] + 1
-                    in_temp -= 1
+                    in_temp -= 0.4
 
                 # Check if it is hot inside
                 if in_temp > self.target_indoor_temp :
                     if new_temperature >= target_temp['normal'] -1 :
-                        if current_temp == target_temp['normal'] :
+                        self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} It's hot. {in_temp} < {self.target_indoor_temp}", level = 'INFO') ###
+                        if heater_temp == target_temp['normal'] :
                             new_temperature -= 1
-                        else :
-                            new_temperature = current_temp
-                            if current_temp == target_temp['normal'] -1 and in_temp > self.target_indoor_temp + 0.3 :
-                                new_temperature -= 1
-                                if OUT_TEMP < 15 : # Or fireplace temp?
-                                    # Logging to inform that the indoor temperature is above set target.
-                                    self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} Redusing temp by -2 from normal: {target_temp['normal']}. Indoor temp is {round(in_temp - self.target_indoor_temp,1)} above target. Outdoor temperature is {OUT_TEMP}", level = 'INFO')
+                        elif heater_temp > target_temp['normal'] :
+                            new_temperature = target_temp['normal']
+                            self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} It's hot. Set temp was above normal target?", level = 'INFO') ###
+                        elif self.ADapi.datetime(aware=True) - self.ac_temp_last_changed > datetime.timedelta(minutes = 20) and heater_temp == target_temp['normal'] -1 and in_temp > self.target_indoor_temp + 0.4 :
+                            new_temperature = target_temp['normal'] -2
+                            if OUT_TEMP < 15 : # Or fireplace temp?
+                                # Logging to inform that the indoor temperature is above set target.
+                                self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} Redusing temp by -2 from normal: {target_temp['normal']}. Indoor temp is {round(in_temp - self.target_indoor_temp,1)} above target. Outdoor temperature is {OUT_TEMP}", level = 'INFO')
+                        elif heater_temp == target_temp['normal'] -1 :
+                            # If none above -> Keep current temp -1 below normal
+                            new_temperature = target_temp['normal'] -1
                     if OUT_TEMP > self.screening_temp :
                         for s in self.screening :
                             s.try_screen_close()
@@ -525,8 +550,9 @@ class Aircondition():
                         return
 
             # Update with new temperature
-            if current_temp != new_temperature :
+            if heater_temp != new_temperature :
                 self.ADapi.call_service('climate/set_temperature', entity_id = self.ac, temperature = new_temperature)
+                self.ac_temp_last_changed = self.ADapi.datetime(aware=True)
 
         elif ac_state == 'cool' :
             """ Setting temperature hvac_mode == cool
@@ -546,7 +572,7 @@ class Aircondition():
                     self.ADapi.call_service('climate/set_hvac_mode', entity_id = self.ac, hvac_mode = 'fan_only')
                 except Exception as e:
                     self.ADapi.log(f"Not able to set hvac_mode to fan_only for {self.ac}. Probably not supported. {e}", level = 'DEBUG')
-            elif current_temp != self.hvac_cooling_temp :
+            elif heater_temp != self.hvac_cooling_temp :
                 self.ADapi.call_service('climate/set_temperature', entity_id = self.ac, temperature = self.hvac_cooling_temp)
 
         elif ac_state == 'fan_only' :
@@ -587,6 +613,7 @@ class Aircondition():
             # If hvac_state is not heat/cool/fan_only/off or unavailable. Log state for notice. Write automation if missing functionality.
             self.ADapi.log(f"Unregisterd AC state: {ac_state}. {self.ADapi.get_state(self.ac, attribute='friendly_name')}. Will not automate", level = 'WARNING')
 
+        # Helper functions to check windows
     def windowopen(self, entity, attribute, old, new, kwargs):
         if self.windowsopened() != 0 :
             self.windows_is_open = True
@@ -605,12 +632,15 @@ class Aircondition():
                 opened += 1
         return opened
 
+        # Function to call screens in child class
     def tryScreenOpen(self):
         for s in self.screening :
             s.try_screen_open()
 
 
 class Screen():
+    """ Class to control cover entities based on inside temperature and weather sensors
+    """
 
     def __init__(self, api,
         screen = None,
@@ -693,6 +723,8 @@ class Screen():
 
 
 class Notify_Mobiles:
+    """ Class to send notification with 'notify' HA integration
+    """
 
     def __init__(self, api):
         self.ADapi = api
