@@ -1,15 +1,10 @@
 """ CLimate Control by Pythm
     Control your Airconditions / Heat pump based on outside temperature and your Screening covers based on inside temperature and lux sensors
 
-    v1.0.1:
-    ## Whats new:
-    - Refined logic in raising/lowering temperature from normal
-    - Cleaning up
-
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 import hassapi as hass
 import datetime
@@ -467,7 +462,7 @@ class Aircondition():
                 # Check if windows has been closed for over an hour and it is colder than target
                 if self.ADapi.datetime(aware=True) - self.window_last_opened > datetime.timedelta(hours = 1) and in_temp < self.target_indoor_temp -0.2 :
                     if in_temp < self.target_indoor_temp -0.5 and heater_temp == target_temp['normal'] :
-                        self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} It's cold. {in_temp} < {self.target_indoor_temp -0.5}", level = 'INFO') ###
+                        self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} It's cold. {in_temp} < {self.target_indoor_temp -0.2}", level = 'INFO') ###
                         new_temperature += 1
                     elif heater_temp < target_temp['normal'] :
                         new_temperature = target_temp['normal']
@@ -476,8 +471,11 @@ class Aircondition():
                         new_temperature += 2
                         # Logging to inform that the set target is not able to maintain the wanted indoor temperature. 
                         self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} Increased temp by 2 from normal: {target_temp['normal']}. Indoor temp is {round(in_temp - self.target_indoor_temp,1)} below target. Outdoor temperature is {OUT_TEMP}", level = 'INFO')
-                    elif heater_temp == target_temp['normal'] +1 :
-                        new_temperature += 1
+                    elif heater_temp > target_temp['normal'] :
+                        if in_temp < self.target_indoor_temp -0.6 :
+                            new_temperature = heater_temp
+                        else :
+                            new_temperature += 1
 
                 # Daytime Savings
                 doDaytimeSaving = False
@@ -529,9 +527,11 @@ class Aircondition():
                             if OUT_TEMP < 15 : # Or fireplace temp?
                                 # Logging to inform that the indoor temperature is above set target.
                                 self.ADapi.log(f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} Redusing temp by -2 from normal: {target_temp['normal']}. Indoor temp is {round(in_temp - self.target_indoor_temp,1)} above target. Outdoor temperature is {OUT_TEMP}", level = 'INFO')
-                        elif heater_temp == target_temp['normal'] -1 :
-                            # If none above -> Keep current temp -1 below normal
-                            new_temperature = target_temp['normal'] -1
+                        elif heater_temp < target_temp['normal'] :
+                            if in_temp > self.target_indoor_temp + 0.4 :
+                                new_temperature = heater_temp
+                            else :
+                                new_temperature = target_temp['normal'] -1
                     if OUT_TEMP > self.screening_temp :
                         for s in self.screening :
                             s.try_screen_close()
