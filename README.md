@@ -65,6 +65,8 @@ Define a external indoor temperature sensor with `indoor_temp` and set `target_i
       target_indoor_temp: 23
 ```
 
+Alternativly you can use a HA input_number and set target from that with `target_indoor_input`
+
 As mentioned earlier defining a proper temperature scale will improve the climate automation. You define the climate working temperature based on outdoor temperature. The array will be built like this, with a `normal` operations temperature and an `away` temperature based on `out` temperature. In this example the climate will heat with 24 degrees up until 1 degree.
 ```yaml
       temperatures:
@@ -97,6 +99,9 @@ There are different temperatures to define behaviour. `hvac_fan_only_above` will
 
 > [!NOTE]
 > If you have a heater that does not have HVAC capabilities `fan_only` and `cool`, you can define `hvac_enabled` to False in climate.
+
+> [!TIP]
+> Define an HA input boolean and configure with `automate` to disable automation. Turn off to stop automating temperature.
 
 ### Windowsensors
 You can add window/door sensors to turn your HVAC to `fan_only` if any is opened for more than 2 minutes. If you have `hvac_enabled` defined to False heater will set temperature to away temperature.
@@ -272,6 +277,8 @@ key | optional | type | default | introduced in | description
 `climate` | False | climate entity | | v1.0.0 | The entity_id of the climate
 `indoor_temp` | False | sensor | | v1.0.0 | External indoor temperature sensor
 `target_indoor_temp` | True | int | 23 | v1.0.0 | Indoor target temperature and Screening/cover auto close
+`target_indoor_input` | True | input_number | | v1.0.3 | Set indoor target temperature with a HA sensor
+`automate` | True | input_boolean | True | v1.0.3 | Turn off a input boolean to stop automating temperature
 `temperatures` | False | list | | v1.0.0 | List of outdoor temperatures with dictionary normal and away temperatures
 `windowsensors` | True | list | | v1.0.0 | Will set fan_only when window is opened for more than 2 minutes
 `daytime_savings` | True | dictionary | | v1.0.0 | Contains start / stop and optionally presence to lower temperature
