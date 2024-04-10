@@ -1,12 +1,13 @@
 """ CLimate Control by Pythm
     Control your Airconditions / Heat pump based on outside temperature and your Screening covers based on inside temperature and lux sensors
 
+
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
-import hassapi as hass
+import appdaemon.plugins.hass.hassapi as hass
 import datetime
 import json
 
@@ -32,6 +33,8 @@ class Climate(hass.Hass):
             # Default away state for saving purposes
         if 'away_state' in self.args:
             self.away_state = self.args['away_state']
+        elif 'vacation' in self.args:
+            self.away_state = self.args['vacation']
         else:
             self.away_state = 'input_boolean.vacation'
             if not self.entity_exists(self.get_entity(self.away_state),
@@ -43,7 +46,7 @@ class Climate(hass.Hass):
                 )
             else:
                 self.log(
-                    "'away_state' not configured. Using 'input_boolean.vacation' as default away state",
+                    "'vacation' not configured. Using 'input_boolean.vacation' as default away state",
                     level = 'WARNING'
                 )
 

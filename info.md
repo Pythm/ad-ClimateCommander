@@ -1,12 +1,14 @@
 # Climate Commander by Pythm
-An Appdaemon app for controlling `climate` entities in [Home Assistant](https://www.home-assistant.io/). Set an indoor temperature target with an external indoor temperature sensor and configure your screens and other sensors to maintain a balanced indoor climate.
+An Appdaemon app for controlling `climate` entities in [Home Assistant](https://www.home-assistant.io/). Set an indoor temperature target with an external indoor temperature sensor and configure your screens and provide other sensors to maintain a balanced indoor climate.
 
 This is developed in Norway where we mostly need heating. The app will only adjust the temperature when heating, but there is some functionality to automatically set to `fan_only` or `cool` in addition to automatically closing screens when it is hot and sunny.
 
 ![Picture is generated with AI](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
 
 ## Installation
-Download the `ClimateCommander` directory from inside the `apps` directory to your [Appdaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory, then add configuration to a .yaml or .toml file to enable the `climateCommander` module. Minimum required in your configuration is:
+1. Download the `ClimateCommander` directory from inside the `apps` directory here to your [Appdaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory.
+2. Add the configuration to a .yaml or .toml file to enable the `ClimateCommander` module. Minimum required in your configuration is:
+
 ```yaml
 nameyourClimateCommander:
   module: climateCommander
@@ -31,6 +33,8 @@ This app is designed to control climate entities in Home Assistant based on outd
 
 Climates will adjust +/- 2 degrees from the temperature defined in normal. By default, the app logs information about outdoor/indoor temperatures if it needs to adjust by as much as 2 degrees to maintain the set target. The idea behind the app was to define what temperature to set given the outdoor temperature. The colder it is outside, the higher temperature is needed to maintain a warm house. Defining a proper temperature scale will improve daytime savings and efficiency.
 
+I have a plan to further improve automation based on forecasts from Met.no and adding more temperature sensors, such as window sensors. In the new version, you will only need to input a target indoor temperature in the external sensor for normal operation, as well as an away temperature target. If you'd like me to prioritize this project, please let me know by supporting my work at https://www.buymeacoffee.com/Pythm or https://www.patreon.com/Pythm and request "Climate Commander" development. Thanks!
+
 
 ### Outdoor weather sensors climate reacts to
 If you do not have an outdoor temperature sensor, the app will try to get the temperature from the [Met.no](https://www.home-assistant.io/integrations/met) integration.
@@ -54,7 +58,7 @@ Outdoor `Lux` and `Rain` sensors are only needed if you also want to control [co
 ### Configurations for the app
 You can define an Home Assistant input_boolean helper to lower the temperature when on vacation to the temperature defined as `away`:
 ```yaml
- away_state: input_boolean.vacation
+ vacation: input_boolean.vacation
  ```
 
 > [!IMPORTANT]
@@ -155,8 +159,10 @@ You can get notifications for when the indoor temperature is low and a window is
 ```
 
 
-# Get started
+## Get started
 The easiest way to get started is to copy the example provided and update it with your sensors and climate entities. You can then add more configurations as needed. Ensure that all list and dictionary elements are correctly indented. Here's an example:
+
+## Example App configuration
 
 ```yaml
 nameyourClimateCommander:
@@ -231,7 +237,7 @@ key | optional | type | default | introduced in | description
 `class` | False | string | | v1.0.0 | The name of the Class.
 `HASS_namespace` | True | string | default | v1.0.0 | HASS namespace
 `MQTT_namespace` | True | string | default | v1.0.0 | MQTT namespace
-`away_state` | True | input_boolean | input_boolean.vacation | v1.0.0 | Sets Vacation temperature
+`vacation` | True | input_boolean | input_boolean.vacation | v1.0.0 | Sets Vacation temperature
 `outside_temperature` | True | sensor | | v1.0.0 | Sensor for outside temperature
 `anemometer` | True | sensor | | v1.0.0 | Sensor for wind speed
 `anemometer_speed` | True | int | 40 | v1.0.0 | windy target
