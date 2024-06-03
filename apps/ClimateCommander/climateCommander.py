@@ -1,11 +1,10 @@
 """ CLimate Control by Pythm
     Control your Airconditions / Heat pump based on outside temperature and your Screening covers based on inside temperature and lux sensors
 
-
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 import appdaemon.plugins.hass.hassapi as hass
 import datetime
@@ -199,6 +198,8 @@ class Climate(hass.Hass):
                 automate = ac.get('automate', None),
                 screens = ac.get('screening', {}),
                 screening_temp = ac.get('screening_temp', 8),
+                getting_cold = ac.get('getting_cold', 18),
+                cooling_temp_out = ac.get('cooling_temp_outside_above', 20),
                 hvac_enabled = ac.get('hvac_enabled', True),
                 hvac_fan_only_above = ac.get('hvac_fan_only_above', 24),
                 notify_above = ac.get('notify_above', 28),
@@ -379,6 +380,8 @@ class Aircondition():
         automate = None,
         screens = {},
         screening_temp = 8,
+        getting_cold = 18,
+        cooling_temp_out = 20,
         hvac_enabled = True,
         hvac_fan_only_above = 24,
         notify_above = 28,
@@ -440,7 +443,10 @@ class Aircondition():
             self.screening.append(screen)
         self.screening_temp = screening_temp
 
+        self.getting_cold = getting_cold
+
             # Target temperatures to change hvac mode
+        self.cooling_temp_out = cooling_temp_out
         self.hvac_fan_only_above = hvac_fan_only_above
         self.hvac_cooling_above = hvac_cooling_above
         self.hvac_cooling_temp = hvac_cooling_temp
@@ -599,6 +605,8 @@ class Aircondition():
                     if (
                         self.notify_on_window_open 
                         and in_temp < target_temp['normal']
+                        and OUT_TEMP < 17
+                        and in_temp < self.target_indoor_temp
                     ):
                         self.notify_app.send_notification(
                             f"{self.notify_message_cold} {in_temp}" ,self.notify_title, self.notify_reciever
@@ -643,7 +651,7 @@ class Aircondition():
             else:
                 if (
                     self.ADapi.datetime(aware=True) - self.last_windy_time < datetime.timedelta(minutes = 30)
-                    and OUT_TEMP < 18
+                    and OUT_TEMP < self.getting_cold
                 ):
                     in_temp -= 0.3
 
@@ -697,13 +705,6 @@ class Aircondition():
                         and in_temp < self.target_indoor_temp -0.6
                     ):
                         new_temperature += 2
-                        # Logging to inform that the set target is not able to maintain the wanted indoor temperature. 
-                        if WIND_AMOUNT < self.anemometer_speed:
-                            self.ADapi.log(
-                                f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} Increased temp by 2 from normal: {target_temp['normal']}. "
-                                f"Indoor temp is {round(in_temp - self.target_indoor_temp,1)} below target. Outdoor temperature is {OUT_TEMP}",
-                                level = 'INFO'
-                            )
 
                     elif heater_temp > target_temp['normal']:
                         if in_temp < self.target_indoor_temp -0.6:
@@ -766,13 +767,7 @@ class Aircondition():
                             and in_temp > self.target_indoor_temp + 0.4
                         ):
                             new_temperature = target_temp['normal'] -2
-                            if OUT_TEMP < 15: # TODO: Or fireplace temp?
-                                # Logging to inform that the indoor temperature is above set target.
-                                self.ADapi.log(
-                                    f"{self.ADapi.get_state(self.ac, attribute = 'friendly_name')} Redusing temp by -2 from normal: {target_temp['normal']}. "
-                                    f"Indoor temp is {round(in_temp - self.target_indoor_temp,1)} above target. Outdoor temperature is {OUT_TEMP}",
-                                    level = 'INFO'
-                                )
+
                         elif heater_temp < target_temp['normal']:
                             if in_temp > self.target_indoor_temp + 0.4:
                                 new_temperature = heater_temp
@@ -786,7 +781,10 @@ class Aircondition():
                         and self.hvac_enabled
                         and self.ADapi.datetime(aware=True) - self.last_windy_time > datetime.timedelta(minutes = 45)
                     ):
-                        if in_temp > self.hvac_cooling_above:
+                        if (
+                            in_temp > self.hvac_cooling_above
+                            and OUT_TEMP > self.cooling_temp_out
+                        ):
                             try:
                                 self.ADapi.call_service('climate/set_hvac_mode',
                                     entity_id = self.ac,
@@ -854,7 +852,10 @@ class Aircondition():
                 not self.windows_is_open
                 and self.ADapi.get_state(self.away_state) == 'off'
             ):
-                if in_temp > self.hvac_cooling_above:
+                if (
+                    in_temp > self.hvac_cooling_above
+                    and OUT_TEMP > self.cooling_temp_out
+                ):
                     try:
                         self.ADapi.call_service('climate/set_hvac_mode',
                             entity_id = self.ac,
@@ -891,7 +892,7 @@ class Aircondition():
             elif (
                 self.windows_is_open 
                 and self.notify_on_window_open 
-                and in_temp < 20
+                and in_temp < self.getting_cold
             ):
                 if self.notify_reciever:
                     self.notify_app.send_notification(f"{self.notify_message_cold} {in_temp}" ,self.notify_title, self.notify_reciever )

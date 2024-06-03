@@ -97,7 +97,23 @@ Climates will adjust up until +/- 2 degrees from the temperature defined in `nor
         - start: '05:00:00'
           stop: '07:00:00'
 ```
-There are different temperatures to define behavior. `hvac_fan_only_above` will change the air conditioning to `fan_only` when the external indoor temperature sensor is above the value. `hvac_cooling_above` is also dependent on the indoor sensor and will activate `cool` on Aircondition and set the temperature defined with `hvac_cooling_temp`. In addition, you configure a minimum outdoor temperature for when the screens will automatically close with `screening_temp`.
+
+There are several temperature-based configurations to define behavior:
+
+1. `hvac_fan_only_above`: If the external indoor temperature sensor is above the defined value, the air conditioning will change to `fan_only`.
+2. `hvac_cooling_above`: Dependent on the indoor sensor, this configuration activates `cool` on the Air Conditioner and sets the temperature using the `hvac_cooling_temp` setting.
+3. `cooling_temp_outside_above`: Disables automated cooling when the outside temperature is below the given value.
+4.  The default temperature threshold when the app registers it as cold outside is 18 degrees Celsius. This configuration is mainly used for notifications but can be changed with `getting_cold`.
+5. `screening_temp`: Configure a minimum outdoor temperature for when screens will automatically close.
+
+```yaml
+      hvac_fan_only_above: 23.3 # Fan Only and Screening/cover auto close above value. Default: 24
+      getting_cold: 18 # Temperature for when it is getting cold outide. Default: 18
+      hvac_cooling_above: 25 # Cooling above inside temperature. Default: 28
+      cooling_temp_outside_above: 20 # Only set hvac to cool if outside temperature is above. Default: 20
+      hvac_cooling_temp: 20 # AC temperature when cooling. Default: 22
+      screening_temp: 12 # Outside temperature needs to be over this to automatically close screen
+```
 
 > [!NOTE]
 > If you have a heater that does not have HVAC capabilities (`fan_only` and `cool`), you can define `hvac_enabled` to False in climate.
