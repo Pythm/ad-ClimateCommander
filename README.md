@@ -259,7 +259,6 @@ key | optional | type | default | introduced in | description
 `class` | False | string | | v1.0.0 | The name of the Class.
 `HASS_namespace` | True | string | default | v1.0.0 | HASS namespace
 `MQTT_namespace` | True | string | default | v1.0.0 | MQTT namespace
-
 `outside_temperature` | True | sensor | | v1.0.0 | Sensor for outside temperature
 `anemometer` | True | sensor | | v1.0.0 | Sensor for wind speed
 `anemometer_speed` | True | int | 40 | v1.0.0 | windy target
@@ -297,7 +296,6 @@ key | optional | type | default | introduced in | description
 ### Key definitions for defining screens 
 key | optional | type | default | introduced in | description
 -- | -- | -- | -- | -- | --
-
 `screening` | True | dictionary | | v1.0.0 | Contains a list of cover entities to control
 `windowsensors` | True | list | | v1.0.0 | If screen is on a window/door that can be opened it will not autoclose when sensor is 'on'
 `lux_close` | True | int | 40000 | v1.0.0 | Close cover if temperatures is above target and lux is above
