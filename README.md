@@ -1,19 +1,24 @@
 ## Breaking Change:
-A rewrite as of version 1.1.0 to better handle both HVAC and heaters with other sources than electricity.
-- Changed "Command" name to either a "HVAC" or a "Heater". Now you can control Heaters without HVAC functionality or define HVAC enabled devices.
-- Indoor sensor temp changed from "indoor_temp" to "indoor_sensor_temp"
-- Away state is now configured with "vacation"
-- Indoor sensor temp has been changed from "indoor_temp" to "indoor_sensor_temp"
+We've made significant updates in version 1.1.0 to improve handling of both HVAC and heaters with non-electric sources.
 
+Changed Command name to either a "HVAC" or a "Heater" for unified control.
+Renamed indoor sensor temperature to `indoor_sensor_temp`.
+Renamed vacation mode (away state) to `vacation`.
 
 # Climate Commander by Pythm
 An Appdaemon app for controlling `climate` entities in [Home Assistant](https://www.home-assistant.io/). Set an indoor temperature target with an external indoor temperature sensor and configure your screens and provide other sensors to maintain a balanced indoor climate.
 
-This is developed in Norway where we mostly need heating. The app automatically changes HVAC entities to `fan_only` if indoor temperature is 0.6 degree above target or if windows is open. It also changes from `fan_only` to `cool` if indoor temperature is 1 degree above target and outdoor temperature is above indoor target. The app also automatically closes screens/covers when it is above target indoor temperature and above given lux constraints.
+This is developed in Norway where we mostly need heating.
+
+### Features:
+
+Automatically changes HVAC entities to fan_only if indoor temperature is 0.6 degree above target or if windows are open
+Changes from fan_only to cool if indoor temperature is 1 degree above target and outdoor temperature is above indoor target
+Automatically closes screens/covers when it's above target indoor temperature and above given lux constraints
 
 ![Picture is generated with AI](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
 
-## Installation
+### Installation
 1. Download the `ClimateCommander` directory from inside the `apps` directory here to your [Appdaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory.
 2. Add the configuration to a .yaml or .toml file to enable the `ClimateCommander` module. Minimum required in your configuration with example input is:
 
@@ -32,31 +37,30 @@ nameyourClimateCommander:
 
 
 ## App usage and configuration
-This app is designed to control climate entities in Home Assistant based on indoor temperature with additional sensors. Outdoor sensors are configured for the app, while indoor sensors are configured per climate entity.
+This app is designed to control climate entities in Home Assistant based on indoor temperature using additional sensors. Outdoor sensors are configured for the app, while indoor sensors are configured per climate entity.
 
 > [!IMPORTANT]
-> You need an external indoor temperature sensor. Placement of the sensor and setting the right target temperature is crucial for optimal indoor temperature.
+> This app requires an external indoor temperature sensor to function correctly. Proper placement of the sensor and setting the right target temperature is crucial for achieving an optimal indoor temperature.
 
 > [!NOTE]
-> This app does not consider electricity prices or usage. Another app controlling heaters, hot water boilers, and chargers for cars based on electricity price and usage can be found here: https://github.com/Pythm/ad-ElectricalManagement
+> This app does not consider electricity prices or usage. If you're looking for an app that controls heaters, hot water boilers, and chargers for cars based on electricity price and usage, please check out [ElectricalManagement](https://github.com/Pythm/ad-ElectricalManagement)
 
-> [!IMPORTANT]
-> If you have defined a namespace for HASS, you need to configure the app with `HASS_namespace`. If you are using MQTT you need to define your MQTT namespace with `MQTT_namespace`. Both defaults to default:
+Namespace Configuration:
+If you have defined a namespace for Home Assistant (HASS), you need to configure the app with HASS_namespace. Similarly, if you're using MQTT, define your MQTT namespace with MQTT_namespace. Both defaults are set to "default" if not specified.
 
 
 ### Outdoor weather sensors climate reacts to
 If you do not have an outdoor temperature sensor, the app will try to get the temperature from the [Met.no](https://www.home-assistant.io/integrations/met) integration.
 
-You can use an anemometer to increase the indoor set temperature when it is windy. Define your sensor with `anemometer` and your "windy" target with `anemometer_speed`. Anemometer is a Home Assistant sensor. It will also open all screens defined if wind speed is above the target. Additionally, it will activate the `boost` preset mode if needed, if your HVAC supports it.
 
-> [!TIP]
-> Boost will not be set if the fan mode is set to Silence.
+An anemometer can be used to increase the indoor set temperature when it is windy. Define your sensor using `anemometer` and a "windy" target with `anemometer_speed`. If the wind speed exceeds the target, all screens will open, and if needed to maintain the temperature, the HVAC system will activate the boost preset mode. Note that boost will not be set if the fan mode is set to Silence.
 
-You can also define a `rain_sensor` and a `rain_level` to increase indoor temperature when it is depressing weather outside. The rain sensor is a Home Assistant sensor. Any rain detected will open all screens defined.
+A rain sensor can increase indoor temperature when it's depressing weather outside. Define your rain sensor using `rain_sensor` and a "rainy" target with `rain_level`. If rain is detected, all screens will open.
 
 Both wind and rain, separately or combined, will set the indoor temperature to 0.3 degrees above target.
 
-Outdoor Lux sensors are needed if you also want to control [cover](https://www.home-assistant.io/integrations/cover/) entities, such as screens or blinds for your windows. You can configure two outdoor lux sensors, with the second ending with `'_2'`, and it will keep the highest lux value or the last if the other is not updated within the past 15 minutes. Both Lux sensors can be either MQTT or Home Assistant sensors.
+Outdoor Lux sensors are required to control [cover](https://www.home-assistant.io/integrations/cover/) entities like screens or blinds for windows. You can configure two outdoor lux sensors, with the second ending with `'_2'`, and it will keep the highest lux value, or the last if the other is not updated within 15 minutes. Both Lux sensors can be either MQTT or Home Assistant sensors.
+
 
 ```yaml
   outside_temperature: sensor.netatmo_out_temperature
@@ -75,9 +79,9 @@ The default temperature threshold when the app registers it as cold outside is 1
 
 
 ### Windowsensors
-You can add window/door sensors to switch your HVAC to `fan_only` if any is opened for more than 2 minutes. If you configure `Heater` in stead if `HVAC`, the heater will set the temperature to the vacation temperature.
+You can add window/door sensors to switch your HVAC to `fan_only` if any window or door is opened for more than 2 minutes. If you configure `Heater` in stead if `HVAC`, the heater will set the temperature to the vacation temperature.
 
-The app supports an additional indoor temperature sensor to register when the sun is heating and turn down the heater before it gets hot. A windowsensor with temperature reading is a optimal placement.
+The app also supports an additional indoor temperature sensor. A windowsensor equipped with temperature reading is ideal for registering when direct sunlight heats the room, allowing the system to lower the heating temperature before it becomes uncomfortably hot.
 
 ```yaml
       windowsensors:
