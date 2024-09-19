@@ -1,91 +1,105 @@
+## Breaking Change:
+A rewrite as of version 1.1.0 to better handle both HVAC and heaters with other sources than electricity.
+- Changed "Command" name to either a "HVAC" or a "Heater". Now you can control Heaters without HVAC functionality or define HVAC enabled devices.
+- Indoor sensor temp changed from "indoor_temp" to "indoor_sensor_temp"
+- Away state is now configured with "vacation"
+- Indoor sensor temp has been changed from "indoor_temp" to "indoor_sensor_temp"
+
+
 # Climate Commander by Pythm
 An Appdaemon app for controlling `climate` entities in [Home Assistant](https://www.home-assistant.io/). Set an indoor temperature target with an external indoor temperature sensor and configure your screens and provide other sensors to maintain a balanced indoor climate.
 
-This is developed in Norway where we mostly need heating. The app will only adjust the temperature when heating, but there is some functionality to automatically set to `fan_only` or `cool` in addition to automatically closing screens when it is hot and sunny.
+This is developed in Norway where we mostly need heating. The app automatically changes HVAC entities to `fan_only` if indoor temperature is 0.6 degree above target or if windows is open. It also changes from `fan_only` to `cool` if indoor temperature is 1 degree above target and outdoor temperature is above indoor target. The app also automatically closes screens/covers when it is above target indoor temperature and above given lux constraints.
 
 ![Picture is generated with AI](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
 
 ## Installation
 1. Download the `ClimateCommander` directory from inside the `apps` directory here to your [Appdaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory.
-2. Add the configuration to a .yaml or .toml file to enable the `ClimateCommander` module. Minimum required in your configuration is:
+2. Add the configuration to a .yaml or .toml file to enable the `ClimateCommander` module. Minimum required in your configuration with example input is:
 
 ```yaml
 nameyourClimateCommander:
   module: climateCommander
   class: Climate
-  Command:
+  HVAC:
     - climate: climate.yourClimate
-      indoor_temp: sensor.yourIndoorTemperatureSensor # External indoor temperature sensor
-      temperatures:   # List of outdoor temperatures with dictionary normal and away temperatures
-        - out: 5      # Measured outdoor temperature
-          normal: 23  # Normal temperature for app to adjust from. 
-          away: 16    # Temperature to set when on holiday
+      indoor_sensor_temp: sensor.yourIndoorTemperatureSensor # External indoor temperature sensor
+      target_indoor_temp: 22.7
 ```
 
+> [!TIP]
+> All numbers in the yaml example configurations are default if not defined in the configuration.
+
+
 ## App usage and configuration
-This app is designed to control climate entities in Home Assistant based on outdoor temperature with additional sensors. Outdoor sensors are configured for the app, while indoor sensors are configured per climate entity.
+This app is designed to control climate entities in Home Assistant based on indoor temperature with additional sensors. Outdoor sensors are configured for the app, while indoor sensors are configured per climate entity.
+
+> [!IMPORTANT]
+> You need an external indoor temperature sensor. Placement of the sensor and setting the right target temperature is crucial for optimal indoor temperature.
 
 > [!NOTE]
 > This app does not consider electricity prices or usage. Another app controlling heaters, hot water boilers, and chargers for cars based on electricity price and usage can be found here: https://github.com/Pythm/ad-ElectricalManagement
 
 > [!IMPORTANT]
-> You need an external indoor temperature sensor. Placement of the sensor and finding the right target temperature is crucial for optimal indoor temperature.
-
-Climates will adjust +/- 2 degrees from the temperature defined in normal. By default, the app logs information about outdoor/indoor temperatures if it needs to adjust by as much as 2 degrees to maintain the set target. The idea behind the app was to define what temperature to set given the outdoor temperature. The colder it is outside, the higher temperature is needed to maintain a warm house. Defining a proper temperature scale will improve daytime savings and efficiency.
-
-I have a plan to further improve automation based on forecasts from Met.no and adding more temperature sensors, such as window sensors. In the new version, you will only need to input a target indoor temperature in the external sensor for normal operation, as well as an away temperature target. If you'd like me to prioritize this project, please let me know by supporting my work at https://www.buymeacoffee.com/Pythm or https://www.patreon.com/Pythm and request "Climate Commander" development. Thanks!
+> If you have defined a namespace for HASS, you need to configure the app with `HASS_namespace`. If you are using MQTT you need to define your MQTT namespace with `MQTT_namespace`. Both defaults to default:
 
 
 ### Outdoor weather sensors climate reacts to
 If you do not have an outdoor temperature sensor, the app will try to get the temperature from the [Met.no](https://www.home-assistant.io/integrations/met) integration.
 
-You can use an anemometer to increase the indoor set temperature when it is windy. Define your sensor with `anemometer` and your target with `anemometer_speed`. Anemometer is a Home Assistant sensor. It will also open any screens defined if wind speed is above the target. Additionally, it will activate the `boost` preset mode if your HVAC supports it.
+You can use an anemometer to increase the indoor set temperature when it is windy. Define your sensor with `anemometer` and your "windy" target with `anemometer_speed`. Anemometer is a Home Assistant sensor. It will also open all screens defined if wind speed is above the target. Additionally, it will activate the `boost` preset mode if needed, if your HVAC supports it.
 
 > [!TIP]
 > Boost will not be set if the fan mode is set to Silence.
 
-Outdoor `Lux` and `Rain` sensors are only needed if you also want to control [cover](https://www.home-assistant.io/integrations/cover/) entities, such as screens or blinds for your windows. You can configure two outdoor lux sensors, with the second ending with `'_2'`, and it will keep the highest lux value or the last if the other is not updated within the past 15 minutes. Both Lux sensors can be either MQTT or Home Assistant sensors. The rain sensor is a Home Assistant sensor.
+You can also define a `rain_sensor` and a `rain_level` to increase indoor temperature when it is depressing weather outside. The rain sensor is a Home Assistant sensor. Any rain detected will open all screens defined.
+
+Both wind and rain, separately or combined, will set the indoor temperature to 0.3 degrees above target.
+
+Outdoor Lux sensors are needed if you also want to control [cover](https://www.home-assistant.io/integrations/cover/) entities, such as screens or blinds for your windows. You can configure two outdoor lux sensors, with the second ending with `'_2'`, and it will keep the highest lux value or the last if the other is not updated within the past 15 minutes. Both Lux sensors can be either MQTT or Home Assistant sensors.
 
 ```yaml
   outside_temperature: sensor.netatmo_out_temperature
   anemometer: sensor.netatmo_anemometer_wind_strength
   anemometer_speed: 40
   rain_sensor: sensor.netatmo_rain
+  rain_level: 3
   OutLux_sensor: sensor.lux_sensor
   OutLuxMQTT_2: zigbee2mqtt/OutdoorHueLux
+
+  screening_temp: 8
+  getting_cold: 18
+```
+`screening_temp` configure a minimum outdoor temperature for when screens will automatically close.
+The default temperature threshold when the app registers it as cold outside is 18 degrees Celsius. This configuration is for now, mainly used for notifications, and can be changed with `getting_cold`.
+
+
+### Windowsensors
+You can add window/door sensors to switch your HVAC to `fan_only` if any is opened for more than 2 minutes. If you configure `Heater` in stead if `HVAC`, the heater will set the temperature to the vacation temperature.
+
+The app supports an additional indoor temperature sensor to register when the sun is heating and turn down the heater before it gets hot. A windowsensor with temperature reading is a optimal placement.
+
+```yaml
+      windowsensors:
+        - binary_sensor.your_window_door_is_open
 ```
 
-### Configurations for the app
-You can define an Home Assistant input_boolean helper to lower the temperature when on vacation to the temperature defined as `away`:
-```yaml
- vacation: input_boolean.vacation
- ```
-
-> [!IMPORTANT]
-> If you have defined a namespace for MQTT other than the default, you need to define your namespace with `MQTT_namespace`. Similarly, for Home Assistant, you need to define your namespace with `HASS_namespace`:
+## Configurations for the app
 
 ### Temperature settings for climate
-Define an external indoor temperature sensor with `indoor_temp`, and set `target_indoor_temp` for the external indoor temperature. Any screens or covers will automatically open above the set temperature:
-```yaml
-      indoor_temp: sensor.yourIndoorTemperatureSensor
-      target_indoor_temp: 23
-```
-Alternatively, you can use a Home Assistant input_number and set the target from that with `target_indoor_input`.
+Define an external indoor temperature sensor with `indoor_sensor_temp`, and set `target_indoor_temp` for the external indoor temperature. Alternatively to the target_indoor_temp, you can use a Home Assistant input_number helper and set the target from that with `target_indoor_input`.
 
-As mentioned earlier, defining a proper temperature scale will improve the climate automation. You define the climate's working temperature based on the outdoor temperature. The array will be built like this, with a `normal` operations temperature and an `away` temperature based on the `out` temperature. In this example, the climate will heat with 24 degrees until it reaches 1 degree.
-```yaml
-      temperatures:
-        - out: -10
-          normal: 24
-          away: 17
-        - out: 1
-          normal: 23
-          away: 16
-```
-> [!TIP]
-> Start from your current temperature and extend the array every time you need to lower or increase the indoor temperature by one degree.
+Add a window sensor with `window_sensor_temp` and input the offset between the indoor sensor and the window sensor when the sun is not heating with `window_offset`.
 
-Climates will adjust up until +/- 2 degrees from the temperature defined in `normal` to maintain the target indoor temperature. The daytime savings and increasing times will alter the measured indoor temperature +/- 1 degree to increase or decrease the indoor temperature. The `daytime_savings` and `daytime_increasing` have a start and stop time. In addition, you can define presence detection. If anyone is home, it will not do daytime savings, but there needs to be someone home to increase the temperature.
+```yaml
+      indoor_sensor_temp: sensor.yourIndoorTemperatureSensor # External indoor temperature sensor
+      target_indoor_temp: 22.7
+      target_indoor_input: input_number.yourInput
+      window_sensor_temp: sensor.your_windowsensor_air_temperature
+      window_offset: -3
+```
+
+ Daytime savings and increasing times will set the target +- 0.5 degree to increase or decrease the indoor temperature. The `daytime_savings` and `daytime_increasing` have a start and stop time. In addition, you can define presence detection. If anyone is home, it will not do daytime savings, but there needs to be someone home to increase the temperature.
 ```yaml
       daytime_savings:
         - start: '10:00:00'
@@ -98,49 +112,21 @@ Climates will adjust up until +/- 2 degrees from the temperature defined in `nor
           stop: '07:00:00'
 ```
 
-There are several temperature-based configurations to define behavior:
-
-1. `hvac_fan_only_above`: If the external indoor temperature sensor is above the defined value, the air conditioning will change to `fan_only`.
-2. `hvac_cooling_above`: Dependent on the indoor sensor, this configuration activates `cool` on the Air Conditioner and sets the temperature using the `hvac_cooling_temp` setting.
-3. `cooling_temp_outside_above`: Disables automated cooling when the outside temperature is below the given value.
-4.  The default temperature threshold when the app registers it as cold outside is 18 degrees Celsius. This configuration is mainly used for notifications but can be changed with `getting_cold`.
-5. `screening_temp`: Configure a minimum outdoor temperature for when screens will automatically close.
-
-```yaml
-      hvac_fan_only_above: 23.3 # Fan Only and Screening/cover auto close above value. Default: 24
-      getting_cold: 18 # Temperature for when it is getting cold outide. Default: 18
-      hvac_cooling_above: 25 # Cooling above inside temperature. Default: 28
-      cooling_temp_outside_above: 20 # Only set hvac to cool if outside temperature is above. Default: 20
-      hvac_cooling_temp: 20 # AC temperature when cooling. Default: 22
-      screening_temp: 12 # Outside temperature needs to be over this to automatically close screen
-```
-
-> [!NOTE]
-> If you have a heater that does not have HVAC capabilities (`fan_only` and `cool`), you can define `hvac_enabled` to False in climate.
-
-> [!TIP]
-> Define an HA input boolean and configure with `automate` to disable automation. Turn off to stop automating temperature.
-
-
 ### Silent Periods
-Configure times to set the fan speed to `Silent`.
+Configure times to set the fan speed to `silence`. This only applies to HVAC heaters.
 
 ```yaml
-silent:
-  - start: '21:00:00'
-    stop: '07:00:00'
-    presence:
-      - person.myself
+      silence:
+        - start: '21:00:00'
+          stop: '07:00:00'
+          presence: 
+            - person.nathaniel
 ```
-> **Note:** The app will revert to its previous setting when the silent period ends. If the app is restarted and the fan speed is already set to silent or if the fan speed was already silent when the silent periods began, it will remain at silent until changed manually.
+> **Note:** The app will revert to its previous setting when the silent period ends. It stores the other fan mode in persistent storage.
 
 
-### Windowsensors
-You can add window/door sensors to switch your HVAC to `fan_only` if any is opened for more than 2 minutes. If you have `hvac_enabled` defined as `False`, the heater will set the temperature to the away temperature.
-
-
-### Setting up sensors for screens
-Each screen has a lux closing and lux opening value for automatically closing or opening your cover entity. If you have `windowsensors` defined, every sensor must be closed for the screen to run. Add `mediaplayers` sensors and a `lux_open_media` if you want the screen to open with a different lux value than normal. Mediaplayers can be any Home Assistant entity that returns 'on'/'off' value.
+### Setting up sensors for screens/covers
+Each screen has a lux closing and lux opening value for automatically closing or opening your cover entity. If you have `windowsensors` defined, the sensor must be off(closed) for the screen to run. Add `mediaplayers` sensors and a `lux_open_media` if you want the screen to open with a different lux value than normal when your media is on. Mediaplayers can be any Home Assistant entity that returns 'on'/'off' value.
 You can prevent covers from closing when a person/tracker is at home using a list with `not_when_home`.
 
 > [!TIP]
@@ -149,33 +135,52 @@ You can prevent covers from closing when a person/tracker is at home using a lis
 ```yaml
       screening:
         - screen: cover.your_screen
-          windowsensors: # If the screen is on a window/door that can be opened, it will not auto-close when the sensor is 'on'
+          windowsensors:
           - binary_sensor.window_door_is_open
-          lux_close: 40000 # Close cover if temperatures are above target and lux is above
-          lux_open: 7000 # Open cover again when lux goes below
-          lux_open_media: 2000 # Optional lux setting if one of the mediaplayers is on
-          not_when_home: # Only close cover automatically if persons are not at home
+          lux_close: 40000
+          lux_open: 15000
+          lux_open_media: 4000
+          not_when_home:
             - person.wife
           mediaplayers:
             - switch.projector
             - media_player.your_tv
 ```
 
+### Vacation temperature
+You can define an Home Assistant input_boolean helper to lower the consumption when on vacation. When heating the target indoor temp will be set to a temperature defined with `vacation_temp`. The vacation temperature can either be defined at main level or under each climate entity.
+When cooling the temperature will be set 3 degrees above
+
+```yaml
+  vacation: input_boolean.vacation
+  vacation_temp: 16
+  HVAC:
+    - climate: climate.yourClimate
+      vacation_temp: 16
+ ```
+
+### Persistent storage
+To configure persistent storage, input a path, exclusive of a name and a .json filename (e.g., '/conf/persistent/Climate/') to store a JSON file using the `json_path` as persistent data.
+
+The app will calculate the average set temperature based on outdoor temperature and lux for further improvements to temperature setting.
+It is also used to store fan speed, in case the app is restarted during silent periode.
+
+### Disable all automations
+Define an HA input boolean and configure with `automate` to disable automation when switch is off.
+
 
 ### Set up notifications
-You can get notifications for when the indoor temperature is low and a window is open, or if it is hot and windows are closed. It sends notifications with [Notify integration](https://www.home-assistant.io/integrations/notify/). You can use 'all' or a list with recipients.
+You can get notifications for when the indoor temperature is low and a window is open, or if it is hot and windows are closed. It sends notifications with [Notify integration](https://www.home-assistant.io/integrations/notify/).
 
 ```yaml
       notify_reciever:
         - mobile_app_your_phone
-      notify_title: 'ClimateCommander'
-      notify_message_cold: 'It\'s getting cold inside and window is open. Temperature is'
-      notify_message_warm: 'It\'s getting hot inside and temperature is'
-      notify_above: 28
 ```
 
-
 ## Get started
+> [!TIP]
+> Define an HA input boolean and configure with `automate` to disable automation. Turn off to stop automating temperature.
+
 The easiest way to get started is to copy the example provided and update it with your sensors and climate entities. You can then add more configurations as needed. Ensure that all list and dictionary elements are correctly indented. Here's an example:
 
 ## Example App configuration
@@ -186,63 +191,60 @@ nameyourClimateCommander:
   class: Climate
   outside_temperature: sensor.netatmo_out_temperature
   anemometer: sensor.netatmo_anemometer_wind_strength
-  anemometer_speed: 20 # Increases temperature inside when anemometer exceeds this amount
+  anemometer_speed: 40
   rain_sensor: sensor.netatmo_rain
+  rain_level: 3
   OutLux_sensor: sensor.lux_sensor
   OutLuxMQTT_2: zigbee2mqtt/OutdoorHueLux
-  Command:
+
+  screening_temp: 8
+  getting_cold: 18
+
+  json_path: /conf/persistent/Climate/
+  vacation: input_boolean.vacation
+  vacation_temp: 16
+
+  HVAC:
     - climate: climate.yourClimate
-      indoor_temp: sensor.yourIndoorTemperatureSensor # External indoor temperature sensor
-      target_indoor_temp: 23 # Target for external indoor temperature and Screening/cover auto close above
-      temperatures:   # List of outdoor temperatures with dictionary normal and away temperatures
-        - out: -10   # Measured outdoor temperature
-          normal: 24 # Normal temperature for app to adjust from. 
-          away: 17   # Temperature to set when on holiday
-        - out: 1
-          normal: 23
-          away: 16
-        - out: 4
-          normal: 22
-          away: 16
-        - out: 6
-          normal: 21
-          away: 15
-        - out: 11
-          normal: 20
-          away: 14
-        - out: 12
-          normal: 18
-          away: 14
-        - out: 16
-          normal: 16
-          away: 14
-        - out: 18
-          normal: 15
-          away: 14
-      hvac_fan_only_above: 24 # Fan Only above value
-      hvac_cooling_above: 28 # Cooling above
-      hvac_cooling_temp: 22 # AC temperature when cooling
-      screening_temp: 8 # Outside temperature needs to be over this to automatically close screen
-      # Cover your windows if indoor temperature and outdoor lux gets above target to stop the sun from heating even more
+      indoor_sensor_temp: sensor.yourIndoorTemperatureSensor # External indoor temperature sensor
+      target_indoor_input: input_number.yourInput
+      window_sensor_temp: sensor.your_windowsensor_air_temperature
+      window_offset: -3
+
+      daytime_savings:
+        - start: '10:00:00'
+          stop: '14:00:00'
+          presence:
+            - person.wife
+            - person.myself
+      daytime_increasing:
+        - start: '05:00:00'
+          stop: '07:00:00'
+
+      silence:
+        - start: '21:00:00'
+          stop: '07:00:00'
+          presence: 
+            - person.nathaniel
+
+      windowsensors:
+        - binary_sensor.your_window_door_is_open
+
       screening:
         - screen: cover.your_screen
-          windowsensors: # If screen is on a window/door that can be opened it will not autoclose when sensor is 'on'
+          windowsensors:
           - binary_sensor.window_door_is_open
-          lux_close: 40000 # Close cover if temperatures is above target and lux is above
-          lux_open: 7000 # Open cover again when lux goes below
-          lux_open_media: 2000 # Optional lux setting if one of the mediaplayers is on
-          not_when_home: # Only close cover automatically if persons are not at home
+          lux_close: 40000
+          lux_open: 15000
+          lux_open_media: 4000
+          not_when_home:
             - person.wife
           mediaplayers:
-          - switch.projector
-          - media_player.your_tv
-      # Notifications for when temperatures is low and window is open, or hot and windows are closed
+            - switch.projector
+            - media_player.your_tv
+
       notify_reciever:
         - mobile_app_your_phone
-      notify_title: 'ClimateCommander'
-      notify_message_cold: 'It\'s getting cold inside and window is open. Temperature is'
-      notify_message_warm: 'It\'s getting hot inside and temperature is'
-      notify_above: 28 # Sends you a notification to open a window if indoor temperature exceeds
 ```
 
 
@@ -253,46 +255,45 @@ key | optional | type | default | introduced in | description
 `class` | False | string | | v1.0.0 | The name of the Class.
 `HASS_namespace` | True | string | default | v1.0.0 | HASS namespace
 `MQTT_namespace` | True | string | default | v1.0.0 | MQTT namespace
-`vacation` | True | input_boolean | input_boolean.vacation | v1.0.0 | Sets Vacation temperature
+
 `outside_temperature` | True | sensor | | v1.0.0 | Sensor for outside temperature
 `anemometer` | True | sensor | | v1.0.0 | Sensor for wind speed
 `anemometer_speed` | True | int | 40 | v1.0.0 | windy target
 `rain_sensor` | True | sensor | | v1.0.0 | Sensor for rain detection
+`rain_level` | True | int | 3 | v1.2.0 | rainy target
 `OutLux_sensor` | True | sensor | | v1.0.0 | Sensor for Lux detection
 `OutLuxMQTT` | True | MQTT sensor | | v1.0.0 | Lux detection via MQTT
 `OutLux_sensor_2` | True | sensor | | v1.0.0 | Secondary Sensor for Lux detection
 `OutLuxMQTT_2` | True | MQTT sensor | | v1.0.0 | Secondary Lux detection via MQTT
+`screening_temp` | True | int | 8 | v1.0.0 | Outside temperature needs to be over this to automatically close screen
+`getting_cold` | True | int | 18 | v1.0.6 | Cold outside for notifications below outside temperature
+`json_path` | True | string | None | v1.1.0 | Persisten storage
+`vacation` | True | input_boolean | input_boolean.vacation | v1.1.0 | Activates Vacation temperature
+`vacation_temp` | True | int | 16 | v1.1.0 | Indoor vacation temperature
 
 ### Key definitions for defining climates
 key | optional | type | default | introduced in | description
 -- | -- | -- | -- | -- | --
-`Command` | False | list | | v1.0.0 | Contains climates
+`HVAC` | False | list | | v1.1.0 | Contains HVAC climates
+`Heaters` | False | list | | v1.1.0 | Contains Heater climates
 `climate` | False | climate entity | | v1.0.0 | The entity_id of the climate
-`indoor_temp` | False | sensor | | v1.0.0 | External indoor temperature sensor
+`indoor_sensor_temp` | False | sensor | | v1.0.0 | External indoor temperature sensor
 `target_indoor_temp` | True | int | 23 | v1.0.0 | Indoor target temperature and Screening/cover auto close
 `target_indoor_input` | True | input_number | | v1.0.3 | Set indoor target temperature with a HA sensor
-`automate` | True | input_boolean | True | v1.0.3 | Turn off a input boolean to stop automating temperature
-`temperatures` | False | list | | v1.0.0 | List of outdoor temperatures with dictionary normal and away temperatures
-`windowsensors` | True | list | | v1.0.0 | Will set fan_only when window is opened for more than 2 minutes
+`window_sensor_temp` | True | sensor | | v1.1.0 | Window temperature sensor
+`window_offset` | True | int | -3 | v1.1.0 | offset from indoor temperature sensor 
 `daytime_savings` | True | dictionary | | v1.0.0 | Contains start / stop and optionally presence to lower temperature
 `daytime_increasing` | True | dictionary | | v1.0.0 | Contains start / stop and optionally presence to increase temperature
 `silence` | True | dictionary | | v1.0.4 | Contains start / stop and optionally presence to set fan to silence
-`hvac_enabled` | True | bool | True | v1.0.1 | Set to false to disable HVAC possibilities for heating only
-`getting_cold` | True | int | 18 | v1.0.6 | Cold outside for notifications below outside temperature
-`hvac_fan_only_above` | True | int | 24 | v1.0.0 | Fan Only above value
-`hvac_cooling_above` | True | int | 28 | v1.0.0 | Cooling above
-`cooling_temp_outside_above` | True | int | 20 | v1.0.6 | Cooling above
-`hvac_cooling_temp` | True | int | 22 | v1.0.0 | AC temperature when cooling
+`windowsensors` | True | list | | v1.0.0 | Will set fan_only when window is opened for more than 2 minutes
+`automate` | True | input_boolean | True | v1.0.3 | Turn off a input boolean to stop automating temperature
 `notify_reciever` | True | list | | v1.0.0 | Notify recipients
-`notify_title` | True | string | ClimateCommander | v1.0.0 | Title
-`notify_message_cold` | True | string | It's getting cold inside and window is open. Temperature is | v1.0.0 | Message
-`notify_message_warm` | True | string | It's getting hot inside and temperature is | v1.0.0 | Message
-`notify_above` | True | int | 28 | v1.0.0 | Sends you a notification to open a window if indoor temperature exceeds
+
 
 ### Key definitions for defining screens 
 key | optional | type | default | introduced in | description
 -- | -- | -- | -- | -- | --
-`screening_temp` | True | int | 8 | v1.0.0 | Outside temperature needs to be over this to automatically close screen
+
 `screening` | True | dictionary | | v1.0.0 | Contains a list of cover entities to control
 `windowsensors` | True | list | | v1.0.0 | If screen is on a window/door that can be opened it will not autoclose when sensor is 'on'
 `lux_close` | True | int | 40000 | v1.0.0 | Close cover if temperatures is above target and lux is above
