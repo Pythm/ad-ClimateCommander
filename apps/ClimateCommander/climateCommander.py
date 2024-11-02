@@ -6,7 +6,7 @@
 
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import appdaemon.plugins.hass.hassapi as hass
 import datetime
@@ -93,6 +93,7 @@ class Climate(hass.Hass):
             except (ValueError, TypeError) as ve:
                 if self.weather_temperature:
                     OUT_TEMP = float(self.get_state(entity_id = self.weather_temperature, attribute = 'temperature'))
+
                     self.backup_temp_handler = self.listen_state(self.outsideBackupTemperatureUpdated, self.weather_temperature,
                         attribute = 'temperature'
                     )
@@ -560,7 +561,7 @@ class Heater():
         # Sets Vacation status
     def awayStateListen(self, entity, attribute, old, new, kwargs) -> None:
         self.away_state = new == 'on'
-        self.ADapi.run_in(self.heater_setNewValues, 5)
+        self.ADapi.run_in(self.set_indoortemp, 5)
 
 
         # Indoor target temperature
@@ -680,7 +681,13 @@ class Heater():
         else:
             away_temp = 10
 
-        new_temperature = self.adjust_set_temperature_by(new_temperature, in_temp)
+        if (
+            new_temperature < self.target_indoor_temp - 6
+            and in_temp < self.target_indoor_temp
+        ):
+            new_temperature = self.getHeatingTemp()  
+        else:
+            new_temperature = self.adjust_set_temperature_by(new_temperature, in_temp)
 
 
         # Windows
@@ -740,8 +747,8 @@ class Heater():
             self.heater_temp_last_changed = self.ADapi.datetime(aware=True)
         elif (
                 self.usePersistentStorage   
-                and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(minutes = 60)
-                and self.ADapi.datetime(aware=True) - self.heater_temp_last_registered > datetime.timedelta(minutes = 60)
+                and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(hours = 1)
+                and self.ADapi.datetime(aware=True) - self.heater_temp_last_registered > datetime.timedelta(hours = 1)
             ):
                 self.registerHeatingtemp()
                 self.heater_temp_last_registered = self.ADapi.datetime(aware=True)
@@ -761,14 +768,14 @@ class Heater():
             if window_temp > self.target_indoor_temp + self.window_offset:
                 adjust_temp_by = round((self.target_indoor_temp + self.window_offset) - window_temp,1)
                 """ Logging of window temp turning down heating """
-                global OUT_LUX
-                if OUT_LUX < 2000:
-                    self.ADapi.log(
-                        f"{self.ADapi.get_state(self.window_temp, namespace = self.namespace, attribute = 'friendly_name')} "
-                        f"is {window_temp}. That is {-adjust_temp_by} above offset. "
-                        f"The lux outside is {OUT_LUX}",
-                        level = 'INFO'
-                        )
+                #global OUT_LUX
+                #if OUT_LUX < 2000:
+                #    self.ADapi.log(
+                #        f"{self.ADapi.get_state(self.window_temp, namespace = self.namespace, attribute = 'friendly_name')} "
+                #        f"is {window_temp}. That is {-adjust_temp_by} above offset. "
+                #        f"The lux outside is {OUT_LUX}",
+                #        level = 'INFO'
+                #        )
                 """ End logging """
 
         adjust_temp_by += round(self.target_indoor_temp - in_temp, 1)
@@ -781,10 +788,9 @@ class Heater():
         elif (
             self.ADapi.datetime(aware=True) - self.heater_temp_last_changed < datetime.timedelta(minutes = 30)
             and adjust_temp_by > 0
-            and adjust_temp_by < 0.5
+            and adjust_temp_by < 0.4
         ):
             adjust_temp_by = 0
-        
         
         if (
             self.ADapi.datetime(aware=True) - self.window_last_opened > datetime.timedelta(hours = 1)
@@ -819,6 +825,13 @@ class Heater():
         except (ValueError, TypeError):
             return
 
+        if (
+            heater_temp >= self.target_indoor_temp + 4
+            or heater_temp <= self.target_indoor_temp - 4
+        ):
+            return
+
+
         if not out_temp_str in heatingdevice_data[self.heater]['data']:
             newData = {out_lux_str : {"temp" : heater_temp, "Counter" : 1}}
             heatingdevice_data[self.heater]['data'].update(
@@ -833,7 +846,7 @@ class Heater():
             heatingData = heatingdevice_data[self.heater]['data'][out_temp_str][out_lux_str]
             counter = heatingData['Counter'] + 1
             if counter > 100:
-                return
+                counter = 10
 
             avgheating = round(((heatingData['temp'] * heatingData['Counter']) + heater_temp) / counter,1)
             newData = {"temp" : avgheating, "Counter" : counter}
@@ -893,15 +906,20 @@ class Heater():
                 out_lux_str = closest_lux
             
             temp = heatingdevice_data[self.heater]['data'][out_temp_str][out_lux_str]['temp']
-            self.ADapi.log(f"Temp from Json: {temp}")
             return temp
 
         else:
             try:
-                return float(self.ADapi.get_state(self.heater,
+                temp = float(self.ADapi.get_state(self.heater,
                     attribute='temperature',
                     namespace = self.namespace
                 ))
+                if temp > self.target_indoor_temp + 6:
+                    temp = self.target_indoor_temp
+                elif temp < self.target_indoor_temp - 6:
+                    temp = self.target_indoor_temp
+                return temp
+
             except (ValueError, TypeError):
                 return self.target_indoor_temp
             except Exception as e:
@@ -1170,7 +1188,14 @@ class Aircondition(Heater):
             else:
                 away_temp = 10
 
-            new_temperature = self.adjust_set_temperature_by(new_temperature, in_temp)
+            if (
+                new_temperature < self.target_indoor_temp - 6
+                and in_temp < self.target_indoor_temp
+                and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(hours = 4)
+            ):
+                new_temperature = self.getHeatingTemp()
+            else:
+                new_temperature = self.adjust_set_temperature_by(new_temperature, in_temp)
 
             # Windows
             if self.windows_is_open:
@@ -1273,8 +1298,8 @@ class Aircondition(Heater):
 
             elif (
                 self.usePersistentStorage   
-                and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(minutes = 60)
-                and self.ADapi.datetime(aware=True) - self.heater_temp_last_registered > datetime.timedelta(minutes = 60)
+                and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(hours = 2)
+                and self.ADapi.datetime(aware=True) - self.heater_temp_last_registered > datetime.timedelta(hours = 2)
             ):
                 self.registerHeatingtemp()
                 self.heater_temp_last_registered = self.ADapi.datetime(aware=True)
