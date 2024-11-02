@@ -12,9 +12,9 @@ This is developed in Norway where we mostly need heating.
 
 ### Features:
 
-Automatically changes HVAC entities to fan_only if indoor temperature is 0.6 degree above target or if windows are open
-Changes from fan_only to cool if indoor temperature is 1 degree above target and outdoor temperature is above indoor target
-Automatically closes screens/covers when it's above target indoor temperature and above given lux constraints
+Automatically changes HVAC entities to fan_only if indoor temperature is 0.6 degree above target or if windows are open. <br>
+Changes from fan_only to cool if indoor temperature is 1 degree above target and outdoor temperature is above indoor target. <br>
+Automatically closes screens/covers when it's above target indoor temperature and above given lux constraints. <br>
 
 ![Picture is generated with AI](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
 
@@ -153,7 +153,7 @@ You can prevent covers from closing when a person/tracker is at home using a lis
 
 ### Vacation temperature
 You can define an Home Assistant input_boolean helper to lower the consumption when on vacation. When heating the target indoor temp will be set to a temperature defined with `vacation_temp`. The vacation temperature can either be defined at main level or under each climate entity.
-When cooling the temperature will be set 3 degrees above
+When cooling the temperature will be set 3 degrees above.
 
 ```yaml
   vacation: input_boolean.vacation
