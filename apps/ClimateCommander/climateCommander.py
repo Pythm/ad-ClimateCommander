@@ -567,6 +567,7 @@ class Heater():
         # Indoor target temperature
     def updateTarget(self, entity, attribute, old, new, kwargs):
         self.target_indoor_temp = float(new)
+        self.ADapi.run_in(self.set_indoortemp, 5)
 
 
         # Helper functions to check windows
