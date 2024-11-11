@@ -6,7 +6,7 @@
 
 """
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 import appdaemon.plugins.hass.hassapi as hass
 import datetime
@@ -566,7 +566,7 @@ class Heater():
 
         # Indoor target temperature
     def updateTarget(self, entity, attribute, old, new, kwargs):
-        self.target_indoor_input = new
+        self.target_indoor_temp = float(new)
 
 
         # Helper functions to check windows
