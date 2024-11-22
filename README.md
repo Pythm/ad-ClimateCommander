@@ -174,12 +174,22 @@ Define an HA input boolean and configure with `automate` to disable automation w
 
 
 ### Set up notifications
-You can get notifications for when the indoor temperature is low and a window is open, or if it is hot and windows are closed. It sends notifications with [Notify integration](https://www.home-assistant.io/integrations/notify/).
+You can get notifications for when the indoor temperature is low and a window is open, or if it is hot and windows are closed. It sends notifications with [Notify integration](https://www.home-assistant.io/integrations/notify/). Create a list for all devices you want to receive notifications. Receivers can be configured at app level, or for each climate.
 
 ```yaml
       notify_reciever:
         - mobile_app_your_phone
 ```
+
+You can also configure ClimateCommander to use your own Notification app instead with `notify_app`. You'll need to have a function in your app to receive. ClimateCommander sends one notification pr list entry.
+```python
+    def send_notification(self,
+        message:str,
+        message_title:str,
+        message_recipient:str
+    ) -> None:
+```
+Search for "Test your notification app" in .py file and uncomment to test your own notification app.
 
 ## Get started
 > [!TIP]
