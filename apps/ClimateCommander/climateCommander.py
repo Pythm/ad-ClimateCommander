@@ -4,7 +4,7 @@
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 import appdaemon.plugins.hass.hassapi as hass
 import datetime
@@ -889,8 +889,6 @@ class Heater():
         ):
             adjust_temp_by = 0
 
-        persistent_temperature:float = new_temperature
-        valid_temp_data:bool = False
         persistent_temperature, valid_temp_data = self.getHeatingTemp()
 
         if self.prev_in_temp > in_temp:
@@ -918,7 +916,7 @@ class Heater():
 
                 if (
                     valid_temp_data
-                    and new_temperature < persistent_temperature
+                    and round(new_temperature * 2, 0) / 2 < round(persistent_temperature * 2, 0) / 2
                 ):
                     self.prev_in_temp = in_temp
                     return persistent_temperature
@@ -935,7 +933,7 @@ class Heater():
 
             if (
                 valid_temp_data
-                and new_temperature > persistent_temperature
+                and round(new_temperature * 2, 0) / 2 > round(persistent_temperature * 2, 0) / 2
             ):
                 self.prev_in_temp = in_temp
                 return persistent_temperature
@@ -1028,7 +1026,9 @@ class Heater():
 
             valid_temp_data:bool = True
 
-            if not out_temp_str in heatingdevice_data[self.heater]['data']:
+            try:
+                lux_temp_data = heatingdevice_data[self.heater]['data'][out_temp_str]
+            except Exception:
                 valid_temp_data = False
                 temp_diff:int = 0
                 closest_temp:int
@@ -1046,27 +1046,34 @@ class Heater():
                         temp_diff = float(temps) - OUT_TEMP
                         closest_temp = temps
                 out_temp_str = closest_temp
+                lux_temp_data = heatingdevice_data[self.heater]['data'][out_temp_str]
 
-            if not out_lux_str in heatingdevice_data[self.heater]['data'][out_temp_str]:
+            try:
+                temp = lux_temp_data[out_lux_str]['temp']
+            except Exception as e:
                 valid_temp_data = False
                 lux_diff:int = 0
                 closest_lux:int
+                luxCheck = math.floor(OUT_LUX / 5000)
                 for luxs in heatingdevice_data[self.heater]['data'][out_temp_str]:
-                    if OUT_LUX > float(luxs):
-                        if lux_diff != 0:
-                            if lux_diff < OUT_LUX - float(luxs):
-                                continue
-                        lux_diff = OUT_LUX - float(luxs)
-                        closest_lux = luxs
+                    if luxCheck > int(luxs):
+                        if lux_diff == 0:
+                            lux_diff = luxCheck - int(luxs)
+                            closest_lux = luxs
+                        elif lux_diff >= luxCheck - int(luxs):
+                            lux_diff = luxCheck - int(luxs)
+                            closest_lux = luxs
+                        
                     else:
-                        if lux_diff != 0:
-                            if lux_diff < float(luxs) - OUT_LUX:
-                                continue
-                        lux_diff = float(luxs) - OUT_LUX
-                        closest_lux = luxs
+                        if lux_diff == 0:
+                            lux_diff = int(luxs) - luxCheck
+                            closest_lux = luxs
+                        elif lux_diff > int(luxs) - luxCheck:
+                            lux_diff = int(luxs) - luxCheck
+                            closest_lux = luxs
                 out_lux_str = closest_lux
-            
-            temp = heatingdevice_data[self.heater]['data'][out_temp_str][out_lux_str]['temp']
+                temp = lux_temp_data[out_lux_str]['temp']
+
 
             if int(heatingdevice_data[self.heater]['data'][out_temp_str][out_lux_str]['Counter']) < 10:
                 valid_temp_data = False
@@ -1093,7 +1100,12 @@ class Heater():
     def setHeatingTempFromPersisten(self, kwargs) -> None:
         """ Function to set heater temp directly to data found in persistent storage
         """
+        offset:float = 0.0
+        if 'offset' in kwargs:
+            offset = kwargs['offset']
+
         temp, valid_temp_data = self.getHeatingTemp()
+        temp += offset
 
         # Update with new temperature
         self.ADapi.call_service('climate/set_temperature',
@@ -1178,7 +1190,14 @@ class Aircondition(Heater):
                 heatingdevice_data = json.load(json_read)
 
             if 'fan_mode' in heatingdevice_data[self.heater]:
-                self.fan_mode_persistent = heatingdevice_data[self.heater]['fan_mode']
+                if heatingdevice_data[self.heater]['fan_mode'] != None:
+                    self.fan_mode_persistent = heatingdevice_data[self.heater]['fan_mode']
+
+        if (
+            self.fan_mode_persistent == None
+            or self.fan_mode_persistent == 'Silence'
+        ):
+            self.fan_mode_persistent = 'Auto'
 
 
     def set_indoortemp(self, kwargs) -> None:
@@ -1280,7 +1299,10 @@ class Aircondition(Heater):
                     fan_mode = 'Silence',
                     namespace = self.namespace
                 )
-                if self.fan_mode != self.fan_mode_persistent:
+                if (
+                    self.fan_mode != self.fan_mode_persistent
+                    and self.fan_mode != None
+                ):
                     self.fan_mode_persistent = self.fan_mode
 
                     if self.usePersistentStorage:
@@ -1624,7 +1646,8 @@ class Aircondition(Heater):
                             hvac_mode = 'heat',
                             namespace = self.namespace
                         )
-                        self.ADapi.run_in(self.setHeatingTempFromPersisten, 10)
+                        # Set new temperature after change to heating
+                        self.ADapi.run_in(self.setHeatingTempFromPersisten, 10, offset = -1)
                     except Exception as e:
                         self.ADapi.log(
                             f"Not able to set hvac_mode to heat for {self.heater}. Probably not supported. {e}",
@@ -1640,7 +1663,8 @@ class Aircondition(Heater):
                             hvac_mode = 'heat',
                             namespace = self.namespace
                         )
-                        self.ADapi.run_in(self.setHeatingTempFromPersisten, 10)
+                        # Set new temperature after change to heating
+                        self.ADapi.run_in(self.set_indoortemp, 20)
                     except Exception as e:
                         self.ADapi.log(
                             f"Not able to set hvac_mode to heat for {self.heater}. Probably not supported. {e}",
