@@ -5,6 +5,12 @@ Changed Command name to either a "HVAC" or a "Heater" for unified control.
 Renamed indoor sensor temperature to `indoor_sensor_temp`.
 Renamed vacation mode (away state) to `vacation`.
 
+Version 1.2.0 Updates:
+
+- Notification Enhancements: Notifications now send recipients as a list to optimize performance by making only one call to send_notification. Please note, this change may affect custom notification apps if they are not updated accordingly.
+- Weather Sensor Configuration: The automatic detection of a weather sensor has been removed. You can now utilize the ad-Weather app or develop your own solution to receive weather data via events. This allows for more flexible and customized sensor configuration within individual applications.
+
+
 # Climate Commander by Pythm
 An Appdaemon app for controlling `climate` entities in [Home Assistant](https://www.home-assistant.io/). Set an indoor temperature target with an external indoor temperature sensor and configure your screens and provide other sensors to maintain a balanced indoor climate.
 
@@ -45,13 +51,15 @@ This app is designed to control climate entities in Home Assistant based on indo
 > [!NOTE]
 > This app does not consider electricity prices or usage. If you're looking for an app that controls heaters, hot water boilers, and chargers for cars based on electricity price and usage, please check out [ElectricalManagement](https://github.com/Pythm/ad-ElectricalManagement)
 
-Namespace Configuration:
+
+#### Namespace Configuration
 If you have defined a namespace for Home Assistant (HASS), you need to configure the app with HASS_namespace. Similarly, if you're using MQTT, define your MQTT namespace with MQTT_namespace. Both defaults are set to "default" if not specified.
 
 
 ### Outdoor weather sensors climate reacts to
-If you do not have an outdoor temperature sensor, the app will try to get the temperature from the [Met.no](https://www.home-assistant.io/integrations/met) integration.
+I recommend setting up the [ad-Weather](https://github.com/Pythm/ad-Weather) application. This tool consolidates all your weather sensors into one application, and it publishes an event to other applications whenever there is a sensor update.
 
+Please note that any weather sensors integrated with climateCommander will take precedence over the ad-Weather app.
 
 An anemometer can be used to increase the indoor set temperature when it is windy. Define your sensor using `anemometer` and a "windy" target with `anemometer_speed`. If the wind speed exceeds the target, all screens will open, and if needed to maintain the temperature, the HVAC system will activate the boost preset mode. Note that boost will not be set if the fan mode is set to Silence.
 
@@ -91,12 +99,13 @@ The app also supports an additional indoor temperature sensor. A windowsensor eq
 ## Configurations for the app
 
 ### Temperature settings for climate
-Define an external indoor temperature sensor with `indoor_sensor_temp`, and set `target_indoor_temp` for the external indoor temperature. Alternatively to the target_indoor_temp, you can use a Home Assistant input_number helper and set the target from that with `target_indoor_input`.
+Define an external indoor temperature sensor with `indoor_sensor_temp`, and set `target_indoor_temp` for the external indoor temperature. Alternatively to the target_indoor_temp, you can use a Home Assistant input_number helper and set the target from that with `target_indoor_input`. Specify a backup indoor temperature sensor with `backup_indoor_sensor_temp` that will be used if main indoor temp is unavailable or stale for more than two hours.
 
 Add a window sensor with `window_sensor_temp` and input the offset between the indoor sensor and the window sensor when the sun is not heating with `window_offset`.
 
 ```yaml
       indoor_sensor_temp: sensor.yourIndoorTemperatureSensor # External indoor temperature sensor
+      backup_indoor_sensor_temp: sensor.yourBackupTemp
       target_indoor_temp: 22.7
       target_indoor_input: input_number.yourInput
       window_sensor_temp: sensor.your_windowsensor_air_temperature
@@ -181,7 +190,7 @@ You can get notifications for when the indoor temperature is low and a window is
         - mobile_app_your_phone
 ```
 
-You can also configure ClimateCommander to use your own Notification app instead with `notify_app`. You'll need to have a function in your app to receive. ClimateCommander sends one notification pr list entry.
+You can also configure ClimateCommander to use your own Notification app instead with `notify_app`. You'll need to have a function in your app to receive.
 ```python
     def send_notification(self,
         message:str,
