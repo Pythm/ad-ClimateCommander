@@ -4,9 +4,9 @@
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
-import appdaemon.plugins.hass.hassapi as hass
+from appdaemon.plugins.hass.hassapi import Hass
 import datetime
 import math
 import json
@@ -23,7 +23,7 @@ OUT_LUX:float = 0.0
 global CLOUD_COVER
 CLOUD_COVER:int = 0
 
-class Climate(hass.Hass):
+class Climate(Hass):
 
     def initialize(self):
 
@@ -116,7 +116,7 @@ class Climate(hass.Hass):
                 namespace = HASS_namespace
             )
         if 'OutLuxMQTT' in self.args:
-            if self.mqtt == None:
+            if self.mqtt is None:
                 self.mqtt = self.get_plugin_api("MQTT")
             out_lux_sensor = self.args['OutLuxMQTT']
             self.mqtt.mqtt_subscribe(out_lux_sensor)
@@ -131,7 +131,7 @@ class Climate(hass.Hass):
                 namespace = HASS_namespace
             )
         if 'OutLuxMQTT_2' in self.args:
-            if self.mqtt == None:
+            if self.mqtt is None:
                 self.mqtt = self.get_plugin_api("MQTT")
             out_lux_sensor = self.args['OutLuxMQTT_2']
             self.mqtt.mqtt_subscribe(out_lux_sensor)
@@ -432,7 +432,7 @@ class Heater():
         self.backup_indoor_sensor_temp = backup_indoor_sensor_temp
         self.prev_in_temp = float()
 
-        if target_indoor_input != None:
+        if target_indoor_input is not None:
             api.listen_state(self.updateTarget, target_indoor_input,
                 namespace = namespace
             )
@@ -443,7 +443,7 @@ class Heater():
         try:
             self.prev_in_temp = float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = namespace))
         except (ValueError, TypeError) as ve:
-            if self.backup_indoor_sensor_temp != None:
+            if self.backup_indoor_sensor_temp is not None:
                 try:
                     self.prev_in_temp = float(self.ADapi.get_state(self.backup_indoor_sensor_temp, namespace = namespace))
                 except (ValueError, TypeError) as ve:
@@ -539,7 +539,7 @@ class Heater():
         )
 
             # Notfification setup
-        if name_of_notify_app != None:
+        if name_of_notify_app is not None:
             self.notify_app = self.ADapi.get_app(name_of_notify_app)
         else:
             self.notify_app = Notify_Mobiles(api)
@@ -640,7 +640,7 @@ class Heater():
                 )
                 raise ValueError("Stale data")
         except (ValueError, TypeError) as ve:
-            if self.backup_indoor_sensor_temp != None:
+            if self.backup_indoor_sensor_temp is not None:
                 try:
                     in_temp = float(self.ADapi.get_state(self.backup_indoor_sensor_temp, namespace = self.namespace))
                 except (ValueError, TypeError) as ve:
@@ -651,7 +651,6 @@ class Heater():
                 f"Not able to set new inside temperature from {self.indoor_sensor_temp}. {e}",
                 level = 'WARNING'
             )
-
         return in_temp
 
 
@@ -754,7 +753,7 @@ class Heater():
                 in_temp -= 0.3 # Trick indoor temp sensor to set temp a bit higher
 
 
-        if self.away_temp != None:
+        if self.away_temp is not None:
             away_temp = self.away_temp
         else:
             away_temp = 10
@@ -816,10 +815,9 @@ class Heater():
         self.updateClimateTemperature(heater_temp = heater_temp, new_temperature = new_temperature)
 
 
-    def updateClimateTemperature(self, heater_temp, new_temperature:int) -> None:
+    def updateClimateTemperature(self, heater_temp, new_temperature) -> None:
         """ Updates climate with new temperature and updates persistent storage
         """
-
         # Update with new temperature
         if heater_temp != round(new_temperature * 2, 0) / 2:
             self.ADapi.call_service('climate/set_temperature',
@@ -844,7 +842,7 @@ class Heater():
         new_temperature:float = heater_set_temp
         adjust_temp_by:float = 0
 
-        if self.window_temp != None:
+        if self.window_temp is not None:
             try:
                 window_temp = float(self.ADapi.get_state(self.window_temp, namespace = self.namespace))
             except (TypeError, AttributeError):
@@ -992,10 +990,10 @@ class Heater():
         else:
             heatingData = heatingdevice_data[self.heater]['data'][out_temp_str][out_lux_str]
             counter = heatingData['Counter'] + 1
+            avgheating = round(((heatingData['temp'] * heatingData['Counter']) + heater_temp) / counter,1)
             if counter > 100:
                 counter = 10
 
-            avgheating = round(((heatingData['temp'] * heatingData['Counter']) + heater_temp) / counter,1)
             newData = {"temp" : avgheating, "Counter" : counter}
             heatingdevice_data[self.heater]['data'][out_temp_str].update(
                 {out_lux_str : newData}
@@ -1089,7 +1087,7 @@ class Heater():
             except Exception as e:
                 return self.target_indoor_temp, False
 
-    def setHeatingTempFromPersisten(self, kwargs) -> None:
+    def setHeatingTempFromPersisten(self, **kwargs) -> None:
         """ Function to set heater temp directly to data found in persistent storage
         """
         offset:float = 0.0
@@ -1184,11 +1182,11 @@ class Aircondition(Heater):
                 heatingdevice_data = json.load(json_read)
 
             if 'fan_mode' in heatingdevice_data[self.heater]:
-                if heatingdevice_data[self.heater]['fan_mode'] != None:
+                if heatingdevice_data[self.heater]['fan_mode'] is not None:
                     self.fan_mode_persistent = heatingdevice_data[self.heater]['fan_mode']
 
         if (
-            self.fan_mode_persistent == None
+            self.fan_mode_persistent is None
             or self.fan_mode_persistent == 'Silence'
         ):
             self.fan_mode_persistent = 'Auto'
@@ -1244,7 +1242,7 @@ class Aircondition(Heater):
                 )
                 if (
                     self.fan_mode != self.fan_mode_persistent
-                    and self.fan_mode != None
+                    and self.fan_mode is not None
                 ):
                     self.fan_mode_persistent = self.fan_mode
 
@@ -1320,7 +1318,7 @@ class Aircondition(Heater):
                 elif RAIN_AMOUNT >= self.rain_level:
                     in_temp -= 0.3 # Trick indoor temp sensor to set temp a bit higher
 
-            if self.away_temp != None:
+            if self.away_temp is not None:
                 away_temp = self.away_temp
             else:
                 away_temp = 10
@@ -1718,7 +1716,7 @@ class Screen():
                     namespace = self.namespace
                 )
                 self.screen_position = 100
-                if self.event_handler != None:
+                if self.event_handler is not None:
                     try:
                         self.ADapi.cancel_listen_event(self.event_handler)
                     except Exception as e:
