@@ -1169,7 +1169,7 @@ class Aircondition(Heater):
             # Set variables from indoor sensor and heater
         in_temp:float = self.get_in_temp()
         if in_temp is None:
-            self.ADapi.log(f"Indoor temp is None. Aborting setting new temperature", level = 'INFO') ###
+            self.ADapi.log(f"Indoor temp is None. Aborting setting new temperature", level = 'INFO')
             return
         heater_temp:float = self.get_heater_temp()
         ac_state = self.ADapi.get_state(self.heater, namespace = self.namespace)
@@ -1321,12 +1321,6 @@ class Aircondition(Heater):
                                     preset_mode = 'boost',
                                     namespace = self.namespace
                                 )
-                                self.ADapi.log(
-                                    f"{self.ADapi.get_state(self.heater, attribute = 'friendly_name', namespace = self.namespace)} "
-                                    f"It's windy outside. Boost mode set. Indoor temp is {round(in_temp,1)} Outdoor temperature is {OUT_TEMP}",
-                                    level = 'INFO'
-                                ) ###
-
 
                 elif self.ADapi.get_state(self.heater, attribute='preset_mode', namespace = self.namespace) == 'boost':
                     self.ADapi.call_service('climate/set_preset_mode',
