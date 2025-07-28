@@ -72,6 +72,7 @@ class Climate(Hass):
         self.rain_level:float = self.args.get('rain_level',3)
         self.anemometer = self.args.get('anemometer', None)
         self.anemometer_speed:int = self.args.get('anemometer_speed',40)
+        self.unit_of_measurement = self.args.get('unit_of_measurement', None)
 
             # Setup Outside temperatures
         global OUT_TEMP
@@ -182,7 +183,6 @@ class Climate(Hass):
                 notify_reciever = ac.get('notify_reciever', notify_reciever)
             )
             self.heatingdevice.append(aircondition)
-        
 
             # Configuration of heaters to command
         heaters = self.args.get('Heaters', [])
@@ -215,6 +215,20 @@ class Climate(Hass):
                 notify_reciever = heater.get('notify_reciever', notify_reciever)
             )
             self.heatingdevice.append(heating)
+        
+        if self.unit_of_measurement is None:
+            for ac in self.heatingdevice:
+                if ac.indoor_sensor_temp is not None:
+                    uom = self.get_state(ac.indoor_sensor_temp, attribute = 'unit_of_measurement')
+                    if 'C' in uom:
+                        self.unit_of_measurement = 'C'
+                        break
+                    elif 'F' in uom:
+                        self.unit_of_measurement = 'F'
+                        break
+        if self.unit_of_measurement is not None:
+            self.set_defaults()
+
 
         if JSON_PATH is not None:
             try:
@@ -231,6 +245,13 @@ class Climate(Hass):
             namespace = HASS_namespace
         )
 
+    def set_defaults(self):
+        if self.unit_of_measurement == 'C':
+            max_vacation_temp = 30
+        elif self.unit_of_measurement == 'F':
+            max_vacation_temp = 86
+        for ac in self.heatingdevice:
+            ac.max_vacation_temp = self.args.get('max_vacation_temp', max_vacation_temp)
 
         # Set proper value when weather sensors is updated
     def weather_event(self, event_name, data, kwargs) -> None:
@@ -454,6 +475,8 @@ class Heater():
             self.vacation_temp = float(vacation_temp)
         except (ValueError, TypeError) as ve:
             self.vacation_temp:float = 10
+        
+        self.max_vacation_temp = 30
 
         self.window_temp = window_temp
         self.window_offset:float = window_offset
@@ -1169,7 +1192,7 @@ class Aircondition(Heater):
             # Set variables from indoor sensor and heater
         in_temp:float = self.get_in_temp()
         if in_temp is None:
-            self.ADapi.log(f"Indoor temp is None. Aborting setting new temperature", level = 'INFO') ###
+            self.ADapi.log(f"Indoor temp is None. Aborting setting new temperature", level = 'INFO')
             return
         heater_temp:float = self.get_heater_temp()
         ac_state = self.ADapi.get_state(self.heater, namespace = self.namespace)
@@ -1284,23 +1307,26 @@ class Aircondition(Heater):
             # Holliday temperature
             if self.away_state:
                 new_temperature = self.vacation_temp
-                if in_temp > self.target_indoor_temp:
+                if (
+                    in_temp > self.target_indoor_temp -3
+                    and in_temp > self.vacation_temp + 3
+                ):
+                    try:
+                        self.ADapi.call_service('climate/set_hvac_mode',
+                            entity_id = self.heater,
+                            hvac_mode = 'fan_only',
+                            namespace = self.namespace
+                        )
+                    except Exception as e:
+                        self.ADapi.log(
+                            f"Not able to set hvac_mode to fan_only for {self.heater}. Probably not supported. {e}",
+                            level = 'INFO'
+                        )
+                        
                     if OUT_TEMP > self.screening_temp:
                         for s in self.screening:
                             s.try_screen_close()
-                    if in_temp > self.target_indoor_temp + 0.6:
-                        try:
-                            self.ADapi.call_service('climate/set_hvac_mode',
-                                entity_id = self.heater,
-                                hvac_mode = 'fan_only',
-                                namespace = self.namespace
-                            )
-                        except Exception as e:
-                            self.ADapi.log(
-                                f"Not able to set hvac_mode to fan_only for {self.heater}. Probably not supported. {e}",
-                                level = 'INFO'
-                            )
-                        return
+                    return
                 else:
                     for s in self.screening:
                         s.can_close_on_lux = False
@@ -1405,22 +1431,11 @@ class Aircondition(Heater):
                 # Correct indoor temp when rain
                 elif RAIN_AMOUNT >= self.rain_level:
                     in_temp -= 0.3 # Trick indoor temp sensor to set temp a bit higher
-            
-            # Holliday temperature
-            if self.away_state:
-                in_temp -= 3
-
-            new_temperature = self.adjust_set_temperature_by(heater_set_temp = heater_temp, in_temp = in_temp)
 
             for s in self.screening:
                 s.try_screen_close()
 
-            if (
-                (OUT_TEMP < self.target_indoor_temp
-                and in_temp < self.target_indoor_temp + 0.6)
-                or (in_temp < self.target_indoor_temp + 3
-                and self.away_state)
-            ):
+            if in_temp < self.target_indoor_temp + 0.6:
                 try:
                     self.ADapi.call_service('climate/set_hvac_mode',
                         entity_id = self.heater,
@@ -1433,6 +1448,22 @@ class Aircondition(Heater):
                         level = 'DEBUG'
                     )
                 return
+            if self.away_state:
+                if in_temp < self.max_vacation_temp - 2:
+                    try:
+                        self.ADapi.call_service('climate/set_hvac_mode',
+                            entity_id = self.heater,
+                            hvac_mode = 'fan_only',
+                            namespace = self.namespace
+                        )
+                    except Exception as e:
+                        self.ADapi.log(
+                            f"Not able to set hvac_mode to fan_only for {self.heater}. Probably not supported. {e}",
+                            level = 'DEBUG'
+                        )
+                    return
+
+            new_temperature = self.adjust_set_temperature_by(heater_set_temp = heater_temp, in_temp = in_temp)
 
             # Update with new temperature
             if heater_temp != round(new_temperature * 2, 0) / 2:
@@ -1452,7 +1483,7 @@ class Aircondition(Heater):
             ):
                 if (
                     in_temp > self.target_indoor_temp + 1
-                    and OUT_TEMP > self.target_indoor_temp - 2
+                    and OUT_TEMP > self.target_indoor_temp - 4
                 ):
                     try:
                         self.ADapi.call_service('climate/set_hvac_mode',
@@ -1484,7 +1515,10 @@ class Aircondition(Heater):
             elif (
                 not self.windows_is_open # And vacation
             ):
-                if in_temp <= self.target_indoor_temp -4:
+                if (
+                    in_temp <= self.target_indoor_temp -5
+                    or in_temp <= self.vacation_temp + 2
+                ):
                     try:
                         self.ADapi.call_service('climate/set_hvac_mode',
                             entity_id = self.heater,
@@ -1498,10 +1532,7 @@ class Aircondition(Heater):
                             f"Not able to set hvac_mode to heat for {self.heater}. Probably not supported. {e}",
                             level = 'DEBUG'
                         )
-                elif (
-                    in_temp > self.target_indoor_temp + 4
-                    and OUT_TEMP > self.target_indoor_temp
-                ):
+                elif in_temp > self.max_vacation_temp:
                     try:
                         self.ADapi.call_service('climate/set_hvac_mode',
                             entity_id = self.heater,
