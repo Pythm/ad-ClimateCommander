@@ -58,22 +58,19 @@ class Climate(Hass):
             else:
                 self.log(
                     "'vacation' not configured. Using 'input_boolean.vacation' as default away state",
-                    level = 'WARNING'
+                    level = 'INFO'
                 )
 
-        vacation_temp = self.args.get('vacation_temp', 16)
+        self.heatingdevice:list = []
+        self.unit_of_measurement = self.args.get('unit_of_measurement', None)
 
             # Weather sensors
         self.outside_temperature = self.args.get('outside_temperature', None)
-        screening_temp = self.args.get('screening_temp', 8)
-        getting_cold = self.args.get('getting_cold', 18)
-
         self.rain_sensor = self.args.get('rain_sensor', None)
         self.rain_level:float = self.args.get('rain_level',3)
         self.anemometer = self.args.get('anemometer', None)
         self.anemometer_speed:int = self.args.get('anemometer_speed',40)
-        self.unit_of_measurement = self.args.get('unit_of_measurement', None)
-
+        
             # Setup Outside temperatures
         global OUT_TEMP
         self.out_temp_last_update = self.datetime(aware=True) - datetime.timedelta(minutes = 20)
@@ -83,6 +80,7 @@ class Climate(Hass):
                 OUT_TEMP = float(self.get_state(self.outside_temperature))
             except (ValueError, TypeError):
                 self.log(f"Outside temperature is not valid. {e}", level = 'DEBUG')
+            self._set_unit_of_measurement(self.outside_temperature)
 
             # Setup Rain sensor
         global RAIN_AMOUNT
@@ -143,17 +141,57 @@ class Climate(Hass):
                 namespace = MQTT_namespace
             )
 
+        self.listen_event(self.weather_event, 'WEATHER_CHANGE',
+            namespace = HASS_namespace
+        )
 
-    # Persistent storage for storing mode and lux data
+        climates = self.args.get('HVAC', [])
+        if self.unit_of_measurement is None:
+            for ac in climates:
+                indoor_sensor_temp = ac.get('indoor_sensor_temp', None)
+                if self._set_unit_of_measurement(indoor_sensor_temp):
+                    break
+
+        heaters = self.args.get('Heaters', [])
+        if self.unit_of_measurement is None:
+            for heater in heaters:
+                indoor_sensor_temp = heater.get('indoor_sensor_temp', None)
+                if self._set_unit_of_measurement(indoor_sensor_temp):
+                    break
+
+        if self.unit_of_measurement == 'c':
+            self.unit_of_measurement = 'C'
+        elif self.unit_of_measurement == 'f':
+            self.unit_of_measurement = 'F'
+
+        if self.unit_of_measurement == 'C':
+            max_vacation_temp = self.args.get('max_vacation_temp', 30)
+            vacation_temp = self.args.get('vacation_temp', 16)
+            screening_temp = self.args.get('screening_temp', 8)
+            getting_cold = self.args.get('getting_cold', 18)
+            target_indoor_temp = 22.7
+        elif self.unit_of_measurement == 'F':
+            max_vacation_temp = self.args.get('max_vacation_temp', 86)
+            vacation_temp = self.args.get('vacation_temp', 61)
+            screening_temp = self.args.get('screening_temp', 47)
+            getting_cold = self.args.get('getting_cold', 65)
+            target_indoor_temp = 72.8
+        else:
+            self.log(
+                "Could not find unit of measurement. Please configure 'unit_of_measurement' with C or F.\n"
+                f"Aborting {self.name} setup",
+                level = 'WARNING'
+            )
+            return
+
+            # Persistent storage for storing mode and lux data
         if 'json_path' in self.args:
             global JSON_PATH
             JSON_PATH = self.args['json_path']
             JSON_PATH += str(self.name) + '.json'
 
             # Configuration of Heatpumps to command
-        self.heatingdevice:list = []
-        climate = self.args.get('HVAC', [])
-        for ac in climate:
+        for ac in climates:
             aircondition = Aircondition(self,
                 heater = ac['climate'],
                 indoor_sensor_temp = ac.get('indoor_sensor_temp', None),
@@ -161,8 +199,9 @@ class Climate(Hass):
                 window_temp = ac.get('window_sensor_temp', None),
                 window_offset = ac.get('window_offset', -3),
                 target_indoor_input = ac.get('target_indoor_input', None),
-                target_indoor_temp = ac.get('target_indoor_temp', 22.7),
+                target_indoor_temp = ac.get('target_indoor_temp', target_indoor_temp),
                 vacation_temp = ac.get('vacation_temp', vacation_temp),
+                max_vacation_temp = ac.get('max_vacation_temp', max_vacation_temp),
                 rain_level = ac.get('rain_level', self.rain_level),
                 anemometer_speed = ac.get('anemometer_speed', self.anemometer_speed),
 
@@ -194,7 +233,7 @@ class Climate(Hass):
                 window_temp = heater.get('window_sensor_temp', None),
                 window_offset = heater.get('window_offset', -3),
                 target_indoor_input = heater.get('target_indoor_input', None),
-                target_indoor_temp = heater.get('target_indoor_temp', 22.7),
+                target_indoor_temp = heater.get('target_indoor_temp', target_indoor_temp),
                 vacation_temp = heater.get('vacation_temp', vacation_temp),
                 rain_level = heater.get('rain_level', self.rain_level),
                 anemometer_speed = heater.get('anemometer_speed', self.anemometer_speed),
@@ -215,20 +254,6 @@ class Climate(Hass):
                 notify_reciever = heater.get('notify_reciever', notify_reciever)
             )
             self.heatingdevice.append(heating)
-        
-        if self.unit_of_measurement is None:
-            for ac in self.heatingdevice:
-                if ac.indoor_sensor_temp is not None:
-                    uom = self.get_state(ac.indoor_sensor_temp, attribute = 'unit_of_measurement')
-                    if 'C' in uom:
-                        self.unit_of_measurement = 'C'
-                        break
-                    elif 'F' in uom:
-                        self.unit_of_measurement = 'F'
-                        break
-        if self.unit_of_measurement is not None:
-            self.set_defaults()
-
 
         if JSON_PATH is not None:
             try:
@@ -241,17 +266,19 @@ class Climate(Hass):
                 with open(JSON_PATH, 'w') as json_write:
                     json.dump(heatingdevice_data, json_write, indent = 4)
 
-        self.listen_event(self.weather_event, 'WEATHER_CHANGE',
-            namespace = HASS_namespace
-        )
-
-    def set_defaults(self):
-        if self.unit_of_measurement == 'C':
-            max_vacation_temp = 30
-        elif self.unit_of_measurement == 'F':
-            max_vacation_temp = 86
-        for ac in self.heatingdevice:
-            ac.max_vacation_temp = self.args.get('max_vacation_temp', max_vacation_temp)
+    def _set_unit_of_measurement(self, sensor):
+        try:
+            uom = self.get_state(sensor, attribute = 'unit_of_measurement')
+        except Exception:
+            return False
+        else:
+            if 'C' in uom:
+                self.unit_of_measurement = 'C'
+                return True
+            elif 'F' in uom:
+                self.unit_of_measurement = 'F'
+                return True
+        return False
 
         # Set proper value when weather sensors is updated
     def weather_event(self, event_name, data, kwargs) -> None:
@@ -475,8 +502,7 @@ class Heater():
             self.vacation_temp = float(vacation_temp)
         except (ValueError, TypeError) as ve:
             self.vacation_temp:float = 10
-        
-        self.max_vacation_temp = 30
+            self.ADapi.log(f"Error setting vacation temperature. Set to 10 degrees.", level = 'INFO')
 
         self.window_temp = window_temp
         self.window_offset:float = window_offset
@@ -1112,6 +1138,7 @@ class Aircondition(Heater):
         target_indoor_input,
         target_indoor_temp:float,
         vacation_temp:float,
+        max_vacation_temp:float,
         rain_level:float,
         anemometer_speed:int,
 
@@ -1159,6 +1186,12 @@ class Aircondition(Heater):
             name_of_notify_app = name_of_notify_app,
             notify_reciever = notify_reciever
         )
+
+        try:
+            self.max_vacation_temp = float(max_vacation_temp)
+        except (ValueError, TypeError) as ve:
+            self.max_vacation_temp:float = 30
+            self.ADapi.log(f"Error setting max vacation temperature. Set to 30 degrees.", level = 'INFO')
 
         self.silence:list = silence
         self.fan_mode:str = self.ADapi.get_state(self.heater,

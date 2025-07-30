@@ -1,45 +1,61 @@
-## Breaking Change:
-We've made significant updates in version 1.1.0 to improve handling of both HVAC and heaters with non-electric sources.
+# Climate Commander by Pythm  
+An Appdaemon app for intelligent climate control in [Home Assistant](https://www.home-assistant.io/). Set target indoor temperatures using external sensors, automate screen/cover control, and maintain optimal climate conditions based on environmental data.
 
-Changed Command name to either a "HVAC" or a "Heater" for unified control.
-Renamed indoor sensor temperature to `indoor_sensor_temp`.
-Renamed vacation mode (away state) to `vacation`.
+---
 
-Version 1.2.0 Updates:
+## 🚨 Breaking Changes
 
-- Notification Enhancements: Notifications now send recipients as a list to optimize performance by making only one call to send_notification. Please note, this change may affect custom notification apps if they are not updated accordingly.
-- Weather Sensor Configuration: The automatic detection of a weather sensor has been removed. You can now utilize the ad-Weather app or develop your own solution to receive weather data via events. This allows for more flexible and customized sensor configuration within individual applications.
+### **1.1.0**
+- Unified control naming: Climate entities are now configured as either **"HVAC"** or **"Heater"** for clarity.
+- Renamed indoor sensor temperature to **`indoor_sensor_temp`**
+- Renamed **"vacation mode"** (away state) to **`vacation`** to separate from away for the day.
 
+### **1.2.0**
+- **Notification Enhancements**: Notifications now send recipients as a list to improve performance (single API call). *Note: Custom notification apps may require updates.*
+- **Weather Sensor Configuration**: Automatic weather sensor detection has been removed. Use the [ad-Weather](https://github.com/Pythm/ad-Weather) app or implement a custom solution to receive weather data via events. This provides greater flexibility in sensor configuration.
 
-# Climate Commander by Pythm
-An Appdaemon app for controlling `climate` entities in [Home Assistant](https://www.home-assistant.io/). Set an indoor temperature target with an external indoor temperature sensor and configure your screens and provide other sensors to maintain a balanced indoor climate.
+---
 
-This is developed in Norway where we mostly need heating.
+## 🔍 Features
 
-### Features:
+- **HVAC Mode Switching**  
+  - Automatically switches to **`fan_only`** if indoor temperature is 0.6°C above target or windows are open.  
+  - Switches to **`cool`** if indoor temperature is 1°C above target *and* outdoor temperature exceeds indoor target.  
 
-Automatically changes HVAC entities to fan_only if indoor temperature is 0.6 degree above target or if windows are open. <br>
-Changes from fan_only to cool if indoor temperature is 1 degree above target and outdoor temperature is above indoor target. <br>
-Automatically closes screens/covers when it's above target indoor temperature and above given lux constraints. <br>
+- **Screen/Cover Automation**  
+  - Automatically closes screens/curtains when indoor temperature exceeds target and ambient light (lux) levels are above defined thresholds.
 
-![Picture is generated with AI](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
+  ![AI-Generated Screenshot](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
 
-### Installation
-1. Download the `ClimateCommander` directory from inside the `apps` directory here to your [Appdaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory.
-2. Add the configuration to a .yaml or .toml file to enable the `ClimateCommander` module. Minimum required in your configuration with example input is:
+---
 
-```yaml
-nameyourClimateCommander:
-  module: climateCommander
-  class: Climate
-  HVAC:
-    - climate: climate.yourClimate
-      indoor_sensor_temp: sensor.yourIndoorTemperatureSensor # External indoor temperature sensor
-      target_indoor_temp: 22.7
-```
+## 🛠️ Installation & Configuration
 
-> [!TIP]
-> All numbers in the yaml example configurations are default if not defined in the configuration.
+1. **Clone the repository** into your [AppDaemon](https://appdaemon.readthedocs.io/en/latest/) `apps` directory:
+   ```bash
+   git clone https://github.com/Pythm/ad-ClimateCommander.git /path/to/appdaemon/apps/
+   ```
+
+2. **Configure the app** in your AppDaemon apps file (`.yaml` or `.toml`):
+
+   ```yaml
+   nameyourClimateCommander:
+     module: climateCommander
+     class: Climate
+     HVAC:
+       - climate: climate.yourClimate
+         indoor_sensor_temp: sensor.yourIndoorTemperatureSensor
+         target_indoor_temp: 22.7
+   ```
+
+   > 💡 **Tip**: Default values are used if parameters are omitted in the configuration.
+
+---
+
+## 📌 Notes
+- For weather data, consider using the [ad-Weather app](https://github.com/Pythm/ad-Weather) or a custom event-based solution.
+
+---
 
 
 ## App usage and configuration
@@ -97,6 +113,24 @@ The app also supports an additional indoor temperature sensor. A windowsensor eq
 ```
 
 ## Configurations for the app
+
+### Celcius or Fahrenheit
+App tries to find `unit_of_measurement` attributes from either `outside_temperature` or `indoor_sensor_temp`. If it does not find and it is not defined it will abort setup. Check the logs for any warning messages. This can be configured with either "C" or "F".
+
+#### Default temperatures that can be altered:
+When Celcius is detected:
+'max_vacation_temp' 30
+'vacation_temp' 16
+'screening_temp' 8
+'getting_cold' 18
+'target_indoor_temp' 22.7
+
+When Fahrenheit is detected:
+'max_vacation_temp' 86
+'vacation_temp' 61
+'screening_temp' 47
+'getting_cold' 65
+'target_indoor_temp' 72.8
 
 ### Temperature settings for climate
 Define an external indoor temperature sensor with `indoor_sensor_temp`, and set `target_indoor_temp` for the external indoor temperature. Alternatively to the target_indoor_temp, you can use a Home Assistant input_number helper and set the target from that with `target_indoor_input`. Specify a backup indoor temperature sensor with `backup_indoor_sensor_temp` that will be used if main indoor temp is unavailable or stale for more than two hours.
