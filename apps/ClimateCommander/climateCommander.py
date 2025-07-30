@@ -37,7 +37,7 @@ class Climate(Hass):
 
             # Namespaces for HASS and MQTT
         HASS_namespace = self.args.get('HASS_namespace', 'default')
-        MQTT_namespace = self.args.get('MQTT_namespace', 'default')
+        MQTT_namespace = self.args.get('MQTT_namespace', 'mqtt')
     
             # Default away state for saving purposes
         if 'away_state' in self.args:
