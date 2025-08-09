@@ -4,7 +4,7 @@
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 from appdaemon.plugins.hass.hassapi import Hass
 import datetime
@@ -37,7 +37,7 @@ class Climate(Hass):
 
             # Namespaces for HASS and MQTT
         HASS_namespace = self.args.get('HASS_namespace', 'default')
-        MQTT_namespace = self.args.get('MQTT_namespace', 'default')
+        MQTT_namespace = self.args.get('MQTT_namespace', 'mqtt')
     
             # Default away state for saving purposes
         if 'away_state' in self.args:
@@ -45,49 +45,38 @@ class Climate(Hass):
         elif 'vacation' in self.args:
             away_state = self.args['vacation']
         else:
-            away_state = 'input_boolean.vacation'
-            if not self.entity_exists(self.get_entity(away_state),
+            away_state = None
+            if self.entity_exists('input_boolean.vacation',
                 namespace = HASS_namespace
             ):
-                self.call_service("state/set",
-                    entity_id = away_state,
-                    attributes = {'friendly_name' : 'Vacation'},
-                    state = 'off',
-                    namespace = HASS_namespace
-                )
-            else:
-                self.log(
-                    "'vacation' not configured. Using 'input_boolean.vacation' as default away state",
-                    level = 'WARNING'
-                )
+                away_state = 'input_boolean.vacation'
 
-        vacation_temp = self.args.get('vacation_temp', 16)
+        self.heatingdevice:list = []
+        self.unit_of_measurement = self.args.get('unit_of_measurement', None)
 
             # Weather sensors
         self.outside_temperature = self.args.get('outside_temperature', None)
-        screening_temp = self.args.get('screening_temp', 8)
-        getting_cold = self.args.get('getting_cold', 18)
-
         self.rain_sensor = self.args.get('rain_sensor', None)
         self.rain_level:float = self.args.get('rain_level',3)
         self.anemometer = self.args.get('anemometer', None)
         self.anemometer_speed:int = self.args.get('anemometer_speed',40)
-
+        
             # Setup Outside temperatures
         global OUT_TEMP
         self.out_temp_last_update = self.datetime(aware=True) - datetime.timedelta(minutes = 20)
         if self.outside_temperature:
-            self.listen_state(self.outsideTemperatureUpdated, self.outside_temperature)
+            self.listen_state(self._outsideTemperatureUpdated, self.outside_temperature)
             try:
                 OUT_TEMP = float(self.get_state(self.outside_temperature))
             except (ValueError, TypeError):
                 self.log(f"Outside temperature is not valid. {e}", level = 'DEBUG')
+            self._set_unit_of_measurement(self.outside_temperature)
 
             # Setup Rain sensor
         global RAIN_AMOUNT
         self.rain_last_update = self.datetime(aware=True) - datetime.timedelta(minutes = 20)
         if self.rain_sensor:
-            self.listen_state(self.rainSensorUpdated, self.rain_sensor)
+            self.listen_state(self._rainSensorUpdated, self.rain_sensor)
             try:
                 RAIN_AMOUNT = float(self.get_state(self.rain_sensor))
             except (ValueError) as ve:
@@ -98,7 +87,7 @@ class Climate(Hass):
         global WIND_AMOUNT
         self.wind_last_update = self.datetime(aware=True) - datetime.timedelta(minutes = 20)
         if self.anemometer:
-            self.listen_state(self.anemometerUpdated, self.anemometer)
+            self.listen_state(self._anemometerUpdated, self.anemometer)
             try:
                 WIND_AMOUNT = float(self.get_state(self.anemometer))
             except (ValueError) as ve:
@@ -114,7 +103,7 @@ class Climate(Hass):
 
         if 'OutLux_sensor' in self.args:
             lux_sensor = self.args['OutLux_sensor']
-            self.listen_state(self.out_lux_state, lux_sensor,
+            self.listen_state(self._out_lux_state, lux_sensor,
                 namespace = HASS_namespace
             )
         if 'OutLuxMQTT' in self.args:
@@ -122,14 +111,14 @@ class Climate(Hass):
                 self.mqtt = self.get_plugin_api("MQTT")
             out_lux_sensor = self.args['OutLuxMQTT']
             self.mqtt.mqtt_subscribe(out_lux_sensor)
-            self.mqtt.listen_event(self.out_lux_event_MQTT, "MQTT_MESSAGE",
+            self.mqtt.listen_event(self._out_lux_event_MQTT, "MQTT_MESSAGE",
                 topic = out_lux_sensor,
                 namespace = MQTT_namespace
             )
 
         if 'OutLux_sensor_2' in self.args:
             lux_sensor = self.args['OutLux_sensor_2']
-            self.listen_state(self.out_lux_state2, lux_sensor,
+            self.listen_state(self._out_lux_state2, lux_sensor,
                 namespace = HASS_namespace
             )
         if 'OutLuxMQTT_2' in self.args:
@@ -137,22 +126,62 @@ class Climate(Hass):
                 self.mqtt = self.get_plugin_api("MQTT")
             out_lux_sensor = self.args['OutLuxMQTT_2']
             self.mqtt.mqtt_subscribe(out_lux_sensor)
-            self.mqtt.listen_event(self.out_lux_event_MQTT2, "MQTT_MESSAGE",
+            self.mqtt.listen_event(self.__out_lux_event_MQTT2, "MQTT_MESSAGE",
                 topic = out_lux_sensor,
                 namespace = MQTT_namespace
             )
 
+        self.listen_event(self.weather_event, 'WEATHER_CHANGE',
+            namespace = HASS_namespace
+        )
 
-    # Persistent storage for storing mode and lux data
+        climates = self.args.get('HVAC', [])
+        if self.unit_of_measurement is None:
+            for ac in climates:
+                indoor_sensor_temp = ac.get('indoor_sensor_temp', None)
+                if self._set_unit_of_measurement(indoor_sensor_temp):
+                    break
+
+        heaters = self.args.get('Heaters', [])
+        if self.unit_of_measurement is None:
+            for heater in heaters:
+                indoor_sensor_temp = heater.get('indoor_sensor_temp', None)
+                if self._set_unit_of_measurement(indoor_sensor_temp):
+                    break
+
+        if self.unit_of_measurement == 'c':
+            self.unit_of_measurement = 'C'
+        elif self.unit_of_measurement == 'f':
+            self.unit_of_measurement = 'F'
+
+        if self.unit_of_measurement == 'C':
+            max_vacation_temp = self.args.get('max_vacation_temp', 30)
+            vacation_temp = self.args.get('vacation_temp', 16)
+            screening_temp = self.args.get('screening_temp', 8)
+            getting_cold = self.args.get('getting_cold', 18)
+            target_indoor_temp = 22.7
+        elif self.unit_of_measurement == 'F':
+            max_vacation_temp = self.args.get('max_vacation_temp', 86)
+            vacation_temp = self.args.get('vacation_temp', 61)
+            screening_temp = self.args.get('screening_temp', 47)
+            getting_cold = self.args.get('getting_cold', 65)
+            target_indoor_temp = 72.8
+        else:
+            self.log(
+                "Could not find unit of measurement. Please configure 'unit_of_measurement' with C or F.\n"
+                f"Aborting {self.name} setup",
+                level = 'WARNING'
+            )
+            return
+
+            # Persistent storage for storing mode and lux data
         if 'json_path' in self.args:
             global JSON_PATH
             JSON_PATH = self.args['json_path']
             JSON_PATH += str(self.name) + '.json'
 
             # Configuration of Heatpumps to command
-        self.heatingdevice:list = []
-        climate = self.args.get('HVAC', [])
-        for ac in climate:
+        for ac in climates:
             aircondition = Aircondition(self,
                 heater = ac['climate'],
                 indoor_sensor_temp = ac.get('indoor_sensor_temp', None),
@@ -160,8 +189,9 @@ class Climate(Hass):
                 window_temp = ac.get('window_sensor_temp', None),
                 window_offset = ac.get('window_offset', -3),
                 target_indoor_input = ac.get('target_indoor_input', None),
-                target_indoor_temp = ac.get('target_indoor_temp', 22.7),
+                target_indoor_temp = ac.get('target_indoor_temp', target_indoor_temp),
                 vacation_temp = ac.get('vacation_temp', vacation_temp),
+                max_vacation_temp = ac.get('max_vacation_temp', max_vacation_temp),
                 rain_level = ac.get('rain_level', self.rain_level),
                 anemometer_speed = ac.get('anemometer_speed', self.anemometer_speed),
 
@@ -182,7 +212,6 @@ class Climate(Hass):
                 notify_reciever = ac.get('notify_reciever', notify_reciever)
             )
             self.heatingdevice.append(aircondition)
-        
 
             # Configuration of heaters to command
         heaters = self.args.get('Heaters', [])
@@ -194,7 +223,7 @@ class Climate(Hass):
                 window_temp = heater.get('window_sensor_temp', None),
                 window_offset = heater.get('window_offset', -3),
                 target_indoor_input = heater.get('target_indoor_input', None),
-                target_indoor_temp = heater.get('target_indoor_temp', 22.7),
+                target_indoor_temp = heater.get('target_indoor_temp', target_indoor_temp),
                 vacation_temp = heater.get('vacation_temp', vacation_temp),
                 rain_level = heater.get('rain_level', self.rain_level),
                 anemometer_speed = heater.get('anemometer_speed', self.anemometer_speed),
@@ -227,10 +256,20 @@ class Climate(Hass):
                 with open(JSON_PATH, 'w') as json_write:
                     json.dump(heatingdevice_data, json_write, indent = 4)
 
-        self.listen_event(self.weather_event, 'WEATHER_CHANGE',
-            namespace = HASS_namespace
-        )
-
+    def _set_unit_of_measurement(self, sensor):
+        try:
+            uom = self.get_state(sensor, attribute = 'unit_of_measurement')
+        except Exception:
+            return False
+        else:
+            match uom:
+                case uom if 'C' in uom:
+                    self.unit_of_measurement = 'C'
+                    return True
+                case uom if 'F' in uom:
+                    self.unit_of_measurement = 'F'
+                    return True
+        return False
 
         # Set proper value when weather sensors is updated
     def weather_event(self, event_name, data, kwargs) -> None:
@@ -260,8 +299,7 @@ class Climate(Hass):
         ):
             OUT_LUX = data['lux']
 
-
-    def outsideTemperatureUpdated(self, entity, attribute, old, new, kwargs) -> None:
+    def _outsideTemperatureUpdated(self, entity, attribute, old, new, kwargs) -> None:
         """ Updates OUT_TEMP from sensor
         """
         global OUT_TEMP
@@ -272,8 +310,7 @@ class Climate(Hass):
         else:
             self.out_temp_last_update = self.datetime(aware=True)
 
-
-    def rainSensorUpdated(self, entity, attribute, old, new, kwargs) -> None:
+    def _rainSensorUpdated(self, entity, attribute, old, new, kwargs) -> None:
         """ Updates RAIN_AMOUNT from sensor
         """
         global RAIN_AMOUNT
@@ -287,9 +324,8 @@ class Climate(Hass):
             if RAIN_AMOUNT > 0.0:
                 for ac in self.heatingdevice:
                     ac.tryScreenOpen()
-        
 
-    def anemometerUpdated(self, entity, attribute, old, new, kwargs) -> None:
+    def _anemometerUpdated(self, entity, attribute, old, new, kwargs) -> None:
         """ Updates WIND_AMOUNT from sensor
         """
         global WIND_AMOUNT
@@ -304,32 +340,29 @@ class Climate(Hass):
                 if WIND_AMOUNT >= ac.anemometer_speed:
                     ac.last_windy_time = self.datetime(aware=True)
 
-
         # LUX sensors
-    def out_lux_state(self, entity, attribute, old, new, kwargs) -> None:
-        """ Updates outLux1 from HA sensor and sends for check to newOutLux
+    def _out_lux_state(self, entity, attribute, old, new, kwargs) -> None:
+        """ Updates outLux1 from HA sensor and sends for check to _newOutLux
         """
         if self.outLux1 != float(new):
             self.outLux1 = float(new)
 
-            self.newOutLux()
+            self._newOutLux()
 
-
-    def out_lux_event_MQTT(self, event_name, data, kwargs) -> None:
-        """ Updates outLux1 from MQTT sensor and sends for check to newOutLux
+    def _out_lux_event_MQTT(self, event_name, data, kwargs) -> None:
+        """ Updates outLux1 from MQTT sensor and sends for check to _newOutLux
         """
         lux_data = json.loads(data['payload'])
-        if 'illuminance_lux' in lux_data:
-            if self.outLux1 != float(lux_data['illuminance_lux']):
-                self.outLux1 = float(lux_data['illuminance_lux']) # Zigbee sensor
-                self.newOutLux()
-        elif 'value' in lux_data:
-            if self.outLux1 != float(lux_data['value']):
-                self.outLux1 = float(lux_data['value']) # Zwave sensor
-                self.newOutLux()
 
+        match lux_data:
+            case {'illuminance_lux': illuminance} if self.outLux1 != float(illuminance):
+                self.outLux1 = float(illuminance) # Zigbee sensor
+                self._newOutLux()
+            case {'value': value} if self.outLux1 != float(value):
+                self.outLux1 = float(value) # Zwave sensor
+                self._newOutLux()
 
-    def newOutLux(self) -> None:
+    def _newOutLux(self) -> None:
         """ Updates OUT_LUX based on conditions between outLux1 and outLux2
         """
         global OUT_LUX
@@ -343,31 +376,27 @@ class Climate(Hass):
 
         self.lux_last_update1 = self.datetime(aware=True)
 
-
-    def out_lux_state2(self, entity, attribute, old, new, kwargs) -> None:
-        """ Updates outLux2 from HA sensor and sends for check to newOutLux
+    def _out_lux_state2(self, entity, attribute, old, new, kwargs) -> None:
+        """ Updates outLux2 from HA sensor and sends for check to _newOutLux
         """
         if self.outLux2 != float(new):
             self.outLux2 = float(new)
 
-            self.newOutLux2()
+            self.__newOutLux2()
 
-
-    def out_lux_event_MQTT2(self, event_name, data, kwargs) -> None:
-        """ Updates outLux2 from MQTT sensor and sends for check to newOutLux
+    def __out_lux_event_MQTT2(self, event_name, data, kwargs) -> None:
+        """ Updates outLux2 from MQTT sensor and sends for check to _newOutLux
         """
         lux_data = json.loads(data['payload'])
-        if 'illuminance_lux' in lux_data:
-            if self.outLux2 != float(lux_data['illuminance_lux']):
-                self.outLux2 = float(lux_data['illuminance_lux']) # Zigbee sensor
-                self.newOutLux2()
-        elif 'value' in lux_data:
-            if self.outLux2 != float(lux_data['value']):
-                self.outLux2 = float(lux_data['value']) # Zwave sensor
-                self.newOutLux2()
 
-
-    def newOutLux2(self) -> None:
+        match lux_data:
+            case {'illuminance_lux': illuminance} if self.outLux2 != float(illuminance):
+                self.outLux2 = float(illuminance) # Zigbee sensor
+                self._newOutLux()
+            case {'value': value} if self.outLux2 != float(value):
+                self.outLux2 = float(value) # Zwave sensor
+                self._newOutLux()
+    def __newOutLux2(self) -> None:
         """ Updates OUT_LUX based on conditions between outLux1 and outLux2
         """
         global OUT_LUX
@@ -385,7 +414,6 @@ class Climate(Hass):
 class Heater():
     """ Parent Class to control room temperature with climate entity and weather/temperature sensors
     """
-
     def __init__(self, api,
         heater,
         indoor_sensor_temp,
@@ -414,9 +442,7 @@ class Heater():
         name_of_notify_app,
         notify_reciever:list
     ):
-
         self.ADapi = api
-
         self.heater = heater
 
             # Sensors
@@ -425,7 +451,7 @@ class Heater():
         self.prev_in_temp = float()
 
         if target_indoor_input is not None:
-            api.listen_state(self.updateTarget, target_indoor_input,
+            api.listen_state(self._updateTarget, target_indoor_input,
                 namespace = namespace
             )
             self.target_indoor_temp = float(api.get_state(target_indoor_input, namespace = namespace))
@@ -454,6 +480,7 @@ class Heater():
             self.vacation_temp = float(vacation_temp)
         except (ValueError, TypeError) as ve:
             self.vacation_temp:float = 10
+            self.ADapi.log(f"Error setting vacation temperature. Set to 10 degrees.", level = 'INFO')
 
         self.window_temp = window_temp
         self.window_offset:float = window_offset
@@ -475,12 +502,12 @@ class Heater():
 
         self.window_last_opened = self.ADapi.datetime(aware=True) - datetime.timedelta(hours = 2)
         for windows in self.windowsensors:
-            self.ADapi.listen_state(self.windowOpened, windows,
+            self.ADapi.listen_state(self._windowOpened, windows,
                 new = 'on',
                 duration = 120,
                 namespace = namespace
             )
-            self.ADapi.listen_state(self.windowClosed, windows,
+            self.ADapi.listen_state(self._windowClosed, windows,
                 new = 'off',
                 namespace = namespace
             )
@@ -500,7 +527,6 @@ class Heater():
         self.notify_on_window_open:bool = True
         self.notify_on_window_closed:bool = False
 
-
             # Setup Screening/Covers
         self.screening = []
         for s in screens:
@@ -518,16 +544,18 @@ class Heater():
             self.screening.append(screen)
         self.screening_temp = screening_temp
 
-
         self.getting_cold:float = getting_cold
 
         self.namespace = namespace
 
             # Vacation setup
-        self.away_state = self.ADapi.get_state(away, namespace = namespace)  == 'on'
-        self.ADapi.listen_state(self.awayStateListen, away,
-            namespace = namespace
-        )
+        if away is None:
+            self.away_state = False
+        else:
+            self.away_state = self.ADapi.get_state(away, namespace = namespace)  == 'on'
+            self.ADapi.listen_state(self._awayStateListen, away,
+                namespace = namespace
+            )
 
             # Notfification setup
         if name_of_notify_app is not None:
@@ -536,13 +564,11 @@ class Heater():
             self.notify_app = Notify_Mobiles(api)
         self.recipients:list = notify_reciever
 
-
             # Setup runtimes
         runtime = datetime.datetime.now()
         addseconds = (round((runtime.minute*60 + runtime.second)/720)+1)*720
         runtime = runtime.replace(minute=0, second=10, microsecond=0) + datetime.timedelta(seconds=addseconds)
-        self.ADapi.run_every(self.set_indoortemp, runtime, 720)
-
+        self.ADapi.run_every(self._set_indoortemp, runtime, 720)
 
         """ Test your notification app
         """
@@ -554,38 +580,35 @@ class Heater():
         """ End test
         """
 
-
         # Sets Vacation status
-    def awayStateListen(self, entity, attribute, old, new, kwargs) -> None:
+    def _awayStateListen(self, entity, attribute, old, new, kwargs) -> None:
         """ Sets new indoor temp and away state after vacation switch
         """
         self.away_state = new == 'on'
-        self.ADapi.run_in(self.set_indoortemp, 5)
-
+        self.ADapi.run_in(self._set_indoortemp, 5)
 
         # Indoor target temperature
-    def updateTarget(self, entity, attribute, old, new, kwargs) -> None:
+    def _updateTarget(self, entity, attribute, old, new, kwargs) -> None:
         """ Sets new indoor temperature target from HA input_number
         """
         self.target_indoor_temp = float(new)
-        self.ADapi.run_in(self.set_indoortemp, 5)
-
+        self.ADapi.run_in(self._set_indoortemp, 5)
 
         # Helper functions to check windows
-    def windowOpened(self, entity, attribute, old, new, kwargs) -> None:
+    def _windowOpened(self, entity, attribute, old, new, kwargs) -> None:
         """ Reacts to window opened
         """
         if self.windowsopened() != 0:
             self.windows_is_open = True
-            self.ADapi.run_in(self.set_indoortemp, 1)
+            self.ADapi.run_in(self._set_indoortemp, 1)
 
-    def windowClosed(self, entity, attribute, old, new, kwargs) -> None:
+    def _windowClosed(self, entity, attribute, old, new, kwargs) -> None:
         """ Reacts to window closed
         """
         if self.windowsopened() == 0:
             self.window_last_opened = self.ADapi.datetime(aware=True)
             self.windows_is_open = False
-            self.ADapi.run_in(self.set_indoortemp, 60)
+            self.ADapi.run_in(self._set_indoortemp, 60)
 
     def windowsopened(self) -> int:
         """ Returns number of opened windows
@@ -596,14 +619,12 @@ class Heater():
                 opened += 1
         return opened
 
-
         # Function to call screens in child class
     def tryScreenOpen(self) -> None:
         """ Tries to open screens on weather updates from rain and lux sensors
         """
         for s in self.screening:
             s.check_if_try_screen_open()
-
 
     def get_in_temp(self) -> float:
         """ Returns indoor temperature
@@ -644,9 +665,8 @@ class Heater():
             )
         return in_temp
 
-
     def get_heater_temp(self) -> float:
-        """ Returns set heater temperature and state for the climate entity.
+        """ Returns set heater temperature for the climate entity.
         """
         heater_temp = float()
         ac_state:str = 'heat'
@@ -665,7 +685,6 @@ class Heater():
             )
 
         return heater_temp
-
 
     def DaytimeIncreasing(self) -> (bool, bool):
         """ Checks if it is time during day to increase temperature.
@@ -695,8 +714,7 @@ class Heater():
 
         return doDaytimeIncreasing, afterDaytimeIncrease
 
-
-    def doDaytimeSaving(self) -> bool:
+    def DaytimeSaving(self) -> bool:
         doDaytimeSaving = False
         for daytime in self.daytime_savings:
             if 'start' in daytime and 'stop' in daytime:
@@ -715,8 +733,7 @@ class Heater():
 
         return doDaytimeSaving
 
-
-    def set_indoortemp(self, kwargs) -> None:
+    def _set_indoortemp(self, kwargs) -> None:
         """ Function to set new temperature to heater based on indoor, outdoor, window and weather sensors
         """
         if self.automate:
@@ -735,7 +752,7 @@ class Heater():
         if doDaytimeIncreasing:
             in_temp -= 0.5
 
-        if self.doDaytimeSaving():
+        if self.DaytimeSaving():
             in_temp += 0.5
 
         else:
@@ -784,7 +801,6 @@ class Heater():
                 if OUT_TEMP > self.screening_temp:
                     for s in self.screening:
                         s.try_screen_close()
-
         else:
             new_temperature = self.adjust_set_temperature_by(heater_set_temp = heater_temp, in_temp = in_temp)
 
@@ -798,7 +814,6 @@ class Heater():
                         s.try_screen_close()
 
         self.updateClimateTemperature(heater_temp = heater_temp, new_temperature = new_temperature)
-
 
     def updateClimateTemperature(self, heater_temp, new_temperature) -> None:
         """ Updates climate with new temperature and updates persistent storage
@@ -816,9 +831,8 @@ class Heater():
                 and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(hours = 2)
                 and self.ADapi.datetime(aware=True) - self.heater_temp_last_registered > datetime.timedelta(hours = 2)
             ):
-                self.registerHeatingtemp(heater_temp = new_temperature)
+                self._registerHeatingtemp(heater_temp = new_temperature)
                 self.heater_temp_last_registered = self.ADapi.datetime(aware=True)
-
 
     def adjust_set_temperature_by(self, heater_set_temp:float, in_temp:float) -> float:
         """ Calculates if heater temperature needs to be adjusted based ontemperatures.
@@ -870,7 +884,7 @@ class Heater():
         ):
             adjust_temp_by = 0
 
-        persistent_temperature, valid_temp_data = self.getHeatingTemp()
+        persistent_temperature, valid_temp_data = self._getHeatingTempFromPersisten()
 
         if self.prev_in_temp > in_temp:
             # Temp is dropping
@@ -902,7 +916,6 @@ class Heater():
                     self.prev_in_temp = in_temp
                     return persistent_temperature
 
-
         elif self.prev_in_temp < in_temp:
             # Temp is increasing
             if in_temp < self.target_indoor_temp:
@@ -925,20 +938,17 @@ class Heater():
                 new_temperature = persistent_temperature + 4
             elif new_temperature < persistent_temperature - 4:
                 new_temperature = persistent_temperature - 4
-
         else:
             # Restrict from going +- 6 degrees away from target indoor temperature when persistent data has not been able to gather enough info
             if new_temperature > self.target_indoor_temp + 6:
                 new_temperature = self.target_indoor_temp + 6
             elif new_temperature < self.target_indoor_temp - 6:
                 new_temperature = self.target_indoor_temp - 6
-        
-        
+
         self.prev_in_temp = in_temp
         return new_temperature
 
-
-    def registerHeatingtemp(self, heater_temp:float) -> None:
+    def _registerHeatingtemp(self, heater_temp:float) -> None:
         """ Register set heater temp based on outside temperature and lux to persistent storage
         """
         with open(JSON_PATH, 'r') as json_read:
@@ -972,8 +982,7 @@ class Heater():
         with open(JSON_PATH, 'w') as json_write:
             json.dump(heatingdevice_data, json_write, indent = 4)
 
-
-    def getHeatingTemp(self) -> (float, bool):
+    def _getHeatingTempFromPersisten(self) -> (float, bool):
         """ Returns temperature from persistent storage and if value is valid
         """
         if JSON_PATH is not None:
@@ -1057,14 +1066,14 @@ class Heater():
             except Exception as e:
                 return self.target_indoor_temp, False
 
-    def setHeatingTempFromPersisten(self, **kwargs) -> None:
+    def _setHeatingTempFromPersisten(self, **kwargs) -> None:
         """ Function to set heater temp directly to data found in persistent storage
         """
         offset:float = 0.0
         if 'offset' in kwargs:
             offset = kwargs['offset']
 
-        temp, valid_temp_data = self.getHeatingTemp()
+        temp, valid_temp_data = self._getHeatingTempFromPersisten()
         temp += offset
 
         # Update with new temperature
@@ -1079,7 +1088,6 @@ class Heater():
 class Aircondition(Heater):
     """ Class to control room temperature with climate entity and weather/temperature sensors
     """
-
     def __init__(self, api,
         heater,
         indoor_sensor_temp,
@@ -1089,6 +1097,7 @@ class Aircondition(Heater):
         target_indoor_input,
         target_indoor_temp:float,
         vacation_temp:float,
+        max_vacation_temp:float,
         rain_level:float,
         anemometer_speed:int,
 
@@ -1108,7 +1117,6 @@ class Aircondition(Heater):
         name_of_notify_app,
         notify_reciever
     ):
-
         super().__init__(api,
             heater = heater,
             indoor_sensor_temp = indoor_sensor_temp,
@@ -1137,6 +1145,12 @@ class Aircondition(Heater):
             notify_reciever = notify_reciever
         )
 
+        try:
+            self.max_vacation_temp = float(max_vacation_temp)
+        except (ValueError, TypeError) as ve:
+            self.max_vacation_temp:float = 30
+            self.ADapi.log(f"Error setting max vacation temperature. Set to 30 degrees.", level = 'INFO')
+
         self.silence:list = silence
         self.fan_mode:str = self.ADapi.get_state(self.heater,
             attribute='fan_mode',
@@ -1159,8 +1173,7 @@ class Aircondition(Heater):
         ):
             self.fan_mode_persistent = 'Auto'
 
-
-    def set_indoortemp(self, kwargs) -> None:
+    def _set_indoortemp(self, kwargs) -> None:
         """ Function to set new temperature to heater based on indoor, outdoor, window and weather sensors
         """
         if self.automate:
@@ -1267,7 +1280,7 @@ class Aircondition(Heater):
             if doDaytimeIncreasing:
                 in_temp -= 0.5
 
-            if self.doDaytimeSaving():
+            if self.DaytimeSaving():
                 in_temp += 0.5
 
             else:
@@ -1279,32 +1292,33 @@ class Aircondition(Heater):
                 elif RAIN_AMOUNT >= self.rain_level:
                     in_temp -= 0.3 # Trick indoor temp sensor to set temp a bit higher
 
-
             new_temperature = float()
             # Holliday temperature
             if self.away_state:
                 new_temperature = self.vacation_temp
-                if in_temp > self.target_indoor_temp:
+                if (
+                    in_temp > self.target_indoor_temp -3
+                    and in_temp > self.vacation_temp + 3
+                ):
+                    try:
+                        self.ADapi.call_service('climate/set_hvac_mode',
+                            entity_id = self.heater,
+                            hvac_mode = 'fan_only',
+                            namespace = self.namespace
+                        )
+                    except Exception as e:
+                        self.ADapi.log(
+                            f"Not able to set hvac_mode to fan_only for {self.heater}. Probably not supported. {e}",
+                            level = 'INFO'
+                        )
+                        
                     if OUT_TEMP > self.screening_temp:
                         for s in self.screening:
                             s.try_screen_close()
-                    if in_temp > self.target_indoor_temp + 0.6:
-                        try:
-                            self.ADapi.call_service('climate/set_hvac_mode',
-                                entity_id = self.heater,
-                                hvac_mode = 'fan_only',
-                                namespace = self.namespace
-                            )
-                        except Exception as e:
-                            self.ADapi.log(
-                                f"Not able to set hvac_mode to fan_only for {self.heater}. Probably not supported. {e}",
-                                level = 'INFO'
-                            )
-                        return
+                    return
                 else:
                     for s in self.screening:
                         s.can_close_on_lux = False
-
             else:
                 new_temperature = self.adjust_set_temperature_by(heater_set_temp = heater_temp, in_temp = in_temp)
 
@@ -1347,7 +1361,7 @@ class Aircondition(Heater):
                                 hvac_mode = 'fan_only',
                                 namespace = self.namespace
                             )
-                            self.ADapi.run_in(self.set_indoortemp, 5) # To set silence to new fan mode, if time for it
+                            self.ADapi.run_in(self._set_indoortemp, 5) # To set silence to new fan mode, if time for it
                         except Exception as e:
                             self.ADapi.log(
                                 f"Not able to set hvac_mode to fan_only for {self.heater}. Probably not supported. {e}",
@@ -1360,7 +1374,6 @@ class Aircondition(Heater):
 
             # Update with new temperature
             self.updateClimateTemperature(heater_temp = heater_temp, new_temperature = new_temperature)
-
 
         elif ac_state == 'cool':
             if heater_temp is None:
@@ -1388,33 +1401,22 @@ class Aircondition(Heater):
             if doDaytimeIncreasing:
                 in_temp += 0.5
 
-            if self.doDaytimeSaving():
+            if self.DaytimeSaving():
                 in_temp -= 0.5
 
             else:
                 # Correct indoor temp when high amount of wind
                 if self.ADapi.datetime(aware=True) - self.last_windy_time < datetime.timedelta(minutes = 30):
-                    in_temp -= 0.3 # Trick indoor temp sensor to set temp a bit higher
+                    in_temp -= 0.3
 
                 # Correct indoor temp when rain
                 elif RAIN_AMOUNT >= self.rain_level:
-                    in_temp -= 0.3 # Trick indoor temp sensor to set temp a bit higher
-            
-            # Holliday temperature
-            if self.away_state:
-                in_temp -= 3
-
-            new_temperature = self.adjust_set_temperature_by(heater_set_temp = heater_temp, in_temp = in_temp)
+                    in_temp -= 0.3
 
             for s in self.screening:
                 s.try_screen_close()
 
-            if (
-                (OUT_TEMP < self.target_indoor_temp
-                and in_temp < self.target_indoor_temp + 0.6)
-                or (in_temp < self.target_indoor_temp + 3
-                and self.away_state)
-            ):
+            if in_temp < self.target_indoor_temp + 0.6:
                 try:
                     self.ADapi.call_service('climate/set_hvac_mode',
                         entity_id = self.heater,
@@ -1427,6 +1429,22 @@ class Aircondition(Heater):
                         level = 'DEBUG'
                     )
                 return
+            if self.away_state:
+                if in_temp < self.max_vacation_temp - 2:
+                    try:
+                        self.ADapi.call_service('climate/set_hvac_mode',
+                            entity_id = self.heater,
+                            hvac_mode = 'fan_only',
+                            namespace = self.namespace
+                        )
+                    except Exception as e:
+                        self.ADapi.log(
+                            f"Not able to set hvac_mode to fan_only for {self.heater}. Probably not supported. {e}",
+                            level = 'DEBUG'
+                        )
+                    return
+
+            new_temperature = self.adjust_set_temperature_by(heater_set_temp = heater_temp, in_temp = in_temp)
 
             # Update with new temperature
             if heater_temp != round(new_temperature * 2, 0) / 2:
@@ -1437,7 +1455,6 @@ class Aircondition(Heater):
                 )
                 self.heater_temp_last_changed = self.ADapi.datetime(aware=True)
 
-
         elif ac_state == 'fan_only':
             # Checking temperature hvac_mode == fan_only
             if (
@@ -1446,7 +1463,7 @@ class Aircondition(Heater):
             ):
                 if (
                     in_temp > self.target_indoor_temp + 1
-                    and OUT_TEMP > self.target_indoor_temp - 2
+                    and OUT_TEMP > self.target_indoor_temp - 4
                 ):
                     try:
                         self.ADapi.call_service('climate/set_hvac_mode',
@@ -1468,7 +1485,7 @@ class Aircondition(Heater):
                             namespace = self.namespace
                         )
                         # Set new temperature after change to heating
-                        self.ADapi.run_in(self.setHeatingTempFromPersisten, 10, offset = -1)
+                        self.ADapi.run_in(self._setHeatingTempFromPersisten, 10, offset = -1)
                     except Exception as e:
                         self.ADapi.log(
                             f"Not able to set hvac_mode to heat for {self.heater}. Probably not supported. {e}",
@@ -1478,7 +1495,10 @@ class Aircondition(Heater):
             elif (
                 not self.windows_is_open # And vacation
             ):
-                if in_temp <= self.target_indoor_temp -4:
+                if (
+                    in_temp <= self.target_indoor_temp -5
+                    or in_temp <= self.vacation_temp + 2
+                ):
                     try:
                         self.ADapi.call_service('climate/set_hvac_mode',
                             entity_id = self.heater,
@@ -1486,23 +1506,20 @@ class Aircondition(Heater):
                             namespace = self.namespace
                         )
                         # Set new temperature after change to heating
-                        self.ADapi.run_in(self.set_indoortemp, 20)
+                        self.ADapi.run_in(self._set_indoortemp, 20)
                     except Exception as e:
                         self.ADapi.log(
                             f"Not able to set hvac_mode to heat for {self.heater}. Probably not supported. {e}",
                             level = 'DEBUG'
                         )
-                elif (
-                    in_temp > self.target_indoor_temp + 4
-                    and OUT_TEMP > self.target_indoor_temp
-                ):
+                elif in_temp > self.max_vacation_temp:
                     try:
                         self.ADapi.call_service('climate/set_hvac_mode',
                             entity_id = self.heater,
                             hvac_mode = 'cool',
                             namespace = self.namespace
                         )
-                        self.ADapi.run_in(self.set_indoortemp, 20)
+                        self.ADapi.run_in(self._set_indoortemp, 20)
                     except Exception as e:
                         self.ADapi.log(
                             f"Not able to set hvac_mode to cool for {self.heater}. Probably not supported. {e}",
@@ -1541,7 +1558,6 @@ class Aircondition(Heater):
 class Screen():
     """ Class to control cover entities based on inside temperature and weather sensors.
     """
-
     def __init__(self, api,
         screen:str,
         windowsensors:list,
@@ -1553,7 +1569,6 @@ class Screen():
         mediaplayers:list,
         namespace:str
     ):
-
         self.ADapi = api
         self.namespace = namespace
 
@@ -1576,7 +1591,6 @@ class Screen():
                     namespace = self.namespace
                 )
 
-
     def windowsopened(self) -> int:
         """ Returns number of opened windows.
         """
@@ -1585,7 +1599,6 @@ class Screen():
             if self.ADapi.get_state(window, namespace = self.namespace) == 'on':
                 opened += 1
         return opened
-
 
     def try_screen_close(self) -> None:
         """ Checks conditions to close screens.
@@ -1620,7 +1633,6 @@ class Screen():
             elif not self.can_close_on_lux:
                 self.can_close_on_lux = True
 
-
     def weather_updated(self, event_name, data, kwargs) -> None:
         """ Listens for weather change from the weather app
         """
@@ -1634,11 +1646,10 @@ class Screen():
             ):
                 self.try_screen_close()
 
-
     def check_if_try_screen_open(self) -> bool:
         """ Checks conditions from configured weather sensors before trying to open or screens.
         """
-        if self.check_mediaplayers_off():
+        if self._check_mediaplayers_off():
             lux_open = self.lux_open_normal
         else:
             lux_open = self.lux_open_when_media_is_on
@@ -1651,7 +1662,6 @@ class Screen():
            return True
 
         return False
-
 
     def try_screen_open(self) -> None:
         """ Checks conditions to open screens.
@@ -1681,8 +1691,7 @@ class Screen():
                 )
                 self.screen_position = 100
 
-
-    def check_mediaplayers_off(self) -> bool:
+    def _check_mediaplayers_off(self) -> bool:
         """ Returns true if all media players is off
         """
         for mediaplayer in self.mediaplayers:
@@ -1696,7 +1705,6 @@ class Notify_Mobiles:
     """
     def __init__(self, api):
         self.ADapi = api
-
 
     def send_notification(self, **kwargs) -> None:
         """ Sends notification to recipients via Home Assistant notification.
