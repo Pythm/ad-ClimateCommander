@@ -12,7 +12,7 @@ Automate HVAC systems, manage cover controls, and maintain optimal indoor temper
 
 ### **1.2.0**  
 - **Notification Enhancements**: Notifications now send recipients as a list (single API call). *Custom notification apps may need updates.*  
-- **Weather Sensor Configuration**: Automatic weather detection removed. Use the [ad‑Weather](https://github.com/Pythm/ad-Weather) app or a custom event‑based solution.  
+- **Weather Sensor Configuration**: Automatic weather sensor detection removed. Use the [ad‑Weather](https://github.com/Pythm/ad-Weather) app or a custom event‑based solution.  
 
 ### **1.2.3**  
 - **MQTT Default Namespace**: Updated to `'mqtt'` as this is the **default** in AppDaemon documentation.  
@@ -44,7 +44,7 @@ Automate HVAC systems, manage cover controls, and maintain optimal indoor temper
 ![AI‑Generated Screenshot](_5b05cb75-1f9c-4fed-9aa6-0e4f9d73c8ac.jpg)
 
 ---
-## 🛠️ Installation & Configuration  
+## 📦 Installation & Configuration  
 
 ### 1. **Clone the repository**  
 
@@ -84,14 +84,15 @@ nameyourClimateCommander:
 | `HASS_namespace`     | string     | `"default"`    | Home Assistant namespace (optional).                                          |
 | `MQTT_namespace`     | string     | `"mqtt"`       | MQTT namespace (optional).                                                   |
 | `outside_temperature`| sensor     | (required)     | Sensor for outdoor temperature.                                               |
-| `anemometer`         | sensor     | (required)     | Wind‑speed sensor.                                                            |
+| `anemometer`         | sensor     | (optional)     | Wind‑speed sensor.                                                            |
 | `anemometer_speed`   | int        | `40`           | Wind‑speed threshold to trigger screen opening/boost mode.                    |
-| `rain_sensor`        | sensor     | (required)     | Rain‑detection sensor.                                                        |
+| `rain_sensor`        | sensor     | (optional)     | Rain‑detection sensor.                                                        |
 | `rain_level`         | int        | `3`            | Rain‑intensity threshold to trigger screen opening.                          |
-| `OutLux_sensor`      | sensor     | (required)     | Primary outdoor lux sensor.                                                   |
+| `OutLuxMQTT`         | MQTT sensor| (optional)     | Primary outdoor lux sensor via MQTT.                                         |
+| `OutLux_sensor`      | sensor     | (optional)     | Primary outdoor lux sensor.                                                   |
 | `OutLuxMQTT_2`       | MQTT sensor| (optional)     | Secondary outdoor lux sensor via MQTT.                                       |
 | `OutLux_sensor_2`    | sensor     | (optional)     | Secondary outdoor lux sensor (non‑MQTT).                                     |
-| `screening_temp`     | int        | `8`            | Minimum outdoor temperature to close screens.                                |
+| `screening_temp`     | int        | `8`            | Minimum outdoor temperature to close screens/covers.                         |
 | `getting_cold`       | int        | `18`           | Threshold to trigger “cold outside” notifications.                           |
 | `json_path`          | string     | `None`         | Persistent storage path for JSON data.                                       |
 | `vacation`           | input_boolean | `input_boolean.vacation` | Enable vacation mode.                                                     |
@@ -110,7 +111,7 @@ nameyourClimateCommander:
 | `window_offset`      | int        | `-3`           | Offset between the window and indoor sensors for accuracy.                  |
 | `daytime_savings`    | dict       | (optional)     | Adjust temperature during specified hours (e.g., lower temperature during the day). |
 | `silence`            | dict       | (optional)     | Set fan to *silence* during defined intervals.                              |
-| `windowsensors`      | list       | (optional)     | List of window/door sensors that trigger `fan_only` mode.                    |
+| `windowsensors`      | list       | (optional)     | List of window/door sensors that turns down heating.                        |
 
 ### **Screen/Cover Automation**  
 
@@ -130,22 +131,20 @@ nameyourClimateCommander:
 nameyourClimateCommander:
   module: climateCommander
   class: Climate
-  outside_temperature: sensor.netatmo_out_temperature
-  anemometer: sensor.netatmo_anemometer_wind_strength
-  anemometer_speed: 40
-  rain_sensor: sensor.netatmo_rain
-  rain_level: 3
-  OutLux_sensor: sensor.lux_sensor
-  OutLuxMQTT_2: zigbee2mqtt/OutdoorHueLux
-  screening_temp: 8
-  getting_cold: 18
   json_path: /conf/persistent/Climate/
   vacation: input_boolean.vacation
+
   vacation_temp: 16
+  screening_temp: 8
+  getting_cold: 18
+  rain_level: 3
+  anemometer_speed: 40
+
   HVAC:
     - climate: climate.yourClimate
       indoor_sensor_temp: sensor.yourIndoorTemperatureSensor
       target_indoor_temp: 22.7
+      automate: input_boolean. #Stops all automation of heating when off
       daytime_savings:
         - start: '10:00:00'
           stop: '14:00:00'
@@ -156,7 +155,7 @@ nameyourClimateCommander:
         - start: '21:00:00'
           stop: '07:00:00'
           presence:
-            - person.nathaniel
+            - person.myself
       screening:
         - screen: cover.your_screen
           lux_close: 40000
@@ -186,13 +185,13 @@ nameyourClimateCommander:
 - Use a custom notification app with the `send_notification` method.
 
 ---
-## 📌 Weather Sensor Integration  
+## 🌤️ Weather Sensor Integration  
 
 We **strongly recommend** using the [ad‑Weather](https://github.com/Pythm/ad-Weather) app for weather data:  
 
 - It consolidates all your weather sensors into a single app.  
 - It **publishes events** that other apps (like ClimateCommander) can use.  
-- If you configure weather sensors directly in ClimateCommander, they **take precedence** over ad‑Weather.  
+- If you configure weather sensors directly in `ClimateCommander`, they **take precedence** over [ad‑Weather](https://github.com/Pythm/ad-Weather).  
 
 ### Wind & Rain Sensors in ClimateCommander  
 
