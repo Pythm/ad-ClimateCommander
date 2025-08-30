@@ -1388,7 +1388,6 @@ class Aircondition(Heater):
                 and RAIN_AMOUNT > 0
                 and in_temp < self.target_indoor_temp + 2
             ):
-                self.ADapi.log(f"Setting fan based on target +3") ###
                 set_fan_mode = True
             elif in_temp < self.target_indoor_temp + 1:
                 set_fan_mode = True
