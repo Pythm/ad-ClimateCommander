@@ -128,7 +128,7 @@ class Climate(Hass):
                 self.mqtt = self.get_plugin_api("MQTT")
             out_lux_sensor = self.args['OutLuxMQTT_2']
             self.mqtt.mqtt_subscribe(out_lux_sensor)
-            self.mqtt.listen_event(self.__out_lux_event_MQTT2, "MQTT_MESSAGE",
+            self.mqtt.listen_event(self._out_lux_event_MQTT2, "MQTT_MESSAGE",
                 topic = out_lux_sensor,
                 namespace = MQTT_namespace
             )
@@ -274,7 +274,7 @@ class Climate(Hass):
         return False
 
         # Set proper value when weather sensors is updated
-    def weather_event(self, event_name, data, kwargs) -> None:
+    def weather_event(self, event_name, data, **kwargs) -> None:
         """ Listens for weather change from the weather app
         """
         global OUT_TEMP
@@ -284,22 +284,22 @@ class Climate(Hass):
         global CLOUD_COVER
 
         if self.datetime(aware=True) - self.out_temp_last_update > datetime.timedelta(minutes = 20):
-            OUT_TEMP = data['temp']
+            OUT_TEMP = float(data['temp'])
         if self.datetime(aware=True) - self.rain_last_update > datetime.timedelta(minutes = 20):
-            RAIN_AMOUNT = data['rain']
+            RAIN_AMOUNT = float(data['rain'])
         if self.datetime(aware=True) - self.wind_last_update > datetime.timedelta(minutes = 20):
-            WIND_AMOUNT = data['wind']
+            WIND_AMOUNT = float(data['wind'])
             for ac in self.heatingdevice:
                 if WIND_AMOUNT >= ac.anemometer_speed:
                     ac.last_windy_time = self.datetime(aware=True)
 
-        CLOUD_COVER = data['cloud_cover']
+        CLOUD_COVER = int(data['cloud_cover'])
 
         if (
             self.datetime(aware=True) - self.lux_last_update1 > datetime.timedelta(minutes = 20)
             and self.datetime(aware=True) - self.lux_last_update2 > datetime.timedelta(minutes = 20)
         ):
-            OUT_LUX = data['lux']
+            OUT_LUX = float(data['lux'])
 
     def _outsideTemperatureUpdated(self, entity, attribute, old, new, kwargs) -> None:
         global OUT_TEMP
@@ -343,11 +343,11 @@ class Climate(Hass):
 
             self._newOutLux()
 
-    def _out_lux_event_MQTT(self, event_name, data, kwargs) -> None:
+    def _out_lux_event_MQTT(self, event_name, data, **kwargs) -> None:
         lux_data = json.loads(data['payload'])
 
         match lux_data:
-            case {'illuminance_lux': illuminance} if self.outLux1 != float(illuminance):
+            case {'illuminance': illuminance} if self.outLux1 != float(illuminance):
                 self.outLux1 = float(illuminance) # Zigbee sensor
                 self._newOutLux()
             case {'value': value} if self.outLux1 != float(value):
@@ -370,19 +370,20 @@ class Climate(Hass):
         if self.outLux2 != float(new):
             self.outLux2 = float(new)
 
-            self.__newOutLux2()
+            self._newOutLux2()
 
-    def __out_lux_event_MQTT2(self, event_name, data, kwargs) -> None:
+    def _out_lux_event_MQTT2(self, event_name, data, **kwargs) -> None:
         lux_data = json.loads(data['payload'])
 
         match lux_data:
-            case {'illuminance_lux': illuminance} if self.outLux2 != float(illuminance):
+            case {'illuminance': illuminance} if self.outLux2 != float(illuminance):
                 self.outLux2 = float(illuminance) # Zigbee sensor
-                self._newOutLux()
+                self._newOutLux2()
             case {'value': value} if self.outLux2 != float(value):
                 self.outLux2 = float(value) # Zwave sensor
-                self._newOutLux()
-    def __newOutLux2(self) -> None:
+                self._newOutLux2()
+
+    def _newOutLux2(self) -> None:
         global OUT_LUX
         if (
             self.datetime(aware=True) - self.lux_last_update1 > datetime.timedelta(minutes = 15)
@@ -1617,7 +1618,7 @@ class Screen():
             elif not self.can_close_on_lux:
                 self.can_close_on_lux = True
 
-    def weather_updated(self, event_name, data, kwargs) -> None:
+    def weather_updated(self, event_name, data, **kwargs) -> None:
         """ Listens for weather change from the weather app
         """
         if (
