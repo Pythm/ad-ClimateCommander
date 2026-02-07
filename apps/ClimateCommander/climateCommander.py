@@ -619,19 +619,13 @@ class Heater():
 
             now: datetime = self.ADapi.datetime(aware=True)
             stale_time = now - last_update
-            if stale_time > datetime.timedelta(hours = 2): # Stale for more than two hours. Reload integration
-                self.ADapi.log(
-                    f"{self.indoor_sensor_temp} has been stale for {stale_time} Reloading config_entry",
-                    level = 'INFO'
-                )
-                self.ADapi.call_service('homeassistant/reload_config_entry',
-                    entity_id = self.indoor_sensor_temp
-                )
+            if stale_time > datetime.timedelta(hours = 1): # Stale for more than an hour. Use backup temp
                 raise ValueError("Stale data")
         except (ValueError, TypeError) as ve:
             if self.backup_indoor_sensor_temp is not None:
                 try:
                     in_temp = float(self.ADapi.get_state(self.backup_indoor_sensor_temp, namespace = self.namespace))
+                    self.ADapi.log(f"Using backup indoor temp: {in_temp} - {ve}", level = 'DEBUG')
                 except (ValueError, TypeError) as ve:
                     in_temp = None
         except Exception as e:
