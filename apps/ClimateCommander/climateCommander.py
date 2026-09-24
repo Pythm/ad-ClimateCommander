@@ -628,12 +628,6 @@ class Heater():
                     self.ADapi.log(f"Using backup indoor temp: {in_temp} - {ve}", level = 'DEBUG')
                 except (ValueError, TypeError) as ve:
                     in_temp = None
-        except Exception as e:
-            in_temp = None
-            self.ADapi.log(
-                f"Not able to get new inside temperature from {self.indoor_sensor_temp}. {e}",
-                level = 'WARNING'
-            )
         return in_temp
 
     def get_heater_temp(self) -> float:
@@ -858,9 +852,14 @@ class Heater():
         if self.prev_in_temp > in_temp:
             # Temp is dropping
             if in_temp > self.target_indoor_temp:
-                # Set temp is already lowering temperature
-                self.prev_in_temp = in_temp
-                return heater_set_temp
+                diff = abs(in_temp - self.target_indoor_temp)
+                drop = abs(self.prev_in_temp - in_temp)
+                if diff / drop < 6:
+                # Set temp is already lowering temperature and will reach target within 6 x 720 seconds
+                    self.prev_in_temp = in_temp
+                    return heater_set_temp
+                else:
+                    valid_temp_data = False
 
             if (
                 new_temperature <= self.target_indoor_temp - 4
@@ -869,7 +868,7 @@ class Heater():
             ):
                 # Has been turned down for more than 4 hours
                 self.prev_in_temp = in_temp
-                return persistent_temperature
+                return new_temperature + adjust_temp_by -1
 
             if (
                 self.ADapi.datetime(aware=True) - self.window_last_opened > datetime.timedelta(hours = 1)
@@ -888,9 +887,14 @@ class Heater():
         elif self.prev_in_temp < in_temp:
             # Temp is increasing
             if in_temp < self.target_indoor_temp:
-                # Set temp is already increasing temperature
-                self.prev_in_temp = in_temp
-                return heater_set_temp
+                diff = abs(in_temp - self.target_indoor_temp)
+                increase = abs(in_temp -self.prev_in_temp)
+                if diff / increase < 6:
+                    # Set temp is already increasing temperature
+                    self.prev_in_temp = in_temp
+                    return heater_set_temp
+                else:
+                    valid_temp_data = False
 
             new_temperature += adjust_temp_by
 
@@ -909,10 +913,10 @@ class Heater():
                 new_temperature = persistent_temperature - 4
         else:
             # Restrict from going +- 6 degrees away from target indoor temperature when persistent data has not been able to gather enough info
-            if new_temperature > self.target_indoor_temp + 6:
-                new_temperature = self.target_indoor_temp + 6
-            elif new_temperature < self.target_indoor_temp - 6:
-                new_temperature = self.target_indoor_temp - 6
+            if new_temperature > self.target_indoor_temp + 8:
+                new_temperature = self.target_indoor_temp + 8
+            elif new_temperature < self.target_indoor_temp - 8:
+                new_temperature = self.target_indoor_temp - 8
 
         self.prev_in_temp = in_temp
         return new_temperature
@@ -1600,7 +1604,7 @@ class Screen():
 
             if (
                 OUT_LUX >= self.lux_close
-                and CLOUD_COVER < 80
+                and CLOUD_COVER < 90
             ):
                 if (
                     self.ADapi.get_state(self.screen,
@@ -1628,7 +1632,7 @@ class Screen():
         ):
             if (
                 float(data['lux']) >= self.lux_close
-                and CLOUD_COVER < 80
+                and CLOUD_COVER < 90
             ):
                 self.try_screen_close()
 
