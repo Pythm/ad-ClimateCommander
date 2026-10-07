@@ -4,7 +4,7 @@
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 from appdaemon.plugins.hass.hassapi import Hass
 import datetime
@@ -22,8 +22,6 @@ global OUT_LUX
 OUT_LUX:float = 0.0
 global CLOUD_COVER
 CLOUD_COVER:int = 0
-global JSON_PATH
-JSON_PATH:str = None
 
 class Climate(Hass):
 
@@ -69,7 +67,7 @@ class Climate(Hass):
             self.listen_state(self._outsideTemperatureUpdated, self.outside_temperature)
             try:
                 OUT_TEMP = float(self.get_state(self.outside_temperature))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
                 self.log(f"Outside temperature is not valid. {e}", level = 'DEBUG')
             else:
                 self._set_unit_of_measurement(self.outside_temperature)
@@ -81,7 +79,7 @@ class Climate(Hass):
             self.listen_state(self._rainSensorUpdated, self.rain_sensor)
             try:
                 RAIN_AMOUNT = float(self.get_state(self.rain_sensor))
-            except (ValueError) as ve:
+            except (ValueError, TypeError) as ve:
                 RAIN_AMOUNT = 0.0
                 self.log(f"Rain sensor not valid. {ve}", level = 'DEBUG')
 
@@ -92,7 +90,7 @@ class Climate(Hass):
             self.listen_state(self._anemometerUpdated, self.anemometer)
             try:
                 WIND_AMOUNT = float(self.get_state(self.anemometer))
-            except (ValueError) as ve:
+            except (ValueError, TypeError) as ve:
                 WIND_AMOUNT = 0.0
                 self.log(f"Anemometer sensor not valid. {ve}", level = 'DEBUG')
 
@@ -177,10 +175,27 @@ class Climate(Hass):
             return
 
             # Persistent storage for storing mode and lux data
+        self.json_path = None
         if 'json_path' in self.args:
-            global JSON_PATH
-            JSON_PATH = self.args['json_path']
-            JSON_PATH += str(self.name) + '.json'
+            self.json_path = self.args['json_path']
+            self.json_path += str(self.name) + '.json'
+
+        heaters = self.args.get('Heaters', [])
+        if self.json_path is not None:
+            # Create the file, or add devices that are new since it was written, before devices read it
+            try:
+                with open(self.json_path, 'r') as json_read:
+                    heatingdevice_data = json.load(json_read)
+            except FileNotFoundError:
+                heatingdevice_data = {}
+            json_changed = False
+            for device in climates + heaters:
+                if device['climate'] not in heatingdevice_data:
+                    heatingdevice_data[device['climate']] = {"data" : {}}
+                    json_changed = True
+            if json_changed:
+                with open(self.json_path, 'w') as json_write:
+                    json.dump(heatingdevice_data, json_write, indent = 4)
 
             # Configuration of Heatpumps to command
         for ac in climates:
@@ -211,17 +226,17 @@ class Climate(Hass):
                 namespace = ac.get('namespace', HASS_namespace),
                 vacation = ac.get('vacation', vacation_state),
                 name_of_notify_app = name_of_notify_app,
-                notify_receiver = ac.get('notify_receiver', notify_receiver)
+                notify_receiver = ac.get('notify_receiver', notify_receiver),
+                json_path = self.json_path
             )
             self.heatingdevice.append(aircondition)
 
             # Configuration of heaters to command
-        heaters = self.args.get('Heaters', [])
         for heater in heaters:
             heating = Heater(self,
                 heater = heater['climate'],
                 indoor_sensor_temp = heater.get('indoor_sensor_temp', None),
-                backup_indoor_sensor_temp = ac.get('backup_indoor_sensor_temp', None),
+                backup_indoor_sensor_temp = heater.get('backup_indoor_sensor_temp', None),
                 window_temp = heater.get('window_sensor_temp', None),
                 window_offset = heater.get('window_offset', -3),
                 target_indoor_input = heater.get('target_indoor_input', None),
@@ -243,20 +258,10 @@ class Climate(Hass):
                 namespace = heater.get('namespace', HASS_namespace),
                 vacation = heater.get('vacation', vacation_state),
                 name_of_notify_app = name_of_notify_app,
-                notify_receiver = heater.get('notify_receiver', notify_receiver)
+                notify_receiver = heater.get('notify_receiver', notify_receiver),
+                json_path = self.json_path
             )
             self.heatingdevice.append(heating)
-
-        if JSON_PATH is not None:
-            try:
-                with open(JSON_PATH, 'r') as json_read:
-                    heatingdevice_data = json.load(json_read)
-            except FileNotFoundError:
-                heatingdevice_data = {}
-                for device in self.heatingdevice:
-                    heatingdevice_data[device.heater] = {"data" : {}}
-                with open(JSON_PATH, 'w') as json_write:
-                    json.dump(heatingdevice_data, json_write, indent = 4)
 
     def _set_unit_of_measurement(self, sensor):
         try:
@@ -264,6 +269,8 @@ class Climate(Hass):
         except Exception:
             return False
         else:
+            if not isinstance(uom, str):
+                return False
             match uom:
                 case uom if 'C' in uom:
                     self.unit_of_measurement = 'C'
@@ -338,8 +345,12 @@ class Climate(Hass):
 
         # LUX sensors
     def _out_lux_state(self, entity, attribute, old, new, kwargs) -> None:
-        if self.outLux1 != float(new):
-            self.outLux1 = float(new)
+        try:
+            new = float(new)
+        except (ValueError, TypeError):
+            return
+        if self.outLux1 != new:
+            self.outLux1 = new
 
             self._newOutLux()
 
@@ -367,8 +378,12 @@ class Climate(Hass):
         self.lux_last_update1 = self.datetime(aware=True)
 
     def _out_lux_state2(self, entity, attribute, old, new, kwargs) -> None:
-        if self.outLux2 != float(new):
-            self.outLux2 = float(new)
+        try:
+            new = float(new)
+        except (ValueError, TypeError):
+            return
+        if self.outLux2 != new:
+            self.outLux2 = new
 
             self._newOutLux2()
 
@@ -425,23 +440,27 @@ class Heater():
         namespace:str,
         vacation,
         name_of_notify_app,
-        notify_receiver:list
+        notify_receiver:list,
+        json_path = None
     ):
         self.ADapi = api
         self.heater = heater
+        self.json_path = json_path
 
             # Sensors
         self.indoor_sensor_temp = indoor_sensor_temp
         self.backup_indoor_sensor_temp = backup_indoor_sensor_temp
         self.prev_in_temp = float()
 
+        self.target_indoor_temp:float = target_indoor_temp
         if target_indoor_input is not None:
             api.listen_state(self._updateTarget, target_indoor_input,
                 namespace = namespace
             )
-            self.target_indoor_temp = float(api.get_state(target_indoor_input, namespace = namespace))
-        else:
-            self.target_indoor_temp:float = target_indoor_temp
+            try:
+                self.target_indoor_temp = float(api.get_state(target_indoor_input, namespace = namespace))
+            except (ValueError, TypeError) as ve:
+                self.ADapi.log(f"{target_indoor_input} is not a valid number. Using {target_indoor_temp}. {ve}", level = 'INFO')
 
         try:
             self.prev_in_temp = float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = namespace))
@@ -486,13 +505,13 @@ class Heater():
                 self.windows_is_open = True
 
         self.window_last_opened = self.ADapi.datetime(aware=True) - datetime.timedelta(hours = 2)
-        for windows in self.windowsensors:
-            self.ADapi.listen_state(self._windowOpened, windows,
+        for window in self.windowsensors:
+            self.ADapi.listen_state(self._windowOpened, window,
                 new = 'on',
                 duration = 120,
                 namespace = namespace
             )
-            self.ADapi.listen_state(self._windowClosed, windows,
+            self.ADapi.listen_state(self._windowClosed, window,
                 new = 'off',
                 namespace = namespace
             )
@@ -572,7 +591,10 @@ class Heater():
 
         # Indoor target temperature
     def _updateTarget(self, entity, attribute, old, new, kwargs) -> None:
-        self.target_indoor_temp = float(new)
+        try:
+            self.target_indoor_temp = float(new)
+        except (ValueError, TypeError):
+            return
         self.ADapi.run_in(self._set_indoortemp, 5)
 
         # Helper functions to check windows
@@ -606,11 +628,12 @@ class Heater():
     def get_in_temp(self) -> float:
         """ Returns calculated indoor temperature
         """
-        in_temp = float()
+        in_temp = None
         try:
             in_temp = float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = self.namespace))
             attr_last_updated = self.ADapi.get_state(entity_id = self.indoor_sensor_temp,
-                attribute = "last_updated"
+                attribute = "last_updated",
+                namespace = self.namespace
             )
             if not attr_last_updated:
                 last_update: datetime = self.ADapi.datetime(aware=True)
@@ -790,7 +813,7 @@ class Heater():
             )
             self.heater_temp_last_changed = self.ADapi.datetime(aware=True)
         elif (
-                JSON_PATH is not None
+                self.json_path is not None
                 and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(hours = 2)
                 and self.ADapi.datetime(aware=True) - self.heater_temp_last_registered > datetime.timedelta(hours = 2)
             ):
@@ -922,10 +945,10 @@ class Heater():
         return new_temperature
 
     def _registerHeatingtemp(self, heater_temp:float) -> None:
-        with open(JSON_PATH, 'r') as json_read:
+        with open(self.json_path, 'r') as json_read:
             heatingdevice_data = json.load(json_read)
 
-        heatingData = heatingdevice_data[self.heater]['data']
+        heatingData = heatingdevice_data.setdefault(self.heater, {"data" : {}}).setdefault('data', {})
         out_temp_str = str(math.floor(OUT_TEMP / 2.) * 2)
         out_lux_str = str(math.floor(OUT_LUX / 5000))
 
@@ -950,15 +973,18 @@ class Heater():
             heatingdevice_data[self.heater]['data'][out_temp_str].update(
                 {out_lux_str : newData}
             )
-        with open(JSON_PATH, 'w') as json_write:
+        with open(self.json_path, 'w') as json_write:
             json.dump(heatingdevice_data, json_write, indent = 4)
 
     def _getHeatingTempFromPersisten(self) -> (float, bool):
-        if JSON_PATH is not None:
-            with open(JSON_PATH, 'r') as json_read:
+        heatingData = {}
+        if self.json_path is not None:
+            with open(self.json_path, 'r') as json_read:
                 heatingdevice_data = json.load(json_read)
 
-            heatingData = heatingdevice_data[self.heater]['data']
+            heatingData = heatingdevice_data.get(self.heater, {}).get('data', {})
+
+        if heatingData: # Empty until the first temperature is registered: fall back to the heater below
             out_temp_str = str(math.floor(OUT_TEMP / 2.) * 2)
             out_lux_str = str(math.floor(OUT_LUX / 5000))
 
@@ -1082,7 +1108,8 @@ class Aircondition(Heater):
         namespace:str,
         vacation,
         name_of_notify_app,
-        notify_receiver
+        notify_receiver,
+        json_path = None
     ):
         super().__init__(api,
             heater = heater,
@@ -1109,7 +1136,8 @@ class Aircondition(Heater):
             namespace = namespace,
             vacation = vacation,
             name_of_notify_app = name_of_notify_app,
-            notify_receiver = notify_receiver
+            notify_receiver = notify_receiver,
+            json_path = json_path
         )
 
         try:
@@ -1126,13 +1154,14 @@ class Aircondition(Heater):
 
         self.fan_mode_persistent:str = self.fan_mode
 
-        if JSON_PATH is not None:
-            with open(JSON_PATH, 'r') as json_read:
+        if self.json_path is not None:
+            with open(self.json_path, 'r') as json_read:
                 heatingdevice_data = json.load(json_read)
 
-            if 'fan_mode' in heatingdevice_data[self.heater]:
-                if heatingdevice_data[self.heater]['fan_mode'] is not None:
-                    self.fan_mode_persistent = heatingdevice_data[self.heater]['fan_mode']
+            device_data = heatingdevice_data.get(self.heater, {})
+            if 'fan_mode' in device_data:
+                if device_data['fan_mode'] is not None:
+                    self.fan_mode_persistent = device_data['fan_mode']
 
         if (
             self.fan_mode_persistent is None
@@ -1153,10 +1182,11 @@ class Aircondition(Heater):
         ac_state = self.ADapi.get_state(self.heater, namespace = self.namespace)
 
             # Set silence preset for HVAC enabled devices
-        if 'Silence' in self.ADapi.get_state(self.heater,
+        fan_modes = self.ADapi.get_state(self.heater,
             attribute='fan_modes',
             namespace = self.namespace
-        ):
+        )
+        if fan_modes is not None and 'Silence' in fan_modes:
             change_fan_mode_to_silence = False
             for time in self.silence:
                 if (
@@ -1197,15 +1227,15 @@ class Aircondition(Heater):
                 ):
                     self.fan_mode_persistent = self.fan_mode
 
-                    if JSON_PATH is not None:
-                        with open(JSON_PATH, 'r') as json_read:
+                    if self.json_path is not None:
+                        with open(self.json_path, 'r') as json_read:
                             heatingdevice_data = json.load(json_read)
 
-                        heatingdevice_data[self.heater].update(
+                        heatingdevice_data.setdefault(self.heater, {"data" : {}}).update(
                             {'fan_mode' : self.fan_mode}
                         )
 
-                        with open(JSON_PATH, 'w') as json_write:
+                        with open(self.json_path, 'w') as json_write:
                             json.dump(heatingdevice_data, json_write, indent = 4)
 
             elif (
@@ -1293,7 +1323,7 @@ class Aircondition(Heater):
                     and in_temp < self.target_indoor_temp -0.7
                 ):
                     if self.ADapi.get_state(self.heater, attribute='fan_mode', namespace = self.namespace) != 'Silence':
-                        if 'boost' in self.ADapi.get_state(self.heater, attribute='preset_modes', namespace = self.namespace):
+                        if 'boost' in (self.ADapi.get_state(self.heater, attribute='preset_modes', namespace = self.namespace) or []):
                             if self.ADapi.get_state(self.heater, attribute='preset_mode', namespace = self.namespace) != 'boost':
                                 self.ADapi.call_service('climate/set_preset_mode',
                                     entity_id = self.heater,
@@ -1575,7 +1605,7 @@ class Screen():
         self.anemometer_speed_limit:int = anemometer_speed_limit
         self.can_close_on_lux:bool = False
 
-        self.screen_position = self.ADapi.get_state(self.screen, attribute='current_position')
+        self.screen_position = self.ADapi.get_state(self.screen, attribute='current_position', namespace = self.namespace)
 
         self.ADapi.listen_event(self.weather_updated, 'WEATHER_CHANGE',
                     namespace = self.namespace
@@ -1699,7 +1729,7 @@ class Notify_Mobiles:
         """
         message:str = kwargs['message']
         message_title:str = kwargs.get('message_title', 'Home Assistant')
-        message_recipient:str = kwargs.get('message_recipient', True)
+        message_recipient:list = kwargs.get('message_recipient') or []
         also_if_not_home:bool = kwargs.get('also_if_not_home', False)
 
         for re in message_recipient:

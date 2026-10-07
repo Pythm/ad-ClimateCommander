@@ -202,3 +202,5 @@ Thumbs.db
 /.vscode
 .vscode/
 apps/.vscode/
+# Local audit scratch output
+.claude/audit_out/
