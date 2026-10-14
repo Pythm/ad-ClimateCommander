@@ -70,7 +70,7 @@ nameyourClimateCommander:
 ## 📌 Notes  
 
 - **Weather Data**: Use the [ad‑Weather](https://github.com/Pythm/ad-Weather) app for **optimal integration**. It consolidates all your weather sensors into a single app and publishes events for other apps to consume.  
-  > ⚠️ **Important**: If you configure weather sensors directly in ClimateCommander, they will **take precedence** over the ad‑Weather app.  
+  > ⚠️ **Important**: ClimateCommander requires the ad‑Weather app (the app name can be set with `weather_app`, default `weather`). An ERROR is logged at startup if it is not found. `outside_temperature`, `rain_sensor` and `anemometer` are deprecated (a WARNING is logged), but still work and take precedence while they report. Own lux sensors (`OutLux_sensor...`) for screen control are supported like in Lightwand: they are used while they report, and the lux from ad‑Weather is used when they have been silent for 20 minutes or none are configured (the logic is in `weather_data.py`, a copy of the file in Lightwand). Values the Weather app does not have are sent as `None` and are ignored.
 
 - **Indoor Sensor**: Required for proper operation. Ensure it is placed correctly and the target temperature is set appropriately.
 
@@ -83,10 +83,11 @@ nameyourClimateCommander:
 |----------------------|------------|----------------|-------------------------------------------------------------------------------|
 | `HASS_namespace`     | string     | `"default"`    | Home Assistant namespace (optional).                                          |
 | `MQTT_namespace`     | string     | `"mqtt"`       | MQTT namespace (optional).                                                   |
-| `outside_temperature`| sensor     | (required)     | Sensor for outdoor temperature.                                               |
-| `anemometer`         | sensor     | (optional)     | Wind‑speed sensor.                                                            |
+| `weather_app`        | string     | `weather`      | Name of the ad‑Weather app. Required app, an ERROR is logged if not found.    |
+| `outside_temperature`| sensor     | (deprecated)   | Sensor for outdoor temperature. Configure it in ad‑Weather instead.           |
+| `anemometer`         | sensor     | (deprecated)   | Wind‑speed sensor. Configure it in ad‑Weather instead.                        |
 | `anemometer_speed`   | int        | `40`           | Wind‑speed threshold to trigger screen opening/boost mode.                    |
-| `rain_sensor`        | sensor     | (optional)     | Rain‑detection sensor.                                                        |
+| `rain_sensor`        | sensor     | (deprecated)   | Rain‑detection sensor. Configure it in ad‑Weather instead.                    |
 | `rain_level`         | int        | `3`            | Rain‑intensity threshold to trigger screen opening.                          |
 | `OutLuxMQTT`         | MQTT sensor| (optional)     | Primary outdoor lux sensor via MQTT.                                         |
 | `OutLux_sensor`      | sensor     | (optional)     | Primary outdoor lux sensor.                                                   |

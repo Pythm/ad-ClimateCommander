@@ -12,6 +12,8 @@ import math
 import json
 import csv
 
+from weather_data import OutdoorWeather
+
 global OUT_TEMP
 OUT_TEMP:float = 10.0
 global RAIN_AMOUNT
@@ -53,7 +55,25 @@ class Climate(Hass):
         self.heatingdevice:list = []
         self.unit_of_measurement = self.args.get('unit_of_measurement', None)
 
-            # Weather sensors
+            # Weather app. Outdoor temperature, rain, wind and lux are published by the
+            # Weather app (https://github.com/Pythm/ad-Weather) in the WEATHER_CHANGE event.
+        weather_app = self.args.get('weather_app', 'weather')
+        if self.get_app(weather_app) is None:
+            self.log(
+                f"Weather app '{weather_app}' not found. ClimateCommander needs "
+                "https://github.com/Pythm/ad-Weather for outdoor temperature, rain, wind and lux. "
+                "Set 'weather_app' if your Weather app has another name.",
+                level = 'ERROR'
+            )
+
+            # Weather sensors. Deprecated: configure them in the Weather app.
+        for deprecated in ('outside_temperature', 'rain_sensor', 'anemometer'):
+            if deprecated in self.args:
+                self.log(
+                    f"'{deprecated}' is deprecated. Configure it in the Weather app instead. "
+                    "It still works and takes priority while it reports.",
+                    level = 'WARNING'
+                )
         self.outside_temperature = self.args.get('outside_temperature', None)
         self.rain_sensor = self.args.get('rain_sensor', None)
         self.rain_level:float = self.args.get('rain_level',3)
@@ -94,42 +114,19 @@ class Climate(Hass):
                 WIND_AMOUNT = 0.0
                 self.log(f"Anemometer sensor not valid. {ve}", level = 'DEBUG')
 
-            # Setup Lux sensors
-        self.outLux1:float = 0.0
-        self.outLux2:float = 0.0
-            # Helpers for last updated when two outdoor lux sensors are in use
-        self.lux_last_update1 = self.datetime(aware=True) - datetime.timedelta(minutes = 20)
-        self.lux_last_update2 = self.datetime(aware=True) - datetime.timedelta(minutes = 20)
-
-        if 'OutLux_sensor' in self.args:
-            lux_sensor = self.args['OutLux_sensor']
-            self.listen_state(self._out_lux_state, lux_sensor,
-                namespace = HASS_namespace
-            )
-        if 'OutLuxMQTT' in self.args:
-            if self.mqtt is None:
-                self.mqtt = self.get_plugin_api("MQTT")
-            out_lux_sensor = self.args['OutLuxMQTT']
-            self.mqtt.mqtt_subscribe(out_lux_sensor)
-            self.mqtt.listen_event(self._out_lux_event_MQTT, "MQTT_MESSAGE",
-                topic = out_lux_sensor,
-                namespace = MQTT_namespace
-            )
-
-        if 'OutLux_sensor_2' in self.args:
-            lux_sensor = self.args['OutLux_sensor_2']
-            self.listen_state(self._out_lux_state2, lux_sensor,
-                namespace = HASS_namespace
-            )
-        if 'OutLuxMQTT_2' in self.args:
-            if self.mqtt is None:
-                self.mqtt = self.get_plugin_api("MQTT")
-            out_lux_sensor = self.args['OutLuxMQTT_2']
-            self.mqtt.mqtt_subscribe(out_lux_sensor)
-            self.mqtt.listen_event(self._out_lux_event_MQTT2, "MQTT_MESSAGE",
-                topic = out_lux_sensor,
-                namespace = MQTT_namespace
-            )
+            # Outdoor lux for screen control. Own lux sensors are optional, without them (or while
+            # they are silent for 20 minutes) the lux from the Weather app is used.
+        self.weather = OutdoorWeather(
+            api = self,
+            on_change = self._out_lux_changed,
+            HASS_namespace = HASS_namespace,
+            MQTT_namespace = MQTT_namespace,
+            lux_sensor = self.args.get('OutLux_sensor'),
+            lux_sensor_mqtt = self.args.get('OutLuxMQTT'),
+            lux_sensor_2 = self.args.get('OutLux_sensor_2'),
+            lux_sensor_2_mqtt = self.args.get('OutLuxMQTT_2'),
+            min_react_minutes = 0,
+        )
 
         self.listen_event(self.weather_event, 'WEATHER_CHANGE',
             namespace = HASS_namespace
@@ -290,23 +287,28 @@ class Climate(Hass):
         global OUT_LUX
         global CLOUD_COVER
 
-        if self.datetime(aware=True) - self.out_temp_last_update > datetime.timedelta(minutes = 20):
+        if (
+            data.get('temp') is not None
+            and self.datetime(aware=True) - self.out_temp_last_update > datetime.timedelta(minutes = 20)
+        ):
             OUT_TEMP = float(data['temp'])
-        if self.datetime(aware=True) - self.rain_last_update > datetime.timedelta(minutes = 20):
+        if (
+            data.get('rain') is not None
+            and self.datetime(aware=True) - self.rain_last_update > datetime.timedelta(minutes = 20)
+        ):
             RAIN_AMOUNT = float(data['rain'])
-        if self.datetime(aware=True) - self.wind_last_update > datetime.timedelta(minutes = 20):
+        if (
+            data.get('wind') is not None
+            and self.datetime(aware=True) - self.wind_last_update > datetime.timedelta(minutes = 20)
+        ):
             WIND_AMOUNT = float(data['wind'])
             for ac in self.heatingdevice:
                 if WIND_AMOUNT >= ac.anemometer_speed:
                     ac.last_windy_time = self.datetime(aware=True)
 
-        CLOUD_COVER = int(data['cloud_cover'])
-
-        if (
-            self.datetime(aware=True) - self.lux_last_update1 > datetime.timedelta(minutes = 20)
-            and self.datetime(aware=True) - self.lux_last_update2 > datetime.timedelta(minutes = 20)
-        ):
-            OUT_LUX = float(data['lux'])
+        # The Weather app sends None for data it does not have
+        if data.get('cloud_cover') is not None:
+            CLOUD_COVER = int(data['cloud_cover'])
 
     def _outsideTemperatureUpdated(self, entity, attribute, old, new, kwargs) -> None:
         global OUT_TEMP
@@ -343,72 +345,12 @@ class Climate(Hass):
                 if WIND_AMOUNT >= ac.anemometer_speed:
                     ac.last_windy_time = self.datetime(aware=True)
 
-        # LUX sensors
-    def _out_lux_state(self, entity, attribute, old, new, kwargs) -> None:
-        try:
-            new = float(new)
-        except (ValueError, TypeError):
-            return
-        if self.outLux1 != new:
-            self.outLux1 = new
-
-            self._newOutLux()
-
-    def _out_lux_event_MQTT(self, event_name, data, **kwargs) -> None:
-        lux_data = json.loads(data['payload'])
-
-        match lux_data:
-            case {'illuminance': illuminance} if self.outLux1 != float(illuminance):
-                self.outLux1 = float(illuminance) # Zigbee sensor
-                self._newOutLux()
-            case {'value': value} if self.outLux1 != float(value):
-                self.outLux1 = float(value) # Zwave sensor
-                self._newOutLux()
-
-    def _newOutLux(self) -> None:
+        # LUX from the Weather app or own lux sensors, see weather_data.py
+    def _out_lux_changed(self) -> None:
         global OUT_LUX
-        if (
-            self.datetime(aware=True) - self.lux_last_update2 > datetime.timedelta(minutes = 15)
-            or self.outLux1 >= self.outLux2
-        ):
-            OUT_LUX = self.outLux1
-            for ac in self.heatingdevice:
-                ac.tryScreenOpen()
-
-        self.lux_last_update1 = self.datetime(aware=True)
-
-    def _out_lux_state2(self, entity, attribute, old, new, kwargs) -> None:
-        try:
-            new = float(new)
-        except (ValueError, TypeError):
-            return
-        if self.outLux2 != new:
-            self.outLux2 = new
-
-            self._newOutLux2()
-
-    def _out_lux_event_MQTT2(self, event_name, data, **kwargs) -> None:
-        lux_data = json.loads(data['payload'])
-
-        match lux_data:
-            case {'illuminance': illuminance} if self.outLux2 != float(illuminance):
-                self.outLux2 = float(illuminance) # Zigbee sensor
-                self._newOutLux2()
-            case {'value': value} if self.outLux2 != float(value):
-                self.outLux2 = float(value) # Zwave sensor
-                self._newOutLux2()
-
-    def _newOutLux2(self) -> None:
-        global OUT_LUX
-        if (
-            self.datetime(aware=True) - self.lux_last_update1 > datetime.timedelta(minutes = 15)
-            or self.outLux2 >= self.outLux1
-        ):
-            OUT_LUX = self.outLux2
-            for ac in self.heatingdevice:
-                ac.tryScreenOpen()
-
-        self.lux_last_update2 = self.datetime(aware=True)
+        OUT_LUX = self.weather.out_lux
+        for ac in self.heatingdevice:
+            ac.tryScreenOpen()
 
 
 class Heater():
