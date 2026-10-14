@@ -22,6 +22,11 @@ Automate HVAC systems, manage cover controls, and maintain optimal indoor temper
 ### **1.2.4**  
 - **Spelling Correction**: Changed `notify_reciever` → `notify_receiver`.  
 
+### **1.3.0**  
+- **The [ad‑Weather](https://github.com/Pythm/ad-Weather) app is required** for outdoor temperature, rain, wind and lux (an ERROR is logged at startup if it is not found; `weather_app` sets its name). **Nothing to do** if you already use it. Install ad‑Weather 0.2.0 or later: it sends values it does not have as `None`, which this version handles.  
+- `outside_temperature`, `rain_sensor` and `anemometer` are **deprecated** (a WARNING is logged). They still work and take precedence while they report.  
+- Own outdoor lux sensors (`OutLux_sensor`, `OutLuxMQTT`, `_2`) are used while they report; after 20 minutes of silence the lux from ad‑Weather is used. The logic is in the new file `weather_data.py` (a copy of the file in Lightwand), so copy the whole app folder when you update.  
+
 ---
 ## 🔍 Features  
 
