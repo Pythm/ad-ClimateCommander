@@ -2,6 +2,8 @@
 **An intelligent climate control app for [Home Assistant](https://www.home-assistant.io/) built with [AppDaemon](https://appdaemon.readthedocs.io/en/latest/).**  
 Automate HVAC systems, manage cover controls, and maintain optimal indoor temperatures using environmental data from sensors.
 
+> 🤖 **Set up with an AI assistant:** the [LLM guide](https://github.com/Pythm/Pythm_AppdaemonApps/blob/master/LLM_GUIDE.md) helps an AI assistant find your own entity ids in Home Assistant and write the configuration.
+
 ---
 ## 🚨 Breaking Changes  
 
