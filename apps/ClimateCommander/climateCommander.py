@@ -4,13 +4,15 @@
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.2.4"
+__version__ = "1.3.0"
 
 from appdaemon.plugins.hass.hassapi import Hass
 import datetime
 import math
 import json
 import csv
+
+from weather_data import OutdoorWeather
 
 global OUT_TEMP
 OUT_TEMP:float = 10.0
@@ -22,8 +24,6 @@ global OUT_LUX
 OUT_LUX:float = 0.0
 global CLOUD_COVER
 CLOUD_COVER:int = 0
-global JSON_PATH
-JSON_PATH:str = None
 
 class Climate(Hass):
 
@@ -55,7 +55,25 @@ class Climate(Hass):
         self.heatingdevice:list = []
         self.unit_of_measurement = self.args.get('unit_of_measurement', None)
 
-            # Weather sensors
+            # Weather app. Outdoor temperature, rain, wind and lux are published by the
+            # Weather app (https://github.com/Pythm/ad-Weather) in the WEATHER_CHANGE event.
+        weather_app = self.args.get('weather_app', 'weather')
+        if self.get_app(weather_app) is None:
+            self.log(
+                f"Weather app '{weather_app}' not found. ClimateCommander needs "
+                "https://github.com/Pythm/ad-Weather for outdoor temperature, rain, wind and lux. "
+                "Set 'weather_app' if your Weather app has another name.",
+                level = 'ERROR'
+            )
+
+            # Weather sensors. Deprecated: configure them in the Weather app.
+        for deprecated in ('outside_temperature', 'rain_sensor', 'anemometer'):
+            if deprecated in self.args:
+                self.log(
+                    f"'{deprecated}' is deprecated. Configure it in the Weather app instead. "
+                    "It still works and takes priority while it reports.",
+                    level = 'WARNING'
+                )
         self.outside_temperature = self.args.get('outside_temperature', None)
         self.rain_sensor = self.args.get('rain_sensor', None)
         self.rain_level:float = self.args.get('rain_level',3)
@@ -69,7 +87,7 @@ class Climate(Hass):
             self.listen_state(self._outsideTemperatureUpdated, self.outside_temperature)
             try:
                 OUT_TEMP = float(self.get_state(self.outside_temperature))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
                 self.log(f"Outside temperature is not valid. {e}", level = 'DEBUG')
             else:
                 self._set_unit_of_measurement(self.outside_temperature)
@@ -81,7 +99,7 @@ class Climate(Hass):
             self.listen_state(self._rainSensorUpdated, self.rain_sensor)
             try:
                 RAIN_AMOUNT = float(self.get_state(self.rain_sensor))
-            except (ValueError) as ve:
+            except (ValueError, TypeError) as ve:
                 RAIN_AMOUNT = 0.0
                 self.log(f"Rain sensor not valid. {ve}", level = 'DEBUG')
 
@@ -92,46 +110,23 @@ class Climate(Hass):
             self.listen_state(self._anemometerUpdated, self.anemometer)
             try:
                 WIND_AMOUNT = float(self.get_state(self.anemometer))
-            except (ValueError) as ve:
+            except (ValueError, TypeError) as ve:
                 WIND_AMOUNT = 0.0
                 self.log(f"Anemometer sensor not valid. {ve}", level = 'DEBUG')
 
-            # Setup Lux sensors
-        self.outLux1:float = 0.0
-        self.outLux2:float = 0.0
-            # Helpers for last updated when two outdoor lux sensors are in use
-        self.lux_last_update1 = self.datetime(aware=True) - datetime.timedelta(minutes = 20)
-        self.lux_last_update2 = self.datetime(aware=True) - datetime.timedelta(minutes = 20)
-
-        if 'OutLux_sensor' in self.args:
-            lux_sensor = self.args['OutLux_sensor']
-            self.listen_state(self._out_lux_state, lux_sensor,
-                namespace = HASS_namespace
-            )
-        if 'OutLuxMQTT' in self.args:
-            if self.mqtt is None:
-                self.mqtt = self.get_plugin_api("MQTT")
-            out_lux_sensor = self.args['OutLuxMQTT']
-            self.mqtt.mqtt_subscribe(out_lux_sensor)
-            self.mqtt.listen_event(self._out_lux_event_MQTT, "MQTT_MESSAGE",
-                topic = out_lux_sensor,
-                namespace = MQTT_namespace
-            )
-
-        if 'OutLux_sensor_2' in self.args:
-            lux_sensor = self.args['OutLux_sensor_2']
-            self.listen_state(self._out_lux_state2, lux_sensor,
-                namespace = HASS_namespace
-            )
-        if 'OutLuxMQTT_2' in self.args:
-            if self.mqtt is None:
-                self.mqtt = self.get_plugin_api("MQTT")
-            out_lux_sensor = self.args['OutLuxMQTT_2']
-            self.mqtt.mqtt_subscribe(out_lux_sensor)
-            self.mqtt.listen_event(self._out_lux_event_MQTT2, "MQTT_MESSAGE",
-                topic = out_lux_sensor,
-                namespace = MQTT_namespace
-            )
+            # Outdoor lux for screen control. Own lux sensors are optional, without them (or while
+            # they are silent for 20 minutes) the lux from the Weather app is used.
+        self.weather = OutdoorWeather(
+            api = self,
+            on_change = self._out_lux_changed,
+            HASS_namespace = HASS_namespace,
+            MQTT_namespace = MQTT_namespace,
+            lux_sensor = self.args.get('OutLux_sensor'),
+            lux_sensor_mqtt = self.args.get('OutLuxMQTT'),
+            lux_sensor_2 = self.args.get('OutLux_sensor_2'),
+            lux_sensor_2_mqtt = self.args.get('OutLuxMQTT_2'),
+            min_react_minutes = 0,
+        )
 
         self.listen_event(self.weather_event, 'WEATHER_CHANGE',
             namespace = HASS_namespace
@@ -177,10 +172,27 @@ class Climate(Hass):
             return
 
             # Persistent storage for storing mode and lux data
+        self.json_path = None
         if 'json_path' in self.args:
-            global JSON_PATH
-            JSON_PATH = self.args['json_path']
-            JSON_PATH += str(self.name) + '.json'
+            self.json_path = self.args['json_path']
+            self.json_path += str(self.name) + '.json'
+
+        heaters = self.args.get('Heaters', [])
+        if self.json_path is not None:
+            # Create the file, or add devices that are new since it was written, before devices read it
+            try:
+                with open(self.json_path, 'r') as json_read:
+                    heatingdevice_data = json.load(json_read)
+            except FileNotFoundError:
+                heatingdevice_data = {}
+            json_changed = False
+            for device in climates + heaters:
+                if device['climate'] not in heatingdevice_data:
+                    heatingdevice_data[device['climate']] = {"data" : {}}
+                    json_changed = True
+            if json_changed:
+                with open(self.json_path, 'w') as json_write:
+                    json.dump(heatingdevice_data, json_write, indent = 4)
 
             # Configuration of Heatpumps to command
         for ac in climates:
@@ -211,17 +223,17 @@ class Climate(Hass):
                 namespace = ac.get('namespace', HASS_namespace),
                 vacation = ac.get('vacation', vacation_state),
                 name_of_notify_app = name_of_notify_app,
-                notify_receiver = ac.get('notify_receiver', notify_receiver)
+                notify_receiver = ac.get('notify_receiver', notify_receiver),
+                json_path = self.json_path
             )
             self.heatingdevice.append(aircondition)
 
             # Configuration of heaters to command
-        heaters = self.args.get('Heaters', [])
         for heater in heaters:
             heating = Heater(self,
                 heater = heater['climate'],
                 indoor_sensor_temp = heater.get('indoor_sensor_temp', None),
-                backup_indoor_sensor_temp = ac.get('backup_indoor_sensor_temp', None),
+                backup_indoor_sensor_temp = heater.get('backup_indoor_sensor_temp', None),
                 window_temp = heater.get('window_sensor_temp', None),
                 window_offset = heater.get('window_offset', -3),
                 target_indoor_input = heater.get('target_indoor_input', None),
@@ -243,20 +255,10 @@ class Climate(Hass):
                 namespace = heater.get('namespace', HASS_namespace),
                 vacation = heater.get('vacation', vacation_state),
                 name_of_notify_app = name_of_notify_app,
-                notify_receiver = heater.get('notify_receiver', notify_receiver)
+                notify_receiver = heater.get('notify_receiver', notify_receiver),
+                json_path = self.json_path
             )
             self.heatingdevice.append(heating)
-
-        if JSON_PATH is not None:
-            try:
-                with open(JSON_PATH, 'r') as json_read:
-                    heatingdevice_data = json.load(json_read)
-            except FileNotFoundError:
-                heatingdevice_data = {}
-                for device in self.heatingdevice:
-                    heatingdevice_data[device.heater] = {"data" : {}}
-                with open(JSON_PATH, 'w') as json_write:
-                    json.dump(heatingdevice_data, json_write, indent = 4)
 
     def _set_unit_of_measurement(self, sensor):
         try:
@@ -264,6 +266,8 @@ class Climate(Hass):
         except Exception:
             return False
         else:
+            if not isinstance(uom, str):
+                return False
             match uom:
                 case uom if 'C' in uom:
                     self.unit_of_measurement = 'C'
@@ -283,23 +287,28 @@ class Climate(Hass):
         global OUT_LUX
         global CLOUD_COVER
 
-        if self.datetime(aware=True) - self.out_temp_last_update > datetime.timedelta(minutes = 20):
+        if (
+            data.get('temp') is not None
+            and self.datetime(aware=True) - self.out_temp_last_update > datetime.timedelta(minutes = 20)
+        ):
             OUT_TEMP = float(data['temp'])
-        if self.datetime(aware=True) - self.rain_last_update > datetime.timedelta(minutes = 20):
+        if (
+            data.get('rain') is not None
+            and self.datetime(aware=True) - self.rain_last_update > datetime.timedelta(minutes = 20)
+        ):
             RAIN_AMOUNT = float(data['rain'])
-        if self.datetime(aware=True) - self.wind_last_update > datetime.timedelta(minutes = 20):
+        if (
+            data.get('wind') is not None
+            and self.datetime(aware=True) - self.wind_last_update > datetime.timedelta(minutes = 20)
+        ):
             WIND_AMOUNT = float(data['wind'])
             for ac in self.heatingdevice:
                 if WIND_AMOUNT >= ac.anemometer_speed:
                     ac.last_windy_time = self.datetime(aware=True)
 
-        CLOUD_COVER = int(data['cloud_cover'])
-
-        if (
-            self.datetime(aware=True) - self.lux_last_update1 > datetime.timedelta(minutes = 20)
-            and self.datetime(aware=True) - self.lux_last_update2 > datetime.timedelta(minutes = 20)
-        ):
-            OUT_LUX = float(data['lux'])
+        # The Weather app sends None for data it does not have
+        if data.get('cloud_cover') is not None:
+            CLOUD_COVER = int(data['cloud_cover'])
 
     def _outsideTemperatureUpdated(self, entity, attribute, old, new, kwargs) -> None:
         global OUT_TEMP
@@ -336,64 +345,12 @@ class Climate(Hass):
                 if WIND_AMOUNT >= ac.anemometer_speed:
                     ac.last_windy_time = self.datetime(aware=True)
 
-        # LUX sensors
-    def _out_lux_state(self, entity, attribute, old, new, kwargs) -> None:
-        if self.outLux1 != float(new):
-            self.outLux1 = float(new)
-
-            self._newOutLux()
-
-    def _out_lux_event_MQTT(self, event_name, data, **kwargs) -> None:
-        lux_data = json.loads(data['payload'])
-
-        match lux_data:
-            case {'illuminance': illuminance} if self.outLux1 != float(illuminance):
-                self.outLux1 = float(illuminance) # Zigbee sensor
-                self._newOutLux()
-            case {'value': value} if self.outLux1 != float(value):
-                self.outLux1 = float(value) # Zwave sensor
-                self._newOutLux()
-
-    def _newOutLux(self) -> None:
+        # LUX from the Weather app or own lux sensors, see weather_data.py
+    def _out_lux_changed(self) -> None:
         global OUT_LUX
-        if (
-            self.datetime(aware=True) - self.lux_last_update2 > datetime.timedelta(minutes = 15)
-            or self.outLux1 >= self.outLux2
-        ):
-            OUT_LUX = self.outLux1
-            for ac in self.heatingdevice:
-                ac.tryScreenOpen()
-
-        self.lux_last_update1 = self.datetime(aware=True)
-
-    def _out_lux_state2(self, entity, attribute, old, new, kwargs) -> None:
-        if self.outLux2 != float(new):
-            self.outLux2 = float(new)
-
-            self._newOutLux2()
-
-    def _out_lux_event_MQTT2(self, event_name, data, **kwargs) -> None:
-        lux_data = json.loads(data['payload'])
-
-        match lux_data:
-            case {'illuminance': illuminance} if self.outLux2 != float(illuminance):
-                self.outLux2 = float(illuminance) # Zigbee sensor
-                self._newOutLux2()
-            case {'value': value} if self.outLux2 != float(value):
-                self.outLux2 = float(value) # Zwave sensor
-                self._newOutLux2()
-
-    def _newOutLux2(self) -> None:
-        global OUT_LUX
-        if (
-            self.datetime(aware=True) - self.lux_last_update1 > datetime.timedelta(minutes = 15)
-            or self.outLux2 >= self.outLux1
-        ):
-            OUT_LUX = self.outLux2
-            for ac in self.heatingdevice:
-                ac.tryScreenOpen()
-
-        self.lux_last_update2 = self.datetime(aware=True)
+        OUT_LUX = self.weather.out_lux
+        for ac in self.heatingdevice:
+            ac.tryScreenOpen()
 
 
 class Heater():
@@ -425,23 +382,27 @@ class Heater():
         namespace:str,
         vacation,
         name_of_notify_app,
-        notify_receiver:list
+        notify_receiver:list,
+        json_path = None
     ):
         self.ADapi = api
         self.heater = heater
+        self.json_path = json_path
 
             # Sensors
         self.indoor_sensor_temp = indoor_sensor_temp
         self.backup_indoor_sensor_temp = backup_indoor_sensor_temp
         self.prev_in_temp = float()
 
+        self.target_indoor_temp:float = target_indoor_temp
         if target_indoor_input is not None:
             api.listen_state(self._updateTarget, target_indoor_input,
                 namespace = namespace
             )
-            self.target_indoor_temp = float(api.get_state(target_indoor_input, namespace = namespace))
-        else:
-            self.target_indoor_temp:float = target_indoor_temp
+            try:
+                self.target_indoor_temp = float(api.get_state(target_indoor_input, namespace = namespace))
+            except (ValueError, TypeError) as ve:
+                self.ADapi.log(f"{target_indoor_input} is not a valid number. Using {target_indoor_temp}. {ve}", level = 'INFO')
 
         try:
             self.prev_in_temp = float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = namespace))
@@ -486,13 +447,13 @@ class Heater():
                 self.windows_is_open = True
 
         self.window_last_opened = self.ADapi.datetime(aware=True) - datetime.timedelta(hours = 2)
-        for windows in self.windowsensors:
-            self.ADapi.listen_state(self._windowOpened, windows,
+        for window in self.windowsensors:
+            self.ADapi.listen_state(self._windowOpened, window,
                 new = 'on',
                 duration = 120,
                 namespace = namespace
             )
-            self.ADapi.listen_state(self._windowClosed, windows,
+            self.ADapi.listen_state(self._windowClosed, window,
                 new = 'off',
                 namespace = namespace
             )
@@ -572,7 +533,10 @@ class Heater():
 
         # Indoor target temperature
     def _updateTarget(self, entity, attribute, old, new, kwargs) -> None:
-        self.target_indoor_temp = float(new)
+        try:
+            self.target_indoor_temp = float(new)
+        except (ValueError, TypeError):
+            return
         self.ADapi.run_in(self._set_indoortemp, 5)
 
         # Helper functions to check windows
@@ -606,11 +570,12 @@ class Heater():
     def get_in_temp(self) -> float:
         """ Returns calculated indoor temperature
         """
-        in_temp = float()
+        in_temp = None
         try:
             in_temp = float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = self.namespace))
             attr_last_updated = self.ADapi.get_state(entity_id = self.indoor_sensor_temp,
-                attribute = "last_updated"
+                attribute = "last_updated",
+                namespace = self.namespace
             )
             if not attr_last_updated:
                 last_update: datetime = self.ADapi.datetime(aware=True)
@@ -619,27 +584,15 @@ class Heater():
 
             now: datetime = self.ADapi.datetime(aware=True)
             stale_time = now - last_update
-            if stale_time > datetime.timedelta(hours = 2): # Stale for more than two hours. Reload integration
-                self.ADapi.log(
-                    f"{self.indoor_sensor_temp} has been stale for {stale_time} Reloading config_entry",
-                    level = 'INFO'
-                )
-                self.ADapi.call_service('homeassistant/reload_config_entry',
-                    entity_id = self.indoor_sensor_temp
-                )
+            if stale_time > datetime.timedelta(hours = 1): # Stale for more than an hour. Use backup temp
                 raise ValueError("Stale data")
         except (ValueError, TypeError) as ve:
             if self.backup_indoor_sensor_temp is not None:
                 try:
                     in_temp = float(self.ADapi.get_state(self.backup_indoor_sensor_temp, namespace = self.namespace))
+                    self.ADapi.log(f"Using backup indoor temp: {in_temp} - {ve}", level = 'DEBUG')
                 except (ValueError, TypeError) as ve:
                     in_temp = None
-        except Exception as e:
-            in_temp = None
-            self.ADapi.log(
-                f"Not able to get new inside temperature from {self.indoor_sensor_temp}. {e}",
-                level = 'WARNING'
-            )
         return in_temp
 
     def get_heater_temp(self) -> float:
@@ -802,7 +755,7 @@ class Heater():
             )
             self.heater_temp_last_changed = self.ADapi.datetime(aware=True)
         elif (
-                JSON_PATH is not None
+                self.json_path is not None
                 and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(hours = 2)
                 and self.ADapi.datetime(aware=True) - self.heater_temp_last_registered > datetime.timedelta(hours = 2)
             ):
@@ -864,9 +817,14 @@ class Heater():
         if self.prev_in_temp > in_temp:
             # Temp is dropping
             if in_temp > self.target_indoor_temp:
-                # Set temp is already lowering temperature
-                self.prev_in_temp = in_temp
-                return heater_set_temp
+                diff = abs(in_temp - self.target_indoor_temp)
+                drop = abs(self.prev_in_temp - in_temp)
+                if diff / drop < 6:
+                # Set temp is already lowering temperature and will reach target within 6 x 720 seconds
+                    self.prev_in_temp = in_temp
+                    return heater_set_temp
+                else:
+                    valid_temp_data = False
 
             if (
                 new_temperature <= self.target_indoor_temp - 4
@@ -875,7 +833,7 @@ class Heater():
             ):
                 # Has been turned down for more than 4 hours
                 self.prev_in_temp = in_temp
-                return persistent_temperature
+                return new_temperature + adjust_temp_by -1
 
             if (
                 self.ADapi.datetime(aware=True) - self.window_last_opened > datetime.timedelta(hours = 1)
@@ -894,9 +852,14 @@ class Heater():
         elif self.prev_in_temp < in_temp:
             # Temp is increasing
             if in_temp < self.target_indoor_temp:
-                # Set temp is already increasing temperature
-                self.prev_in_temp = in_temp
-                return heater_set_temp
+                diff = abs(in_temp - self.target_indoor_temp)
+                increase = abs(in_temp -self.prev_in_temp)
+                if diff / increase < 6:
+                    # Set temp is already increasing temperature
+                    self.prev_in_temp = in_temp
+                    return heater_set_temp
+                else:
+                    valid_temp_data = False
 
             new_temperature += adjust_temp_by
 
@@ -915,19 +878,19 @@ class Heater():
                 new_temperature = persistent_temperature - 4
         else:
             # Restrict from going +- 6 degrees away from target indoor temperature when persistent data has not been able to gather enough info
-            if new_temperature > self.target_indoor_temp + 6:
-                new_temperature = self.target_indoor_temp + 6
-            elif new_temperature < self.target_indoor_temp - 6:
-                new_temperature = self.target_indoor_temp - 6
+            if new_temperature > self.target_indoor_temp + 8:
+                new_temperature = self.target_indoor_temp + 8
+            elif new_temperature < self.target_indoor_temp - 8:
+                new_temperature = self.target_indoor_temp - 8
 
         self.prev_in_temp = in_temp
         return new_temperature
 
     def _registerHeatingtemp(self, heater_temp:float) -> None:
-        with open(JSON_PATH, 'r') as json_read:
+        with open(self.json_path, 'r') as json_read:
             heatingdevice_data = json.load(json_read)
 
-        heatingData = heatingdevice_data[self.heater]['data']
+        heatingData = heatingdevice_data.setdefault(self.heater, {"data" : {}}).setdefault('data', {})
         out_temp_str = str(math.floor(OUT_TEMP / 2.) * 2)
         out_lux_str = str(math.floor(OUT_LUX / 5000))
 
@@ -952,15 +915,18 @@ class Heater():
             heatingdevice_data[self.heater]['data'][out_temp_str].update(
                 {out_lux_str : newData}
             )
-        with open(JSON_PATH, 'w') as json_write:
+        with open(self.json_path, 'w') as json_write:
             json.dump(heatingdevice_data, json_write, indent = 4)
 
     def _getHeatingTempFromPersisten(self) -> (float, bool):
-        if JSON_PATH is not None:
-            with open(JSON_PATH, 'r') as json_read:
+        heatingData = {}
+        if self.json_path is not None:
+            with open(self.json_path, 'r') as json_read:
                 heatingdevice_data = json.load(json_read)
 
-            heatingData = heatingdevice_data[self.heater]['data']
+            heatingData = heatingdevice_data.get(self.heater, {}).get('data', {})
+
+        if heatingData: # Empty until the first temperature is registered: fall back to the heater below
             out_temp_str = str(math.floor(OUT_TEMP / 2.) * 2)
             out_lux_str = str(math.floor(OUT_LUX / 5000))
 
@@ -1084,7 +1050,8 @@ class Aircondition(Heater):
         namespace:str,
         vacation,
         name_of_notify_app,
-        notify_receiver
+        notify_receiver,
+        json_path = None
     ):
         super().__init__(api,
             heater = heater,
@@ -1111,7 +1078,8 @@ class Aircondition(Heater):
             namespace = namespace,
             vacation = vacation,
             name_of_notify_app = name_of_notify_app,
-            notify_receiver = notify_receiver
+            notify_receiver = notify_receiver,
+            json_path = json_path
         )
 
         try:
@@ -1128,13 +1096,14 @@ class Aircondition(Heater):
 
         self.fan_mode_persistent:str = self.fan_mode
 
-        if JSON_PATH is not None:
-            with open(JSON_PATH, 'r') as json_read:
+        if self.json_path is not None:
+            with open(self.json_path, 'r') as json_read:
                 heatingdevice_data = json.load(json_read)
 
-            if 'fan_mode' in heatingdevice_data[self.heater]:
-                if heatingdevice_data[self.heater]['fan_mode'] is not None:
-                    self.fan_mode_persistent = heatingdevice_data[self.heater]['fan_mode']
+            device_data = heatingdevice_data.get(self.heater, {})
+            if 'fan_mode' in device_data:
+                if device_data['fan_mode'] is not None:
+                    self.fan_mode_persistent = device_data['fan_mode']
 
         if (
             self.fan_mode_persistent is None
@@ -1155,10 +1124,11 @@ class Aircondition(Heater):
         ac_state = self.ADapi.get_state(self.heater, namespace = self.namespace)
 
             # Set silence preset for HVAC enabled devices
-        if 'Silence' in self.ADapi.get_state(self.heater,
+        fan_modes = self.ADapi.get_state(self.heater,
             attribute='fan_modes',
             namespace = self.namespace
-        ):
+        )
+        if fan_modes is not None and 'Silence' in fan_modes:
             change_fan_mode_to_silence = False
             for time in self.silence:
                 if (
@@ -1199,15 +1169,15 @@ class Aircondition(Heater):
                 ):
                     self.fan_mode_persistent = self.fan_mode
 
-                    if JSON_PATH is not None:
-                        with open(JSON_PATH, 'r') as json_read:
+                    if self.json_path is not None:
+                        with open(self.json_path, 'r') as json_read:
                             heatingdevice_data = json.load(json_read)
 
-                        heatingdevice_data[self.heater].update(
+                        heatingdevice_data.setdefault(self.heater, {"data" : {}}).update(
                             {'fan_mode' : self.fan_mode}
                         )
 
-                        with open(JSON_PATH, 'w') as json_write:
+                        with open(self.json_path, 'w') as json_write:
                             json.dump(heatingdevice_data, json_write, indent = 4)
 
             elif (
@@ -1295,7 +1265,7 @@ class Aircondition(Heater):
                     and in_temp < self.target_indoor_temp -0.7
                 ):
                     if self.ADapi.get_state(self.heater, attribute='fan_mode', namespace = self.namespace) != 'Silence':
-                        if 'boost' in self.ADapi.get_state(self.heater, attribute='preset_modes', namespace = self.namespace):
+                        if 'boost' in (self.ADapi.get_state(self.heater, attribute='preset_modes', namespace = self.namespace) or []):
                             if self.ADapi.get_state(self.heater, attribute='preset_mode', namespace = self.namespace) != 'boost':
                                 self.ADapi.call_service('climate/set_preset_mode',
                                     entity_id = self.heater,
@@ -1570,7 +1540,7 @@ class Screen():
         self.anemometer_speed_limit:int = anemometer_speed_limit
         self.can_close_on_lux:bool = False
 
-        self.screen_position = self.ADapi.get_state(self.screen, attribute='current_position')
+        self.screen_position = self.ADapi.get_state(self.screen, attribute='current_position', namespace = self.namespace)
 
         self.ADapi.listen_event(self.weather_updated, 'WEATHER_CHANGE',
                     namespace = self.namespace
@@ -1599,7 +1569,7 @@ class Screen():
 
             if (
                 OUT_LUX >= self.lux_close
-                and CLOUD_COVER < 80
+                and CLOUD_COVER < 90
             ):
                 if (
                     self.ADapi.get_state(self.screen,
@@ -1627,7 +1597,7 @@ class Screen():
         ):
             if (
                 float(data['lux']) >= self.lux_close
-                and CLOUD_COVER < 80
+                and CLOUD_COVER < 90
             ):
                 self.try_screen_close()
 
@@ -1694,7 +1664,7 @@ class Notify_Mobiles:
         """
         message:str = kwargs['message']
         message_title:str = kwargs.get('message_title', 'Home Assistant')
-        message_recipient:str = kwargs.get('message_recipient', True)
+        message_recipient:list = kwargs.get('message_recipient') or []
         also_if_not_home:bool = kwargs.get('also_if_not_home', False)
 
         for re in message_recipient:
