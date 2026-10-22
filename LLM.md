@@ -42,6 +42,8 @@ Keys: required `climate` (alias `heater`). Optional: `type`, `target_mode` (`ind
 
 Deprecated, still working (do not write them in new configs): `HVAC:` / `Heaters:` lists in one app (WARNING), `outside_temperature`, `rain_sensor`, `anemometer`, `away_state`.
 
+The configuration is validated by pydantic models in `cc_config.py` (`AppConfig`, `DeviceConfig`). A wrong type gives an ERROR with the key name in the app log and the device is skipped. When a key is added, add it to the model, the README and this list.
+
 ## Which entities fit each key
 
 | Key | Entity |

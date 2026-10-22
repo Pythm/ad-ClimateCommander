@@ -15,18 +15,12 @@ import datetime
 import glob
 import json
 import os
-import zlib
+
+from pydantic import ValidationError
 
 from weather_data import OutdoorWeather
 from cc_devices import Heater, Aircondition, Notify_Mobiles, to_float
-
-# Keys a device may inherit from the app level in the old list style
-APP_LEVEL_KEYS = (
-    'vacation_temp', 'max_vacation_temp', 'screening_temp', 'getting_cold', 'getting_hot_offset',
-    'rain_level', 'anemometer_speed', 'spend_temp_offset',
-)
-INDOOR_INTERVAL = 720   # seconds between runs, indoor-target mode (unchanged from earlier versions)
-TABLE_INTERVAL = 900    # seconds between runs, table mode (as the ElectricalManagement heaters)
+from cc_config import AppConfig, DeviceConfig, APP_LEVEL_KEYS, UNIT_DEFAULTS, format_errors
 
 
 class WeatherState:
@@ -93,12 +87,20 @@ class Climate(ad.ADBase):
         self.devices:list = []
         self.store = None
 
+            # Validated configuration (cc_config.py)
+        try:
+            self.config_model = AppConfig.model_validate(dict(self.args))
+        except ValidationError as e:
+            self.ADapi.log(f"Invalid configuration for {self.name}, app not started: {format_errors(e)}", level = 'ERROR')
+            return
+        cfg = self.config_model
+
             # Namespaces for HASS and MQTT
-        self.HASS_namespace = self.args.get('HASS_namespace', 'default')
-        MQTT_namespace = self.args.get('MQTT_namespace', 'mqtt')
+        self.HASS_namespace = cfg.HASS_namespace
+        MQTT_namespace = cfg.MQTT_namespace
 
             # Set up your own notification app
-        name_of_notify_app = self.args.get('notify_app', None)
+        name_of_notify_app = cfg.notify_app
         if name_of_notify_app is not None:
             self.notify_app = self.ADapi.get_app(name_of_notify_app)
             if self.notify_app is None:
@@ -107,11 +109,11 @@ class Climate(ad.ADBase):
             self.notify_app = Notify_Mobiles(self.ADapi, self.HASS_namespace)
 
             # Default vacation state for saving purposes
-        if 'away_state' in self.args:
-            vacation_state = self.args['away_state']
+        if cfg.away_state is not None:
+            vacation_state = cfg.away_state
             self.ADapi.log("Please change 'away_state' to 'vacation' in your configuration. This option will be removed in an upcoming release.", level = 'WARNING')
-        elif 'vacation' in self.args:
-            vacation_state = self.args['vacation']
+        elif 'vacation' in cfg.model_fields_set:
+            vacation_state = cfg.vacation
         else:
             vacation_state = None
             # Convention shared with ElectricalManagement and ModeManagement: used only if it exists
@@ -122,7 +124,7 @@ class Climate(ad.ADBase):
 
             # Weather app. Outdoor temperature, rain, wind and lux are published by the
             # Weather app (https://github.com/Pythm/ad-Weather) in the WEATHER_CHANGE event.
-        weather_app_name = self.args.get('weather_app', 'weather')
+        weather_app_name = cfg.weather_app
         weather_app = self.ADapi.get_app(weather_app_name)
         if weather_app is None:
             self.ADapi.log(
@@ -134,15 +136,15 @@ class Climate(ad.ADBase):
 
             # Weather sensors. Deprecated: configure them in the Weather app.
         for deprecated in ('outside_temperature', 'rain_sensor', 'anemometer'):
-            if deprecated in self.args:
+            if getattr(cfg, deprecated) is not None:
                 self.ADapi.log(
                     f"'{deprecated}' is deprecated. Configure it in the Weather app instead. "
                     "It still works and takes priority while it reports.",
                     level = 'WARNING'
                 )
-        self.outside_temperature = self.args.get('outside_temperature', None)
-        self.rain_sensor = self.args.get('rain_sensor', None)
-        self.anemometer = self.args.get('anemometer', None)
+        self.outside_temperature = cfg.outside_temperature
+        self.rain_sensor = cfg.rain_sensor
+        self.anemometer = cfg.anemometer
         now = self.ADapi.datetime(aware=True)
 
         self.out_temp_last_update = now - datetime.timedelta(minutes = 21)
@@ -176,10 +178,10 @@ class Climate(ad.ADBase):
             on_change = self._out_lux_changed,
             HASS_namespace = self.HASS_namespace,
             MQTT_namespace = MQTT_namespace,
-            lux_sensor = self.args.get('OutLux_sensor'),
-            lux_sensor_mqtt = self.args.get('OutLuxMQTT'),
-            lux_sensor_2 = self.args.get('OutLux_sensor_2'),
-            lux_sensor_2_mqtt = self.args.get('OutLuxMQTT_2'),
+            lux_sensor = cfg.OutLux_sensor,
+            lux_sensor_mqtt = cfg.OutLuxMQTT,
+            lux_sensor_2 = cfg.OutLux_sensor_2,
+            lux_sensor_2_mqtt = cfg.OutLuxMQTT_2,
             min_react_minutes = 0,
         )
         self.weather.lux = self.weather_lux.out_lux
@@ -192,14 +194,14 @@ class Climate(ad.ADBase):
         single = self.args.get('climate') or self.args.get('heater')
         raw_devices = []
         if single:
-            kind = str(self.args.get('type', 'heater')).lower()
+            kind = str(self.args.get('type') or 'heater').lower()
             if kind not in ('heater', 'hvac'):
                 self.ADapi.log(f"Unknown type '{kind}' for {single}. Use 'heater' or 'hvac'. Using 'heater'.", level = 'WARNING')
                 kind = 'heater'
-            raw_devices.append((kind, self.args))
+            raw_devices.append((kind, dict(self.args)))
         else:
-            raw_devices += [('hvac', ac) for ac in self.args.get('HVAC') or []]
-            raw_devices += [('heater', h) for h in self.args.get('Heaters') or []]
+            raw_devices += [('hvac', ac) for ac in cfg.HVAC]
+            raw_devices += [('heater', h) for h in cfg.Heaters]
             if raw_devices:
                 self.ADapi.log(
                     "Configuring several devices with 'HVAC:' / 'Heaters:' lists in one app is deprecated. "
@@ -209,12 +211,8 @@ class Climate(ad.ADBase):
                 )
 
         unit = self._find_unit(raw_devices)
-        if unit == 'C':
-            self.defaults = {'max_vacation_temp': 30, 'vacation_temp': 16, 'screening_temp': 8,
-                             'getting_cold': 18, 'target_indoor_temp': 22.7}
-        elif unit == 'F':
-            self.defaults = {'max_vacation_temp': 86, 'vacation_temp': 61, 'screening_temp': 47,
-                             'getting_cold': 65, 'target_indoor_temp': 72.8}
+        if unit in UNIT_DEFAULTS:
+            self.defaults = UNIT_DEFAULTS[unit]
         else:
             self.ADapi.log(
                 "Could not find unit of measurement. Please configure 'unit_of_measurement' with C or F.\n"
@@ -224,8 +222,8 @@ class Climate(ad.ADBase):
             return
 
             # Persistent storage for learned setpoints and fan mode
-        if 'json_path' in self.args:
-            path = str(self.args['json_path']) + str(self.name) + '.json'
+        if cfg.json_path is not None:
+            path = cfg.json_path + str(self.name) + '.json'
             self.store = JsonStore(self.ADapi, path)
             changed = False
             for kind, raw in raw_devices:
@@ -255,7 +253,7 @@ class Climate(ad.ADBase):
     # ------------------------------------------------------------------ #
 
     def _find_unit(self, raw_devices) -> str | None:
-        unit = self.args.get('unit_of_measurement', None)
+        unit = self.config_model.unit_of_measurement
         if unit is None and self.outside_temperature:
             unit = self._unit_of(self.outside_temperature, self.HASS_namespace)
         if unit is None:
@@ -301,78 +299,29 @@ class Climate(ad.ADBase):
                 return
 
     def _device_cfg(self, raw:dict, kind:str, vacation_state) -> dict | None:
-        """ Resolves one device's configuration. Accepts both the ClimateCommander keys and the
-            ElectricalManagement climate keys (heater, window_temp, recipient, options). """
+        """ Validates one device with DeviceConfig and returns the dict the device classes read.
+            Accepts both the ClimateCommander keys and the ElectricalManagement climate keys
+            (heater, window_temp, recipient, options). In the old list style, the keys in
+            APP_LEVEL_KEYS fall back to the app level. """
         entity = raw.get('climate') or raw.get('heater')
         if not entity:
             self.ADapi.log(f"Skipping device without 'climate': {raw}", level = 'WARNING')
             return None
 
-        def app_level(key, default):
-            if key in raw:
-                return raw[key]
-            return self.args.get(key, default)
+        merged = dict(raw)
+        for key in APP_LEVEL_KEYS:
+            if key in self.args and key not in raw:
+                if key == 'notify_receiver' and 'recipient' in raw:
+                    continue
+                merged[key] = self.args[key]
 
-        options = raw.get('options') or []
-        temperatures = sorted(raw.get('temperatures') or [], key = lambda d: d.get('out', float('-inf')))
-        target_mode = raw.get('target_mode')
-        if target_mode not in ('indoor', 'table'):
-            if target_mode is not None:
-                self.ADapi.log(f"{entity}: unknown target_mode '{target_mode}'. Use 'indoor' or 'table'.", level = 'WARNING')
-            if temperatures or 'target_heater_temp' in raw or 'target_heater_input' in raw:
-                target_mode = 'table'
-            else:
-                target_mode = 'indoor'
-
-        target_indoor_temp = raw.get('target_indoor_temp', self.defaults['target_indoor_temp'])
-        target_heater_input = raw.get('target_heater_input')
-        if target_heater_input is None and 'target_heater_temp' not in raw:
-            # As ElectricalManagement 1.0.3: without own heater keys the indoor target is the heater target
-            target_heater_input = raw.get('target_indoor_input')
-
-        if target_mode == 'table':
-            vacation_temp = app_level('vacation_temp', None)
-        else:
-            vacation_temp = app_level('vacation_temp', self.defaults['vacation_temp'])
-
-        automate = raw.get('automate')
-        interval = TABLE_INTERVAL if target_mode == 'table' else INDOOR_INTERVAL
-
-        return {
-            'climate': entity,
-            'namespace': raw.get('namespace', self.HASS_namespace),
-            'target_mode': target_mode,
-            'interval': interval,
-            'start_delay': 10 + zlib.crc32(entity.encode()) % interval,
-            'indoor_sensor_temp': raw.get('indoor_sensor_temp'),
-            'backup_indoor_sensor_temp': raw.get('backup_indoor_sensor_temp'),
-            'window_temp': raw.get('window_sensor_temp', raw.get('window_temp')),
-            'window_offset': raw.get('window_offset', -3),
-            'target_indoor_input': raw.get('target_indoor_input'),
-            'target_indoor_temp': target_indoor_temp,
-            'target_heater_temp': raw.get('target_heater_temp', target_indoor_temp),
-            'target_heater_input': target_heater_input,
-            'temperatures': temperatures,
-            'save_temp': raw.get('save_temp'),
-            'save_temp_offset': raw.get('save_temp_offset'),
-            'spend_temp_offset': app_level('spend_temp_offset', 1),
-            'vacation_temp': vacation_temp,
-            'max_vacation_temp': app_level('max_vacation_temp', self.defaults['max_vacation_temp']),
-            'rain_level': app_level('rain_level', 3),
-            'anemometer_speed': app_level('anemometer_speed', 40),
-            'daytime_savings': raw.get('daytime_savings') or [],
-            'daytime_increasing': raw.get('daytime_increasing') or [],
-            'silence': raw.get('silence') or [],
-            'automate': automate if isinstance(automate, str) else None,
-            'windowsensors': raw.get('windowsensors') or [],
-            'screening': raw.get('screening') or [],
-            'screening_temp': app_level('screening_temp', self.defaults['screening_temp']),
-            'getting_cold': app_level('getting_cold', self.defaults['getting_cold']),
-            'getting_hot_offset': app_level('getting_hot_offset', 10),
-            'vacation': raw.get('vacation', vacation_state),
-            'vacation_keep_off': bool(raw.get('vacation_keep_off', False)) or 'vacation_keep_off' in options,
-            'notify_receiver': raw.get('notify_receiver', raw.get('recipient', self.args.get('notify_receiver'))),
-        }
+        try:
+            model = DeviceConfig.model_validate(merged)
+        except ValidationError as e:
+            self.ADapi.log(f"{entity}: invalid configuration, device skipped: {format_errors(e)}", level = 'ERROR')
+            return None
+        return model.runtime(defaults = self.defaults, hass_namespace = self.HASS_namespace,
+                             vacation_state = vacation_state)
 
     # ------------------------------------------------------------------ #
     # Public API (ElectricalManagement)
