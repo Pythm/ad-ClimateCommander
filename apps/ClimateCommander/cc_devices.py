@@ -15,6 +15,10 @@
     Power states (set by ElectricalManagement through set_power_state, see README):
       'normal', 'save' (high price), 'spend' (low price / solar), 'reduce' (over the kWh limit).
 
+    controller (per device, default 'classic'): 'shadow' and 'adaptive' use the indoor controller in
+    cc_control.py instead of the step rules and learned setpoints (indoor mode, and table mode for heaters).
+    'shadow' keeps classic in control and only computes and logs what adaptive would do.
+
     @Pythm / https://github.com/Pythm
 """
 
@@ -24,12 +28,17 @@ import bisect
 import datetime
 import math
 
+from cc_control import ControlConfig, IndoorController, Inputs
+
 UNAVAIL = ('unavailable', 'unknown')
 POWER_STATES = ('normal', 'save', 'spend', 'reduce')
 DEFAULT_POWER_STATE_MINUTES = 45   # a power state without a refresh falls back to 'normal' after this
 STALE_SENSOR = datetime.timedelta(hours = 1)
 STABLE_CORRECTION_MIN_DIFF = 0.3   # indoor mode: correct a steady room that is this far off target
 STABLE_CORRECTION_AFTER = datetime.timedelta(minutes = 30)
+CONTROL_WRITE_EVERY = datetime.timedelta(minutes = 30)   # shadow / adaptive: JSON written at most this often (and on power-state changes)
+DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
+             'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl')
 
 
 def round_half(value: float) -> float:
@@ -59,6 +68,8 @@ class Heater:
         self.namespace:str = cfg['namespace']
         self.target_mode:str = cfg['target_mode']
         self.interval:int = cfg['interval']
+        self.controller:str = 'classic'
+        self.ctrl = None                   # cc_control.IndoorController with controller shadow / adaptive
         now = self.ADapi.datetime(aware=True)
 
             # Sensors
@@ -202,6 +213,9 @@ class Heater:
             self.ADapi.listen_state(self._vacationStateListen, self.vacation_entity,
                 namespace = self.namespace
             )
+
+        if not self.hvac:
+            self._setup_controller(cfg)   # Aircondition does it at the end of its own __init__
 
             # Periodic run. Spread over the interval so many devices do not all call HA in the same second.
         self.ADapi.run_every(self._set_indoortemp, f"now+{cfg['start_delay']}", self.interval)
@@ -452,6 +466,9 @@ class Heater:
             self.ADapi.log(f"{self.heater}: the entity is back ({state}).", level = 'INFO')
 
     def _set_indoortemp(self, **kwargs) -> None:
+        if self.ctrl is not None and 'classic_only' not in kwargs:
+            self._controller_cycle()
+            return
         if self._automation_off():
             return
         self._note_entity_state()
@@ -927,6 +944,265 @@ class Heater:
         if heater_temp != round_half(new_temperature):
             self._send_temperature(round_half(new_temperature))
 
+    # ------------------------------------------------------------------ #
+    # Indoor controller (controller: shadow / adaptive, cc_control.py)
+    # ------------------------------------------------------------------ #
+
+    def _setup_controller(self, cfg:dict) -> None:
+        """ Creates the controller for 'shadow' and 'adaptive' and restores its learned state from the JSON
+            ('adaptive' key; the classic 'data' buckets are neither read nor written by it). """
+        controller = cfg.get('controller') or 'classic'
+        if controller == 'classic':
+            if cfg.get('adaptive_keys'):
+                self.ADapi.log(f"{self.heater}: {', '.join(cfg['adaptive_keys'])} only work with controller "
+                               "'shadow' or 'adaptive'. Ignored with the classic controller.", level = 'INFO')
+            return
+        if self.hvac and self.target_mode == 'table':
+            self.ADapi.log(f"{self.heater}: controller '{controller}' is for indoor mode on HVAC (heaters: indoor or "
+                           "table mode). This HVAC is in table mode, so the classic controller is used.", level = 'INFO')
+            return
+        if cfg.get('window_offset_table') and not self.window_temp:
+            self.ADapi.log(f"{self.heater}: window_offset_table needs window_sensor_temp. The table is not used.", level = 'WARNING')
+        if cfg.get('internal_offset_table') and self.ADapi.get_state(self.heater, attribute = 'current_temperature', namespace = self.namespace) is None:
+            self.ADapi.log(f"{self.heater}: internal_offset_table is set, but the climate reports no current_temperature "
+                           "(yet). The table is used only when it does.", level = 'WARNING')
+        max_temp = to_float(self.ADapi.get_state(self.heater, attribute = 'max_temp', namespace = self.namespace))
+        self.controller = controller
+        self.ctrl = IndoorController(ControlConfig(
+            kind = 'hvac' if self.hvac else 'heater',
+            target_mode = self.target_mode,
+            unit = cfg['unit'],
+            min_temp = self.min_temp,
+            max_temp = max_temp if max_temp is not None else 35.0,
+            vacation_temp = self.vacation_temp,
+            max_vacation_temp = getattr(self, 'max_vacation_temp', 30.0),
+            save_temp_offset = self.save_temp_offset,
+            save_temp = self.save_temp,
+            spend_temp_offset = self.spend_temp_offset,
+            window_offset = cfg['window_offset_prior'],
+            window_offset_table = cfg['window_offset_table'],
+            internal_offset_table = cfg['internal_offset_table'],
+            target_table = cfg['target_table'],
+            outdoor_gain = cfg['outdoor_gain'],
+            solar_gain = cfg['solar_gain'],
+            solar_max = cfg['solar_max'],
+            comfort_guard = cfg['comfort_guard'],
+            temperatures = self.temperatures,
+            target_heater_temp = self.target_heater_temp,
+        ))
+        self.diagnostic_sensor = cfg.get('diagnostic_sensor')
+        self._virtual_setpoint = None      # shadow: the setpoint and mode the controller proposed last,
+        self._virtual_mode = None          # fed back to it instead of the real ones
+        self._ctrl_last_write = None
+        self._lux_seen = False             # lux stays 0 without any lux source: use day / night until one reports
+        if self.store is None:
+            self.ADapi.log(f"{self.heater}: controller '{controller}' without json_path: the learned window and climate "
+                           "sensor offsets start empty after every restart.", level = 'INFO')
+            return
+        for level, text in self.ctrl.restore(self.store.device(self.heater).get('adaptive')):
+            self.ADapi.log(f"{self.heater}: {text}", level = level)
+
+    def _sensor_reading(self, entity):
+        """ (value, seconds since last reported), or (None, None). """
+        if entity is None:
+            return None, None
+        value = to_float(self.ADapi.get_state(entity, namespace = self.namespace))
+        if value is None:
+            return None, None
+        return value, self._sensor_age(entity).total_seconds()
+
+    def _controller_inputs(self, state:str, setpoint) -> Inputs:
+        now = self.ADapi.datetime(aware=True)
+        room, room_age = self._sensor_reading(self.indoor_sensor_temp)
+        backup, backup_age = self._sensor_reading(self.backup_indoor_sensor_temp)
+        window, window_age = self._sensor_reading(self.window_temp)
+        if self.weather.lux > 0:
+            self._lux_seen = True
+        increasing, after_increase = self.DaytimeIncreasing()
+        preset_modes = self.ADapi.get_state(self.heater, attribute = 'preset_modes', namespace = self.namespace) or []
+        fan_mode = self.ADapi.get_state(self.heater, attribute = 'fan_mode', namespace = self.namespace)
+        return Inputs(
+            now = now,
+            target = self.target_indoor_temp,
+            setpoint = setpoint,
+            hvac_mode = state,
+            room = room, room_age_s = room_age,
+            backup = backup, backup_age_s = backup_age,
+            window = window, window_age_s = window_age,
+            internal = to_float(self.ADapi.get_state(self.heater, attribute = 'current_temperature', namespace = self.namespace)),
+            out_temp = self.weather.out_temp if self.weather.out_temp_known else None,
+            lux = self.weather.lux if self._lux_seen else None,
+            daytime = self.ADapi.now_is_between('sunrise', 'sunset - 00:30:00'),
+            since_windy_s = (now - self.last_windy_time).total_seconds(),
+            wind_now = self.weather.wind >= self.anemometer_speed,
+            raining = self.weather.rain >= self.rain_level,
+            rain = self.weather.rain,
+            windows_open = self.windows_is_open,
+            since_window_closed_s = (now - self.window_last_closed).total_seconds(),
+            vacation = self.vacation_state,
+            power_state = self.power_state,
+            increasing = increasing,
+            after_increase = after_increase,
+            saving = self.DaytimeSaving(),
+            preset = self.ADapi.get_state(self.heater, attribute = 'preset_mode', namespace = self.namespace),
+            boost_available = 'boost' in preset_modes and fan_mode != 'Silence',
+        )
+
+    def _controller_cycle(self) -> None:
+        """ One run with controller shadow / adaptive. Shadow: classic runs first and stays in control; the
+            controller then gets its own last proposals as setpoint and mode, so it does not follow classic. """
+        shadow = self.controller == 'shadow'
+        classic_setpoint = classic_mode = None
+        if shadow:
+            changed_before = self.heater_temp_last_changed
+            self._set_indoortemp(classic_only = True)
+            classic_setpoint = self._last_commanded if self.heater_temp_last_changed != changed_before else self.get_heater_temp()
+            classic_mode = self.ADapi.get_state(self.heater, namespace = self.namespace)
+        if self._automation_off():
+            return
+        if not shadow:
+            self._note_entity_state()
+        state = self.ADapi.get_state(self.heater, namespace = self.namespace)
+        if state is None or state in UNAVAIL:
+            return
+        if self.hvac:
+            if state not in ('heat', 'cool', 'fan_only', 'off'):
+                if not shadow:
+                    self.ADapi.log(f"Unregistered AC state: {state}. {self.friendly_name()}. Will not automate", level = 'WARNING')
+                return
+            if not shadow:
+                self._silence()
+        else:
+            state = 'off' if state == 'off' else 'heat'
+        if (not shadow and self.target_mode == 'table' and self.vacation_state and self.vacation_keep_off
+                and not self.windows_is_open and self.power_state != 'reduce'):
+            if self.off_retry_count >= 0:   # as classic table mode
+                self.ADapi.call_service('climate/turn_off', entity_id = self.heater, namespace = self.namespace)
+                self.off_retry_count -= 1
+            return
+
+        setpoint = self.get_heater_temp()
+        if shadow:
+            if state in ('heat', 'cool', 'fan_only'):
+                self._virtual_mode = self._virtual_mode or state
+                state = self._virtual_mode
+            else:
+                self._virtual_mode = None
+            if self._virtual_setpoint is None:
+                self._virtual_setpoint = setpoint
+            setpoint = self._virtual_setpoint
+        if self.target_mode == 'table':
+            self.ctrl.cfg.target_heater_temp = self.target_heater_temp   # target_heater_input may have changed
+        inp = self._controller_inputs(state, setpoint)
+        pw_before = self.ctrl.pw_state
+        dec = self.ctrl.update(inp)
+        for level, text in dec.logs:
+            self.ADapi.log(f"{self.heater}: {'[shadow] ' if shadow else ''}{text}", level = level)
+
+        if shadow:
+            if dec.hvac_mode is not None and self._virtual_mode is not None:
+                self._virtual_mode = dec.hvac_mode
+            if dec.temperature is not None:
+                self._virtual_setpoint = dec.temperature
+            holds, mode = self._virtual_setpoint, self._virtual_mode or state
+        else:
+            if dec.hvac_mode is not None and self.hvac and dec.hvac_mode != state:
+                self._set_hvac_mode(dec.hvac_mode)
+                # A new mode and the fan mode in the same moment can lose one of them in the unit: set the
+                # Silence fan mode separately a few seconds later, as classic does (it re-runs after a mode change).
+                if self.silence:
+                    self.ADapi.run_in(self._silence_later, 5)
+            if dec.temperature is not None and dec.temperature != setpoint:
+                self._send_temperature(dec.temperature)
+            if dec.preset is not None and self.hvac:
+                self.ADapi.call_service('climate/set_preset_mode',
+                    entity_id = self.heater,
+                    preset_mode = dec.preset,
+                    namespace = self.namespace
+                )
+            holds = dec.temperature if dec.temperature is not None else setpoint
+            mode = dec.hvac_mode or state
+            self._window_notifications(dec.diag.get('R'))
+            self._controller_screens(dec.diag.get('R'), mode)
+
+        self._controller_persist(dec, pw_before, inp.now)
+        self._controller_report(dec, holds, mode, classic_setpoint, classic_mode)
+
+    def _controller_screens(self, room, mode:str) -> None:
+        """ Screens as in classic: always tried in cool, else when the room is 0.2 above target, no wind for 45 min
+            and the outdoor temperature is above screening_temp. """
+        if not self.screening or room is None:
+            return
+        if mode == 'cool':
+            for s in self.screening:
+                s.try_screen_close()
+            return
+        if (
+            room > self.target_indoor_temp + 0.2
+            and self.ADapi.datetime(aware=True) - self.last_windy_time > datetime.timedelta(minutes = 45)
+        ):
+            if self.weather.out_temp > self.screening_temp:
+                for s in self.screening:
+                    s.try_screen_close()
+        elif self.hvac:
+            for s in self.screening:
+                s.can_close_on_lux = False
+
+    def _controller_persist(self, dec, pw_before:str, now) -> None:
+        """ The controller state goes under 'adaptive' in the JSON. The file is written at most every 30 min, at
+            once when a power state starts or ends (a restart must not add the offset twice), and on terminate. """
+        if self.store is None:
+            return
+        edge = self.ctrl.pw_state != pw_before
+        due = self._ctrl_last_write is None or now - self._ctrl_last_write >= CONTROL_WRITE_EVERY
+        if dec.save or due or edge:
+            self.store.device(self.heater)['adaptive'] = self.ctrl.snapshot()
+        if due or edge:
+            self.store.save()
+            self._ctrl_last_write = now
+
+    def controller_terminate(self) -> bool:
+        """ App terminate: puts the latest controller state in the store. True when there is one to write. """
+        if self.ctrl is None or self.store is None:
+            return False
+        self.store.device(self.heater)['adaptive'] = self.ctrl.snapshot()
+        return True
+
+    def _controller_report(self, dec, holds, mode, classic_setpoint, classic_mode) -> None:
+        """ One DEBUG line per run, and the optional diagnostic_sensor (state: the setpoint the controller holds,
+            in shadow the one it would hold; attributes: the terms). """
+        d = dec.diag
+
+        def num(v, digits = 2):
+            return round(v, digits) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+
+        terms = ' '.join(f"{k} {num(d[k])}" for k in DIAG_KEYS if k in d and d[k] is not None)
+        text = f"{self.heater}: {self.controller} {mode} {terms} send {dec.temperature} hold {holds} frozen {d.get('frozen')}"
+        if self.controller == 'shadow':
+            text += f" classic {classic_setpoint} {classic_mode}"
+        self.ADapi.log(text, level = 'DEBUG')
+        if not self.diagnostic_sensor:
+            return
+        attributes = {k: num(d[k], 3) for k in DIAG_KEYS if k in d}
+        attributes.update(
+            controller = self.controller,
+            climate = self.heater,
+            hvac_mode = mode,
+            send = dec.temperature,
+            frozen = d.get('frozen'),
+            unit_of_measurement = '°F' if self.ctrl.cfg.unit == 'F' else '°C',
+            friendly_name = f"{self.friendly_name()} controller",
+        )
+        if self.controller == 'shadow':
+            attributes.update(classic_setpoint = classic_setpoint, classic_mode = classic_mode)
+        self.ADapi.set_state(self.diagnostic_sensor,
+            state = holds if holds is not None else 'unknown',
+            attributes = attributes,
+            replace = True,
+            check_existence = False,
+            namespace = self.namespace
+        )
+
 
 class Aircondition(Heater):
     """ Heat pump / AC with heat, cool and fan_only. """
@@ -954,6 +1230,9 @@ class Aircondition(Heater):
         if self.fan_mode_persistent is None or self.fan_mode_persistent == 'Silence':
             self.fan_mode_persistent = 'Auto'
 
+        self._schedule_silence()
+        self._setup_controller(cfg)
+
     def _set_hvac_mode(self, mode:str) -> None:
         self.ADapi.call_service('climate/set_hvac_mode',
             entity_id = self.heater,
@@ -969,12 +1248,18 @@ class Aircondition(Heater):
             return self._table_setpoint(real_in_temp, vacation = False)
         return self._indoor_setpoint(heater_temp = heater_temp, in_temp = in_temp, mode = 'heat')
 
-    def _silence(self) -> None:
-        """ Set silence preset for HVAC enabled devices """
+    # ------------------------------------------------------------------ #
+    # Silence fan mode
+    # ------------------------------------------------------------------ #
+
+    def _silence_fan_available(self) -> bool:
         fan_modes = self.ADapi.get_state(self.heater, attribute = 'fan_modes', namespace = self.namespace)
-        if fan_modes is None or 'Silence' not in fan_modes:
-            return
-        change_fan_mode_to_silence = False
+        return fan_modes is not None and 'Silence' in fan_modes
+
+    def _in_silence_period(self) -> bool:
+        """ True while a silence period applies: inside start/stop, not on vacation, and (with `presence`)
+            at least one listed person is home. """
+        wanted = False
         for time in self.silence:
             if 'start' in time and 'stop' in time:
                 if (
@@ -984,33 +1269,80 @@ class Aircondition(Heater):
                     if 'presence' in time:
                         for presence in time['presence']:
                             if self.ADapi.get_state(presence, namespace = self.namespace) == 'home':
-                                change_fan_mode_to_silence = True
+                                wanted = True
                     else:
-                        change_fan_mode_to_silence = True
+                        wanted = True
                     break
+        return wanted
 
+    def _fan_to_silence(self) -> None:
+        """ Sets the fan mode Silence and remembers the fan mode that was set before. """
         fan_mode_now = self.ADapi.get_state(self.heater, attribute = 'fan_mode', namespace = self.namespace)
-        if change_fan_mode_to_silence and fan_mode_now != 'Silence':
-            self.fan_mode = fan_mode_now
-            self.ADapi.call_service('climate/set_fan_mode',
-                entity_id = self.heater,
-                fan_mode = 'Silence',
-                namespace = self.namespace
-            )
-            if self.fan_mode != self.fan_mode_persistent and self.fan_mode is not None:
-                self.fan_mode_persistent = self.fan_mode
-                if self.store is not None:
-                    self.store.device(self.heater)['fan_mode'] = self.fan_mode
-                    self.store.save()
+        if fan_mode_now == 'Silence':
+            return
+        self.fan_mode = fan_mode_now
+        self.ADapi.call_service('climate/set_fan_mode',
+            entity_id = self.heater,
+            fan_mode = 'Silence',
+            namespace = self.namespace
+        )
+        if self.fan_mode != self.fan_mode_persistent and self.fan_mode is not None:
+            self.fan_mode_persistent = self.fan_mode
+            if self.store is not None:
+                self.store.device(self.heater)['fan_mode'] = self.fan_mode
+                self.store.save()
 
-        elif not change_fan_mode_to_silence and fan_mode_now == 'Silence':
-            self.ADapi.call_service('climate/set_fan_mode',
-                entity_id = self.heater,
-                fan_mode = self.fan_mode_persistent,
-                namespace = self.namespace
-            )
+    def _fan_back_from_silence(self) -> None:
+        """ Sets the fan mode back to the one that was set before Silence (Auto if none is known). """
+        fan_mode_now = self.ADapi.get_state(self.heater, attribute = 'fan_mode', namespace = self.namespace)
+        if fan_mode_now != 'Silence':
+            return
+        self.ADapi.call_service('climate/set_fan_mode',
+            entity_id = self.heater,
+            fan_mode = self.fan_mode_persistent,
+            namespace = self.namespace
+        )
+
+    def _silence(self) -> None:
+        """ Makes the fan mode match the silence periods: Silence inside a period, the earlier fan mode outside.
+            Called at every run, 5 seconds after a mode change, and by the timers at each period start and stop. """
+        if not self._silence_fan_available():
+            return
+        if self._in_silence_period():
+            self._fan_to_silence()
+        else:
+            self._fan_back_from_silence()
+
+    def _silence_later(self, *args, **kwargs) -> None:
+        self._silence()
+
+    def _silence_timer(self, *args, **kwargs) -> None:
+        """ Timer at the start or stop of a silence period: also covers a period that ends while nobody runs. """
+        if self._automation_off():
+            return
+        self._silence()
+
+    def _schedule_silence(self) -> None:
+        """ One daily timer at every start and stop time of the silence periods, so the fan mode changes on time
+            and not at the next 12 minute run. """
+        times = set()
+        for period in self.silence:
+            for key in ('start', 'stop'):
+                value = period.get(key)
+                if isinstance(value, int) and 0 <= value < 86400:      # YAML 1.1 reads an unquoted 22:00:00 as 79200
+                    value = f"{value // 3600:02d}:{value % 3600 // 60:02d}:{value % 60:02d}"
+                if isinstance(value, str):
+                    times.add(value)
+        for value in sorted(times):
+            try:
+                self.ADapi.run_daily(self._silence_timer, value)
+            except (ValueError, TypeError, NotImplementedError):
+                self.ADapi.log(f"{self.heater}: silence time '{value}' not understood. Silence changes at the next run.", level = 'WARNING')
 
     def _set_indoortemp(self, **kwargs) -> None:
+        if self.ctrl is not None and 'classic_only' not in kwargs:
+            self._controller_cycle()
+            return
         if self._automation_off():
             return
         self._note_entity_state()

@@ -251,6 +251,11 @@ class Climate(ad.ADBase):
         if isinstance(last_sent, dict):
             self.weather_event('WEATHER_CHANGE', last_sent)
 
+    def terminate(self):
+        """ Called by AppDaemon before a reload or stop: writes the state of shadow / adaptive controllers. """
+        if self.store is not None and any([device.controller_terminate() for device in self.devices]):
+            self.store.save()
+
     # ------------------------------------------------------------------ #
     # Setup helpers
     # ------------------------------------------------------------------ #

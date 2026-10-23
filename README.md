@@ -15,6 +15,7 @@ One app controls one climate entity: a heater (floor heating, panel heater) or a
 - [Quick start](#quick-start)
 - [One app per device](#one-app-per-device)
 - [How the setpoint is found](#how-the-setpoint-is-found)
+- [Adaptive controller (optional)](#adaptive-controller-optional)
 - [HVAC modes, fan and preset](#hvac-modes-fan-and-preset)
 - [Screens and covers](#screens-and-covers)
 - [Weather integration](#weather-integration)
@@ -46,7 +47,8 @@ One app controls one climate entity: a heater (floor heating, panel heater) or a
   - A missing or unavailable climate entity is logged once (WARNING for missing, INFO for unavailable), not silently.
   - An HVAC in table mode without `vacation_temp` no longer fails on vacation (falls back to 10).
 - **Save / spend / reduce from ElectricalManagement** (optional, ElectricalManagement 1.0.6 or later), see [ElectricalManagement](#electricalmanagement).
-- **The app now has two more files**, `cc_devices.py` and `cc_config.py`, next to `climateCommander.py` and `weather_data.py`. Copy the whole app folder when you update (HACS does).
+- **The app now has three more files**, `cc_devices.py`, `cc_config.py` and `cc_control.py`, next to `climateCommander.py` and `weather_data.py`. Copy the whole app folder when you update (HACS does).
+- **New, optional: `controller: shadow` / `controller: adaptive`**, a different way to find the setpoint, per device. The default `classic` is the controller described in this README and is unchanged. See [Adaptive controller](#adaptive-controller-optional).
 - **The configuration is validated with pydantic** (`cc_config.py`). A value of the wrong type (for example `window_offset: abc`, or a table entry without `out`) now logs an ERROR naming the key: an invalid device is skipped, an invalid app-level key stops that app. Before, such a value was silently used or crashed later (`vacation_temp: abc` used to fall back to 10). A single entity where a list is expected (for example `windowsensors: binary_sensor.x`) is accepted as a one-item list. See [Validation](#validation).
 - **New key `cloud_cover`** (default `90`): screens close only while the cloud cover from the Weather app is below this percentage. Before, the limit was fixed at 90, so the default keeps the old behaviour. See [Screens and covers](#screens-and-covers).
 - Behaviour changes in the indoor-target mode (HVAC, and heaters without a table):
@@ -87,6 +89,12 @@ climate_living_room:
 - Learned setpoints: on its first start a one-device app copies the data for its entity from the other JSON files in `json_path` (the old app's file), then writes its own `<app name>.json`. Remove the device from the old app when you move it.
 - Many apps: AppDaemon gives every app its own thread. With more than 20-30 apps, set `total_threads` (for example 10) in `appdaemon.yaml`; the apps then share the threads.
 
+#### Trying the adaptive controller (optional)
+**Nothing to do for the default case**: without `controller`, every device keeps the classic controller and behaves exactly as before. To try the new one:
+1. Add `controller: shadow` to one device (and optionally `diagnostic_sensor`). Classic stays in control; nothing else changes. Leave it for 1 to 2 weeks and read the [DEBUG line or the diagnostic sensor](#start-with-shadow).
+2. Then change it to `controller: adaptive`.
+3. To go back, set `controller: classic` (or remove the key). The learned setpoints of classic (`"data"` in the JSON file) are not touched by `shadow` or `adaptive`, and classic ignores the new `"adaptive"` entry, so you can switch back and forth.
+
 ### 1.3.0
 - **The [ad-Weather](https://github.com/Pythm/ad-Weather) app is required** for outdoor temperature, rain, wind and lux. An ERROR is logged at startup if it is not found; `weather_app` sets its name. **Nothing to do** if you already use it. Install ad-Weather 0.2.0 or later: it sends values it does not have as `None`, which this version handles.
 - `outside_temperature`, `rain_sensor` and `anemometer` are **deprecated** (a WARNING is logged). They still work and take precedence while they report.
@@ -125,7 +133,7 @@ climate_living_room:
 - Home Assistant and AppDaemon 4.5, with Python 3.10 or later.
 - The Python package `pydantic` version 2 (AppDaemon 4.5 depends on it, so it is normally installed already).
 - The [ad-Weather](https://github.com/Pythm/ad-Weather) app, version 0.2.0 or later. ClimateCommander looks for an app named `weather`; set `weather_app` if yours has another name. An ERROR is logged at startup if it is not found.
-- All four files of the app in the same folder: `climateCommander.py`, `cc_devices.py`, `cc_config.py` and `weather_data.py`.
+- All five files of the app in the same folder: `climateCommander.py`, `cc_devices.py`, `cc_config.py`, `cc_control.py` and `weather_data.py`.
 - A temperature sensor in the room (`indoor_sensor_temp`). It is required in indoor mode, and it is used to find the unit (C or F) unless you set `unit_of_measurement`.
 - Optional: [ElectricalManagement](https://github.com/Pythm/ad-ElectricalManagement) 1.0.6 or later for save / spend / reduce.
 
@@ -321,6 +329,141 @@ Each period is a list entry with `start`, `stop` and optionally `presence` (a li
 | `silence` (HVAC) | between `start` and `stop`, not on vacation, and (with `presence`) someone in `presence` is `home`. Only the first period that matches the time is checked. | Fan mode `Silence`, see [HVAC modes](#hvac-modes-fan-and-preset). |
 
 ---
+## Adaptive controller (optional)
+
+Everything above describes the **classic** controller, the default. With `controller: adaptive` a device finds its setpoint in a different way; with `controller: shadow` it only calculates what the adaptive controller would do and changes nothing. The key is per device:
+
+| `controller` | What happens |
+|---|---|
+| `classic` (default) | As described in [How the setpoint is found](#how-the-setpoint-is-found). Nothing new. |
+| `shadow` | Classic stays in control and sends exactly what it sent before. The adaptive controller runs next to it on its own proposals, writes one DEBUG line per run and the optional `diagnostic_sensor`. Use it first. |
+| `adaptive` | The adaptive controller sets the temperature (and for HVAC the mode heat / cool / fan_only and the `boost` preset). |
+
+It works in indoor mode for heaters and HVAC, and in table mode for heaters. An HVAC in table mode keeps the classic controller (one INFO line).
+
+### What it does
+
+Every run (12 minutes, 15 in table mode, and on window, vacation and power-state changes) the setpoint is calculated again from these parts:
+- **The target**: `target_indoor_temp` or `target_indoor_input`, or `target_table` (below). On top, the same shifts as classic, now applied to the target: +0.5 during `daytime_increasing`, -0.5 during `daytime_savings`, otherwise +0.3 with wind or rain.
+- **A feed-forward from the climate's own sensor**: a heat pump regulates its own sensor (`current_temperature`), which often reads 2 to 5 degrees above the room. The controller learns that offset (see below) and, for HVAC, adds half of it, so the setpoint moves with it before the room drifts. Heaters do not use it. `outdoor_gain` adds a fixed extra per degree that the slow outdoor temperature is below the target.
+- **A slow integral term**, which finds the setpoint that holds the room. It only runs while the room is near the target, outside a small band (room more than 0.1 above or 0.25 below the target, as the classic asymmetry), and it is frozen while a window is open or closed less than an hour ago, on vacation, in a power state, without a room sensor and (HVAC) while the sun term is large.
+- **A proportional term** on the filtered room temperature.
+- **Minus a sun term**: how far the window sensor reads above its learned level without sun. It rises at once and fades over about two hours (walls and floor keep the heat), times `solar_gain`, at most `solar_max`.
+
+The result stays within the target ± 8, the climate's `min_temp` and `max_temp` attributes, and never below the vacation temperature. It is rounded to 0.5 and sent **at most once per 12 minutes, at most 0.5 per change**. Window, vacation and the start or end of a power state are sent at once. A setpoint changed by hand (or by another app) is followed: the controller continues from it.
+
+**Start and restart.** At the first run after a start or a reload the controller takes over the climate's current setpoint, so nothing jumps. If the room is then far from the target (more than about 1.4 degrees for HVAC, 3.9 for heaters) it does not wait: the setpoint is walked towards the calculated value, one 0.5 step per 12 minutes. A setpoint changed by hand is followed in the same way as in classic. When the HVAC mode changes, the `Silence` fan mode (if a `silence` period is active) is set in a separate command a few seconds later, because a mode and a fan mode sent together can lose one of them.
+
+On top, unchanged from classic: open windows (heater: `vacation_temp`, HVAC: `fan_only`), vacation, and the power states from ElectricalManagement (the setpoint at the start of the state plus the same offsets). New: the **comfort guard** drops the power-state offset until the state changes when the room is `comfort_guard` below the target in `save` / `reduce`, or that much above it in `spend`.
+
+**What it learns** (stored per climate under `"adaptive"` in the JSON file, see [JSON](#json-and-switching-back)):
+- **The window level without sun**: window sensor minus room sensor, by outdoor temperature, with extra terms for wind and rain. It is learned only on quiet nights: room sensor fresh, windows closed for an hour, no vacation or power state, lux below 500 and no sun for an hour. It may be negative (a cold window) or positive (a sensor above a heater or in the air flow of a heat pump). Until enough is learned, `window_offset` (default -3 C / -5.4 F) or `window_offset_table` is used.
+- **The offset of the climate's own sensor**: `current_temperature` minus the room, by the slow outdoor temperature, only in `heat` with a settled room.
+
+**Without a room sensor** (unavailable, or not reported for an hour, and no usable backup): the room is estimated as the climate's own sensor minus the learned offset (or `internal_offset_table`). The integral is frozen, nothing is learned and an HVAC does not change mode on an estimate. Without any offset the controller runs open loop on the feed-forward. One WARNING when this starts, one INFO when the room sensor is back. Classic does nothing in indoor mode in that case.
+
+**Table-mode heaters** keep the table: base from `temperatures`, +1 for rain or wind, then the sun term and "room above target" together lower it by at most 3, and save / spend / vacation / `min_temp` as classic. Differences: the room is the room sensor or the estimate above; **without either, the "room above target" part is left out** (classic uses the thermostat's `current_temperature`, often the floor, as the room and lowers the setpoint by up to 3). A small trim (at most ±2) moves the table value towards `target_indoor_temp` while a real room sensor reports.
+
+### Start with shadow
+
+1. Set `controller: shadow`, optionally `diagnostic_sensor: sensor.<room>_controller`, and leave it for **1 to 2 weeks**. A `json_path` keeps what it learns over restarts.
+2. Read what it would do. Either set `log_level: DEBUG` for the app in `apps.yaml`; each run then logs one line such as  
+   `climate.living_room: shadow heat src primary R 21.9 in_f 21.93 rate 0.1 out_slow 3.4 out_day 4.1 excess -0.3 base_w -2.5 solar 0.0 bias_int 2.1 target_eff 22.0 ff 1.05 i -0.32 p 0.07 sp_ctrl 22.3 send None hold 22.5 frozen None classic 22.0 heat`  
+   or open the history of the diagnostic sensor in Home Assistant. Its state is the setpoint the controller would hold; `classic_setpoint` is what classic did.
+3. Check that `src` is `primary` most of the time, that `base_w` (the learned window level) looks plausible for the room, and that `sp_ctrl` and `classic_setpoint` are not far apart for long.
+4. Then set `controller: adaptive`.
+
+**Heaters:** adaptive works for heaters too, but the heater constants were only tuned in a simulation with guessed floor-heating physics. Always run a heater in `shadow` first.
+
+| Diagnostic attribute | Meaning |
+|---|---|
+| state | Setpoint the controller holds (`shadow`: would hold) |
+| `src`, `R` | Room value used: `primary`, `backup` (with a learned offset), `estimate` (climate sensor minus offset) or none |
+| `in_f`, `rate` | Filtered room temperature and its trend per hour |
+| `out_slow`, `out_day` | Outdoor temperature filtered over 8 to 9 hours (the walls) and over 24 hours |
+| `excess`, `base_w`, `solar` | Window sensor above its learned level (`base_w`), and the sun term |
+| `bias_int` | Learned offset of the climate's own sensor |
+| `target_eff`, `ff`, `i`, `p`, `sp_ctrl` | Effective target, feed-forward, integral, proportional term, unrounded setpoint |
+| `trim`, `room_term` | Table mode: trim and the "room above target" part |
+| `send`, `frozen` | What was sent this run (`shadow`: would be sent), and why the integral is frozen |
+| `classic_setpoint`, `classic_mode` | `shadow` only: what classic set |
+
+The diagnostic sensor is written with `set_state` once per run. Home Assistant does not keep such an entity over its own restart; it comes back at the next run (within 12 minutes). Its history is recorded like any other entity.
+
+### Keys
+
+All optional. Only `shadow` and `adaptive` read them; with `classic` they are ignored with one INFO line.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `controller` | string | `classic` | `classic`, `shadow` or `adaptive`. |
+| `diagnostic_sensor` | entity | none | For example `sensor.living_room_controller`. Written once per run, see above. |
+| `window_offset` | number | -3 | Classic: unchanged (the window sensor lowers the setpoint above `target + window_offset`). Adaptive: only the starting value of the learned window level, relative to the room. When not set, adaptive uses -3 C / -5.4 F. |
+| `window_offset_table` | list | none | Starting values of the window level by outdoor temperature (see below). Needs `window_sensor_temp`. |
+| `internal_offset_table` | list | none | Starting values of the climate's sensor minus the room by outdoor temperature. Gives an estimate without a room sensor from day one; the only source for a heater with no room sensor at all. |
+| `target_table` | list | none | Indoor target by the 24-hour mean outdoor temperature (see below). |
+| `outdoor_gain` | number 0 to 0.6 | not set | Fixed extra feed-forward per degree the slow outdoor temperature is below the target. Not set: only the learned offset is used. |
+| `solar_gain` | number 0 to 5 | 1.0 | Multiplies the sun term. |
+| `solar_max` | number above 0 | 3 C / 5.4 F | Largest sun term. |
+| `comfort_guard` | number above 0 | 1.5 C / 2.7 F | Power-state offset dropped (until the state changes) when the room is this far below the target in `save` / `reduce`, or above it in `spend`. |
+
+Fixed, not keys: one change per 12 minutes, 0.5 per change, room sensor stale after 1 hour, window sensor stale after 12 hours (window sensors often report only on a 1-degree change), JSON written at most every 30 minutes.
+
+**Offset tables** (`window_offset_table`, `internal_offset_table`). Each entry applies from its `out` and up, like `temperatures`. They seed the learning: with data the learned values take over step by step. Leave them out unless you know the values (for example from the diagnostic sensor after weeks of shadow).
+
+| Entry key | Type | Required | Meaning |
+|---|---|---|---|
+| `out` | number | yes | Outdoor temperature from which the entry applies. |
+| `offset` | number | yes | Window sensor (or the climate's sensor) minus the room sensor. Between -30 and 30. |
+| `wind` | number | no | Extra while windy (wind at or above `anemometer_speed` in the last 30 minutes). |
+| `rain` | number | no | Extra while it rains (at or above `rain_level`). |
+
+**Target table** (`target_table`): each entry has `out` and either `target` (absolute indoor target) or `offset` (added to `target_indoor_temp` or `target_indoor_input`). The outdoor value is the 24-hour mean, so the target follows the season, not day and night, and it moves to another entry at most once a day. With a `target` entry, `target_indoor_input` has no effect while that entry applies.
+
+Unknown keys in a table entry, the same `out` twice, or `target` and `offset` together are errors: the device is skipped with an ERROR naming the key.
+
+```yaml
+climate_living_room:
+  module: climateCommander
+  class: Climate
+  climate: climate.living_room
+  type: hvac
+  json_path: /conf/persistent/Climate/
+  indoor_sensor_temp: sensor.living_room_temperature
+  window_sensor_temp: sensor.living_room_window_temperature
+  target_indoor_temp: 22
+  controller: shadow
+  diagnostic_sensor: sensor.living_room_controller
+  target_table:                 # optional
+    - out: -30
+      offset: 0.5
+    - out: 12
+      target: 21.5
+```
+
+### What differs from classic
+
+- No learned setpoints per outdoor temperature and lux: the `"data"` entries in the JSON are neither read nor written.
+- No 6-run hold, no steady-room correction, no extra -1 after 4 hours turned down (D2), no fixed ±4 around a learned value.
+- The trend uses the real room reading and the real time between reports. The daytime and wind / rain shifts move the target, not the reading.
+- The window sensor counts relative to its learned level, not to `target + window_offset`, and it is not added up run after run.
+- HVAC modes: heat to `fan_only` when the room is 0.6 above the effective target (plus the spend offset during `spend`) and the setpoint is at its lowest or the room still rises; `fan_only` to heat at or below the effective target, not while the sun term is large, starting half a degree below the calculated setpoint. The 0.6 hysteresis now holds during daytime periods too. At least 30 minutes in a mode before an automatic switch (window and vacation switch at once). No heat to `fan_only` within 45 minutes of wind, in the hour after `daytime_increasing` or in the hour after a power state ended. Cooling uses the classic thresholds.
+- The comfort guard during power states.
+- The room estimate from the climate's own sensor when the room sensor is gone.
+- Indoor mode: the vacation temperature is also the lowest setpoint in normal operation, and the climate's `min_temp` / `max_temp` attributes are limits. In F, make sure the climate reports them in F.
+- A heater whose climate is `off` is left alone (classic sets the temperature anyway).
+- Without any lux source (lux stays 0), day and night from sunrise and sunset decide when the window level may be learned, until a lux value above 0 arrives.
+- After a restart the state comes back from the JSON (written at most every 30 minutes, at once when a power state starts or ends, and when AppDaemon stops or reloads the app), and a running power state is not applied twice.
+
+### JSON and switching back
+
+- The state is stored under `"adaptive"` next to the classic `"data"` for each climate in `<json_path>/<app name>.json`. Classic never reads it.
+- Switching between `classic`, `shadow` and `adaptive` is safe in both directions. What `shadow` learned is used by `adaptive`. Switch while ElectricalManagement sends `normal`: during `save` / `spend` the new controller takes the setpoint that already holds the offset as its base, so the offset counts twice until that state ends.
+- A state saved in another unit (C / F) or by another version is ignored with one INFO line, and learning starts again.
+- To reset only the adaptive learning: stop the app, delete the `"adaptive"` entry of that climate, start the app.
+- Without `json_path` everything learned is lost at every restart (one INFO line).
+
+---
 ## HVAC modes, fan and preset
 
 An HVAC device runs every 12 minutes (15 in table mode) and acts on the climate's current mode. It never turns an HVAC unit on from `off` (except in table mode when vacation ends, as for heaters). In a mode other than `heat`, `cool`, `fan_only` or `off` it logs a WARNING and does nothing. Without an indoor temperature it logs an INFO message and does nothing.
@@ -349,7 +492,7 @@ An HVAC device runs every 12 minutes (15 in table mode) and acts on the climate'
 - Switch to `heat` when the room is at or below `target_indoor_temp - 5` or at or below `vacation_temp + 2`.
 - Switch to `cool` when the room is above `max_vacation_temp` (default 30 C / 86 F).
 
-**Fan mode `Silence`**: used only if the climate lists `Silence` in its `fan_modes`. In a `silence` period the fan mode is set to `Silence`; the previous fan mode is stored (in the JSON file when `json_path` is set) and set back when the period ends. If no previous fan mode is known, `Auto` is used. The fan mode is checked in every run, whatever the HVAC mode.
+**Fan mode `Silence`**: used only if the climate lists `Silence` in its `fan_modes`. In a `silence` period the fan mode is set to `Silence`; the previous fan mode is stored (in the JSON file when `json_path` is set) and set back when the period ends. If no previous fan mode is known, `Auto` is used. The fan mode is checked in every run, whatever the HVAC mode. A daily timer runs at every `start` and `stop` time of the `silence` periods, so the fan mode changes on time and not at the next run (the same check still runs every run and 5 seconds after a mode change, because a mode and a fan mode sent together can lose one of them). Times in `silence` must be quoted strings such as `'21:00:00'`.
 
 ---
 ## Screens and covers
@@ -491,7 +634,7 @@ In a one-device app these go at the top level. In the deprecated list style they
 | `vacation_keep_off` | bool | no | `false` | Table mode: turn the heater off on vacation. |
 | `options` | list | no | empty | `[vacation_keep_off]` is the same as `vacation_keep_off: true` (ElectricalManagement style). |
 | `window_sensor_temp` | entity | no | none | Temperature sensor in a window (sun). `window_temp` works as an alias. |
-| `window_offset` | number | no | -3 | The window sensor lowers the setpoint when it is above `target_indoor_temp + window_offset`. |
+| `window_offset` | number | no | -3 | The window sensor lowers the setpoint when it is above `target_indoor_temp + window_offset`. With `controller: shadow` / `adaptive` only the starting value of the learned window level (default -3 C / -5.4 F when not set). |
 | `windowsensors` | list | no | empty | Window / door `binary_sensor`s. `on` for 2 minutes counts as open. |
 | `rain_level` | number | no | 3 | Rain at or above this raises the heating. Inherit. |
 | `anemometer_speed` | number | no | 40 | Wind at or above this raises the heating and starts `boost`; screens open above it and do not close at or above it. Inherit. |
@@ -505,6 +648,15 @@ In a one-device app these go at the top level. In the deprecated list style they
 | `getting_cold` | number | no | 18 C / 65 F | "Window open" notification when outdoor and indoor are below this; "Window closed" needs outdoor above it. Inherit. |
 | `getting_hot_offset` | number | no | 10 | "Window closed" notification when the room is this much above the target. Inherit. |
 | `notify_receiver` | list | no | app-level value | Receivers of this device's notifications. Alias `recipient`. Inherit. |
+| `controller` | string | no | `classic` | `classic`, `shadow` or `adaptive`, see [Adaptive controller](#adaptive-controller-optional). |
+| `diagnostic_sensor` | entity | no | none | Shadow / adaptive: sensor the app writes with the controller's terms once per run. |
+| `window_offset_table` | list | no | none | Shadow / adaptive: starting values of the learned window level, see [Keys](#keys). |
+| `internal_offset_table` | list | no | none | Shadow / adaptive: starting values of the climate's sensor minus the room. |
+| `target_table` | list | no | none | Shadow / adaptive: indoor target by the 24-hour mean outdoor temperature. |
+| `outdoor_gain` | number | no | not set | Shadow / adaptive: fixed outdoor feed-forward, 0 to 0.6. |
+| `solar_gain` | number | no | 1.0 | Shadow / adaptive: factor on the sun term, 0 to 5. |
+| `solar_max` | number | no | 3 C / 5.4 F | Shadow / adaptive: largest sun term. |
+| `comfort_guard` | number | no | 1.5 C / 2.7 F | Shadow / adaptive: power-state offset dropped when the room is this far off target. |
 
 ### Screening keys
 
@@ -674,6 +826,7 @@ The configuration is checked with pydantic models (`AppConfig` and `DeviceConfig
 - Table entries: only `out` is checked; `offset`, `normal`, `save` and `vacation` are used as written.
 - `automate` must be an entity id; `true` / `false` are accepted but ignored.
 - A `target_mode` other than `indoor` or `table` is ignored, and the mode is chosen from the keys.
+- The [adaptive controller keys](#keys) are checked strictly: `controller` must be `classic`, `shadow` or `adaptive`; `outdoor_gain` 0 to 0.6, `solar_gain` 0 to 5, `solar_max` and `comfort_guard` above 0; `diagnostic_sensor` must look like an entity id; table entries may only have their documented keys, offsets between -30 and 30, no `out` twice, and `target_table` entries exactly one of `target` / `offset`.
 
 ---
 ## Notifications
@@ -716,6 +869,19 @@ Messages in the AppDaemon log, and what they mean:
 | INFO | `<input> is not a valid number. Using <value>.` | `target_indoor_input` has no number at startup; `target_indoor_temp` is used until it has. |
 | INFO | `Learned data for <climate> copied from <file>.` | First start of a one-device app: learned data was taken from the old app's JSON file. |
 | DEBUG | `<climate>: waiting for the outdoor temperature from the Weather app.` | Table mode has no outdoor temperature yet. |
+| WARNING | `<climate>: no fresh room sensor: using the climate's own sensor minus the learned offset (<x>). Integral frozen, no mode changes, no learning.` | Adaptive / shadow: the room sensor (and backup) is unavailable or silent for an hour. The room is estimated until it is back. Check the sensor's battery or connection. |
+| WARNING | `<climate>: no fresh room sensor and no usable internal-sensor offset: open loop (feed-forward only). internal_offset_table gives an estimate.` | Adaptive / shadow: no room sensor and nothing learned yet about the climate's own sensor. Fix the sensor, or add `internal_offset_table`. |
+| INFO | `<climate>: room sensor back (primary).` | The estimate or open loop has ended. |
+| INFO | `<climate>: comfort guard: room <x>, target <y>, '<state>' offset dropped until the state changes.` | Adaptive: the room got `comfort_guard` too cold (save / reduce) or too warm (spend). Raise `comfort_guard` if this happens too often. |
+| INFO | `<climate>: setpoint changed by hand to <x>: followed.` | Adaptive: someone (or another app) changed the setpoint; the controller continues from it. |
+| INFO | `<climate>: adaptive state from another version or unit is ignored (learned models start empty).` | The `"adaptive"` entry in the JSON was saved in another unit or format. Learning starts again. |
+| INFO | `<climate>: <keys> only work with controller 'shadow' or 'adaptive'. Ignored with the classic controller.` | Remove the keys, or set `controller`. |
+| INFO | `<climate>: controller '<c>' is for indoor mode on HVAC ... the classic controller is used.` | An HVAC in table mode keeps the classic controller. |
+| INFO | `<climate>: controller '<c>' without json_path: ...` | Set `json_path` to keep what the controller learns over restarts. |
+| WARNING | `<climate>: window_offset_table needs window_sensor_temp. The table is not used.` | Add `window_sensor_temp`, or remove the table. |
+| WARNING | `<climate>: internal_offset_table is set, but the climate reports no current_temperature (yet). ...` | The climate has no own temperature (or it was not there at startup). The table only works when it reports one. |
+| any | `<climate>: [shadow] ...` | The same messages from a device in `shadow`: nothing was changed. |
+| DEBUG | `<climate>: shadow heat src primary R ... sp_ctrl ... send ... hold ... classic ...` | One line per run in `shadow` / `adaptive` with `log_level: DEBUG`, see [Start with shadow](#start-with-shadow). |
 
 **Nothing happens, and nothing is logged:**
 - The `automate` entity is `off`.
@@ -738,7 +904,8 @@ These are intended. Please do not report them as bugs.
 - With two own lux sensors the highest fresh value is used. In the Weather app the lowest temperature and the highest lux are used.
 - `input_boolean.vacation` is the default vacation switch only if it exists (a convention shared with ElectricalManagement and ModeManagement).
 - Fixed values in the rules (steps of 0.3 / 0.5 / 1, the fallback 10, `getting_hot_offset` 10, 400 lux) are not converted for Fahrenheit; only the defaults in the tables above are.
-- In table mode without an indoor sensor, the climate's own `current_temperature` is compared with `target_indoor_temp`. For a floor heater this can be the floor temperature: set `indoor_sensor_temp`, or a `target_indoor_temp` that suits that sensor.
+- In table mode without an indoor sensor, the climate's own `current_temperature` is compared with `target_indoor_temp`. For a floor heater this can be the floor temperature: set `indoor_sensor_temp`, or a `target_indoor_temp` that suits that sensor. (`controller: adaptive` leaves that comparison out, see [Adaptive controller](#adaptive-controller-optional).)
+- The rules above (the asymmetry, the extra -1, the learned setpoints) belong to the classic controller. The adaptive controller's own deliberate choices are listed in [What differs from classic](#what-differs-from-classic).
 
 ---
 ## 📌 License  

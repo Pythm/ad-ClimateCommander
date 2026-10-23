@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 import zlib
 from typing import Any, Dict, List, Union
 
@@ -31,10 +33,21 @@ TABLE_INTERVAL = 900    # seconds between runs, table mode (as the ElectricalMan
 
 UNIT_DEFAULTS = {
     'C': {'max_vacation_temp': 30, 'vacation_temp': 16, 'screening_temp': 8,
-          'getting_cold': 18, 'target_indoor_temp': 22.7},
+          'getting_cold': 18, 'target_indoor_temp': 22.7,
+          'unit': 'C', 'comfort_guard': 1.5, 'solar_max': 3.0},
     'F': {'max_vacation_temp': 86, 'vacation_temp': 61, 'screening_temp': 47,
-          'getting_cold': 65, 'target_indoor_temp': 72.8},
+          'getting_cold': 65, 'target_indoor_temp': 72.8,
+          'unit': 'F', 'comfort_guard': 2.7, 'solar_max': 5.4},
 }
+
+CONTROLLERS = ('classic', 'shadow', 'adaptive')
+# Keys that only the shadow / adaptive controller reads (classic ignores them with one INFO line)
+ADAPTIVE_KEYS = (
+    'window_offset_table', 'internal_offset_table', 'target_table', 'outdoor_gain', 'solar_gain',
+    'solar_max', 'comfort_guard', 'diagnostic_sensor',
+)
+OFFSET_LIMIT = 30   # an offset table value further from 0 than this is a typo (no sign or unit assumption)
+ENTITY_ID = re.compile(r'^[a-z0-9_]+\.[a-z0-9_]+$')
 
 
 def _as_list(value: Any) -> Any:
@@ -56,6 +69,50 @@ class TemperatureEntry(BaseModel):
     model_config = ConfigDict(extra='allow')
 
     out: float
+
+
+class OffsetEntry(BaseModel):
+    """ One row of window_offset_table / internal_offset_table (controller shadow / adaptive): the offset
+        (window or climate sensor minus the room) from `out` and up, optional extra when windy / raining.
+        Unknown keys are an error here, so a typo is reported. """
+    model_config = ConfigDict(extra='forbid')
+
+    out: float
+    offset: float
+    wind: float | None = None
+    rain: float | None = None
+
+    @field_validator('out', 'offset', 'wind', 'rain')
+    @classmethod
+    def _finite(cls, value: Any) -> Any:
+        if value is not None and (not math.isfinite(value) or abs(value) > OFFSET_LIMIT):
+            raise ValueError(f"must be a number between -{OFFSET_LIMIT} and {OFFSET_LIMIT}")
+        return value
+
+
+class TargetEntry(BaseModel):
+    """ One row of target_table: from `out` (24 h mean outdoor temperature) and up, either an absolute
+        `target` or an `offset` added to target_indoor_temp / target_indoor_input. """
+    model_config = ConfigDict(extra='forbid')
+
+    out: float
+    target: float | None = None
+    offset: float | None = None
+
+    @model_validator(mode='after')
+    def _one_of(self) -> 'TargetEntry':
+        if (self.target is None) == (self.offset is None):
+            raise ValueError("give exactly one of 'target' or 'offset'")
+        return self
+
+
+def _sorted_by_out(entries: list) -> list:
+    """ Sorted by `out`; the same `out` twice is an error (which row applies would be a guess). """
+    entries = sorted(entries, key=lambda e: e.out)
+    for a, b in zip(entries, entries[1:]):
+        if a.out == b.out:
+            raise ValueError(f"two entries with out {a.out}")
+    return entries
 
 
 class DayPeriod(BaseModel):
@@ -176,6 +233,17 @@ class DeviceConfig(_Model):
     getting_hot_offset: float = 10
     notify_receiver: Any = Field(default=None, validation_alias=AliasChoices('notify_receiver', 'recipient'))
 
+    # Indoor controller (cc_control.py). Everything below is read only by `shadow` and `adaptive`.
+    controller: str = 'classic'
+    window_offset_table: List[OffsetEntry] = Field(default_factory=list)
+    internal_offset_table: List[OffsetEntry] = Field(default_factory=list)
+    target_table: List[TargetEntry] = Field(default_factory=list)
+    outdoor_gain: float | None = Field(default=None, ge=0, le=0.6)   # None: only the learned internal offset
+    solar_gain: float = Field(default=1.0, ge=0, le=5)
+    solar_max: float | None = Field(default=None, gt=0)              # None: UNIT_DEFAULTS
+    comfort_guard: float | None = Field(default=None, gt=0)          # None: UNIT_DEFAULTS
+    diagnostic_sensor: str | None = None
+
     @model_validator(mode='before')
     @classmethod
     def _heater_alias(cls, data: Any) -> Any:
@@ -194,6 +262,31 @@ class DeviceConfig(_Model):
     @classmethod
     def _lists(cls, value: Any) -> Any:
         return _as_list(value)
+
+    @field_validator('controller', mode='before')
+    @classmethod
+    def _controller(cls, value: Any) -> Any:
+        value = 'classic' if value is None else str(value).lower()
+        if value not in CONTROLLERS:
+            raise ValueError(f"use one of {', '.join(CONTROLLERS)}")
+        return value
+
+    @field_validator('window_offset_table', 'internal_offset_table', 'target_table', mode='before')
+    @classmethod
+    def _table_lists(cls, value: Any) -> Any:
+        return _as_list(value)
+
+    @field_validator('window_offset_table', 'internal_offset_table', 'target_table')
+    @classmethod
+    def _tables_sorted(cls, value: Any) -> Any:
+        return _sorted_by_out(value)
+
+    @field_validator('diagnostic_sensor')
+    @classmethod
+    def _entity_id(cls, value: Any) -> Any:
+        if value is not None and not ENTITY_ID.match(value):
+            raise ValueError("must be an entity id such as sensor.living_room_controller")
+        return value
 
     @property
     def kind(self) -> str:
@@ -264,6 +357,19 @@ class DeviceConfig(_Model):
             'vacation': self.vacation if 'vacation' in fields else vacation_state,
             'vacation_keep_off': self.vacation_keep_off or 'vacation_keep_off' in self.options,
             'notify_receiver': [self.notify_receiver] if isinstance(self.notify_receiver, str) else self.notify_receiver,
+            # Indoor controller (cc_control.py)
+            'controller': self.controller,
+            'unit': defaults.get('unit', 'C'),
+            'window_offset_prior': self.window_offset if 'window_offset' in fields else None,
+            'window_offset_table': dump(self.window_offset_table),
+            'internal_offset_table': dump(self.internal_offset_table),
+            'target_table': dump(self.target_table),
+            'outdoor_gain': self.outdoor_gain if self.outdoor_gain is not None else 0.0,
+            'solar_gain': self.solar_gain,
+            'solar_max': self.solar_max if self.solar_max is not None else defaults['solar_max'],
+            'comfort_guard': self.comfort_guard if self.comfort_guard is not None else defaults['comfort_guard'],
+            'diagnostic_sensor': self.diagnostic_sensor,
+            'adaptive_keys': [k for k in ADAPTIVE_KEYS if k in fields],
         }
 
 
