@@ -24,7 +24,7 @@ from pydantic import (
 # Keys a device may inherit from the app level in the old list style
 APP_LEVEL_KEYS = (
     'vacation_temp', 'max_vacation_temp', 'screening_temp', 'getting_cold', 'getting_hot_offset',
-    'rain_level', 'anemometer_speed', 'spend_temp_offset', 'notify_receiver',
+    'rain_level', 'anemometer_speed', 'spend_temp_offset', 'notify_receiver', 'cloud_cover',
 )
 INDOOR_INTERVAL = 720   # seconds between runs, indoor-target mode (unchanged from earlier versions)
 TABLE_INTERVAL = 900    # seconds between runs, table mode (as the ElectricalManagement heaters)
@@ -171,6 +171,7 @@ class DeviceConfig(_Model):
 
     screening: List[ScreenConfig] = Field(default_factory=list)
     screening_temp: float | None = None
+    cloud_cover: float = 90   # screens close only while the cloud cover (%) is below this
     getting_cold: float | None = None
     getting_hot_offset: float = 10
     notify_receiver: Any = Field(default=None, validation_alias=AliasChoices('notify_receiver', 'recipient'))
@@ -256,12 +257,13 @@ class DeviceConfig(_Model):
             'automate': self.automate if isinstance(self.automate, str) else None,
             'windowsensors': list(self.windowsensors),
             'screening': dump(self.screening),
+            'cloud_cover': self.cloud_cover,
             'screening_temp': self.screening_temp if self.screening_temp is not None else defaults['screening_temp'],
             'getting_cold': self.getting_cold if self.getting_cold is not None else defaults['getting_cold'],
             'getting_hot_offset': self.getting_hot_offset,
             'vacation': self.vacation if 'vacation' in fields else vacation_state,
             'vacation_keep_off': self.vacation_keep_off or 'vacation_keep_off' in self.options,
-            'notify_receiver': self.notify_receiver,
+            'notify_receiver': [self.notify_receiver] if isinstance(self.notify_receiver, str) else self.notify_receiver,
         }
 
 

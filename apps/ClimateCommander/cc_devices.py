@@ -109,7 +109,8 @@ class Heater:
         except (ValueError, TypeError):
             self.vacation_temp = 10
             self.ADapi.log(f"{self.heater}: error setting vacation temperature. Set to 10 degrees.", level = 'INFO')
-        if self.vacation_temp is None and self.target_mode == 'indoor':
+        if self.vacation_temp is None and (self.target_mode == 'indoor' or self.hvac):
+            # A heater table may leave it out (the table has its own floor); the HVAC code adds to it
             self.vacation_temp = 10
         self.vacation_keep_off:bool = cfg['vacation_keep_off']
         self.off_retry_count:int = 3
@@ -135,6 +136,7 @@ class Heater:
         self._power_state:str = 'normal'
         self._power_until = None
         self._power_source = None
+        self._entity_problem = None        # 'missing' / 'unavailable' while the climate entity has a problem (logged once)
         self._applied_offset:float = 0.0   # offset that is in the climate's setpoint right now (indoor mode)
         self._base_setpoint = None         # setpoint without the offset while a power state is active
         self._last_commanded = None        # last temperature this device sent
@@ -184,6 +186,7 @@ class Heater:
                 lux_open = s.get('lux_open', 15000),
                 lux_open_when_media_is_on = s.get('lux_open_media', 4000),
                 anemometer_speed_limit = self.anemometer_speed,
+                cloud_cover_limit = cfg['cloud_cover'],
                 not_when_home = s.get('not_when_home', []),
                 mediaplayers = s.get('mediaplayers', []),
                 namespace = self.namespace
@@ -434,9 +437,24 @@ class Heater:
     # Main cycle
     # ------------------------------------------------------------------ #
 
+    def _note_entity_state(self) -> None:
+        """ Logs once per problem (not every run) when the climate entity is missing or unavailable, and once when it is back. """
+        state = self.ADapi.get_state(self.heater, namespace = self.namespace)
+        problem = 'missing' if state is None else ('unavailable' if state in UNAVAIL else None)
+        if problem == self._entity_problem:
+            return
+        previous, self._entity_problem = self._entity_problem, problem
+        if problem == 'missing':
+            self.ADapi.log(f"{self.heater}: the entity does not exist in namespace '{self.namespace}'. Nothing is controlled until it exists. Check 'climate'.", level = 'WARNING')
+        elif problem == 'unavailable':
+            self.ADapi.log(f"{self.heater}: the entity is {state}. Waiting for it to come back.", level = 'INFO')
+        elif previous is not None:
+            self.ADapi.log(f"{self.heater}: the entity is back ({state}).", level = 'INFO')
+
     def _set_indoortemp(self, **kwargs) -> None:
         if self._automation_off():
             return
+        self._note_entity_state()
         if self.target_mode == 'table':
             self._table_cycle()
             return
@@ -786,7 +804,7 @@ class Heater:
             if current_target_temp > target_temp['save']:
                 current_target_temp = target_temp['save']
         else:
-            current_target_temp = 10
+            current_target_temp = self.min_temp   # nothing configured: the climate's own minimum
         return current_target_temp
 
     def getVacationTemp(self, current_target_temp:float, target_temp:dict) -> float:
@@ -798,7 +816,7 @@ class Heater:
             if current_target_temp > target_temp['vacation']:
                 current_target_temp = target_temp['vacation']
         else:
-            current_target_temp = 10
+            current_target_temp = self.min_temp   # nothing configured: the climate's own minimum
         return current_target_temp
 
     def _table_in_temp(self):
@@ -845,7 +863,9 @@ class Heater:
                 adjust = float(window_temp - (self.target_indoor_temp + self.window_offset))
 
         if in_temp is not None and in_temp > self.target_indoor_temp:
-            adjust = min(adjust + float(in_temp - self.target_indoor_temp), 3)
+            adjust += float(in_temp - self.target_indoor_temp)
+        # The window and indoor corrections together never lower the setpoint by more than 3 degrees
+        adjust = min(adjust, 3)
         new_temperature -= adjust
 
         if vacation:
@@ -986,6 +1006,7 @@ class Aircondition(Heater):
     def _set_indoortemp(self, **kwargs) -> None:
         if self._automation_off():
             return
+        self._note_entity_state()
             # Set variables from indoor sensor and heater
         in_temp = self.get_in_temp()
         if in_temp is None:
@@ -1147,6 +1168,7 @@ class Aircondition(Heater):
                 and not self.vacation_state
             ):
                 set_cool = False
+                # No cooling when it is cold outside (outdoor below target - 4): airing out (opening a window) is better. Deliberate.
                 if (
                     in_temp > self.target_indoor_temp + 2
                     and self.weather.out_temp > self.target_indoor_temp - 4
@@ -1200,6 +1222,7 @@ class Screen:
         lux_open:int,
         lux_open_when_media_is_on:int,
         anemometer_speed_limit:int,
+        cloud_cover_limit:float,
         not_when_home:list,
         mediaplayers:list,
         namespace:str
@@ -1219,6 +1242,7 @@ class Screen:
         self.lux_open_normal:int = lux_open
         self.lux_open_when_media_is_on:int = lux_open_when_media_is_on
         self.anemometer_speed_limit:int = anemometer_speed_limit
+        self.cloud_cover_limit:float = cloud_cover_limit   # close only below this cloud cover (%)
         self.can_close_on_lux:bool = False   # armed by a close attempt below lux_close, see weather_updated
 
         self.screen_position = self.ADapi.get_state(self.screen, attribute='current_position', namespace = self.namespace)
@@ -1248,7 +1272,7 @@ class Screen:
 
             if (
                 self.weather.lux >= self.lux_close
-                and self.weather.cloud_cover < 90
+                and self.weather.cloud_cover < self.cloud_cover_limit
             ):
                 position = self.ADapi.get_state(self.screen, attribute='current_position', namespace = self.namespace)
                 if position == self.screen_position and position == 100:
@@ -1274,7 +1298,7 @@ class Screen:
             if (
                 lux is not None
                 and lux >= self.lux_close
-                and cloud_cover < 90
+                and cloud_cover < self.cloud_cover_limit
             ):
                 self.try_screen_close()
 
