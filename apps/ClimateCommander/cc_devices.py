@@ -340,8 +340,8 @@ class Heater:
             backup = to_float(self.ADapi.get_state(self.backup_indoor_sensor_temp, namespace = self.namespace))
             if backup is not None:
                 self.ADapi.log(f"{self.heater}: using backup indoor temp {backup}", level = 'DEBUG')
-            return backup
-        return in_temp   # stale value is better than nothing when there is no backup sensor
+                return backup
+        return in_temp   # a stale value is better than nothing when there is no usable backup sensor
 
     def get_heater_temp(self):
         """ Returns set heater temperature for the climate entity. """
@@ -766,7 +766,7 @@ class Heater:
         offset:float = kwargs.get('offset', 0.0)
         temp, valid_temp_data = self._getHeatingTempFromPersisten()
         temp += offset
-        self._send_temperature(temp)
+        self._send_temperature(round_half(temp))   # the same 0.5 grid as every other command
 
     # ------------------------------------------------------------------ #
     # Table mode (heater logic from ElectricalManagement)
@@ -830,16 +830,20 @@ class Heater:
             (stops the heater drawing power fastest). Only sent when the setpoint is above the save temperature. """
         if self.ADapi.get_state(self.heater, namespace = self.namespace) not in ('heat', 'cool'):
             return
+        save_temp, new_temp = self._reduce_temperatures()
+        heater_temp = self.get_heater_temp()
+        if heater_temp is None:
+            self._send_temperature(self.min_temp)
+        elif heater_temp > save_temp:
+            self._send_temperature(new_temp)
+
+    def _reduce_temperatures(self) -> tuple[float, float]:
+        """ Returns (save temperature, the lowest of the save and the vacation temperature). """
         target_temp = self.current_target_temp_entry()
         new_temperature = self._table_base(target_temp)
         save_temp = self.getSaveTemp(current_target_temp = new_temperature, target_temp = target_temp)
         vacation_temp = self.getVacationTemp(current_target_temp = new_temperature, target_temp = target_temp)
-        new_temp = min(save_temp, vacation_temp)
-        heater_temp = self.get_heater_temp()
-        if heater_temp is None:
-            self._send_temperature(10)
-        elif heater_temp > save_temp:
-            self._send_temperature(new_temp)
+        return save_temp, min(save_temp, vacation_temp)
 
     def _table_setpoint(self, in_temp, vacation:bool) -> float:
         """ Setpoint from the table, weather, window/indoor sensors, power state and daytime savings. """
@@ -857,7 +861,7 @@ class Heater:
         if self.window_temp is not None:
             window_temp = to_float(self.ADapi.get_state(self.window_temp, namespace = self.namespace))
             if window_temp is None:
-                window_temp = self.target_heater_temp + self.window_offset
+                window_temp = self.target_indoor_temp + self.window_offset   # at the threshold: no correction
                 self.ADapi.log(f"{self.window_temp} has no temperature. Probably offline", level = 'DEBUG')
             if window_temp > self.target_indoor_temp + self.window_offset:
                 adjust = float(window_temp - (self.target_indoor_temp + self.window_offset))
@@ -959,6 +963,9 @@ class Aircondition(Heater):
 
     def _heat_setpoint(self, heater_temp:float, in_temp:float, real_in_temp:float) -> float:
         if self.target_mode == 'table':
+            if self.power_state == 'reduce':
+                # As a table heater: the lowest of the save and the vacation temperature
+                return self._reduce_temperatures()[1]
             return self._table_setpoint(real_in_temp, vacation = False)
         return self._indoor_setpoint(heater_temp = heater_temp, in_temp = in_temp, mode = 'heat')
 

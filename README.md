@@ -37,6 +37,14 @@ One app controls one climate entity: a heater (floor heating, panel heater) or a
 - **One app per climate entity** is the recommended setup: top-level `climate:` and `type: heater` or `type: hvac`, see [One app per device](#one-app-per-device). The old style with `HVAC:` / `Heaters:` lists in one app still works but logs a deprecation WARNING.
 - **Heaters with an outdoor-temperature table** (`temperatures`, `target_heater_temp`, `save_temp`, ...). This is the heater logic from [ElectricalManagement](https://github.com/Pythm/ad-ElectricalManagement). See [How the setpoint is found](#how-the-setpoint-is-found).
   - Table mode: with no save or vacation temperature configured, the climate's own `min_temp` is used (before: a fixed 10). The window and indoor corrections together lower the setpoint by at most 3 degrees.
+- **Bug fixes in the same release** (they apply to every setup):
+  - The JSON file is written through a temporary file and replaced, so a crash during the write can no longer destroy the learned data.
+  - HVAC in table mode now follows `reduce` from ElectricalManagement (the lowest of the save and vacation temperature), as table heaters do. Before, `reduce` was ignored.
+  - Table mode: an offline `window_sensor_temp` no longer lowers the setpoint (it counts as exactly at the threshold). Before, it was compared against the heater target instead of the indoor target.
+  - A stale indoor sensor with an unavailable backup sensor now uses the stale value (as documented). Before, no value was used and the run was skipped.
+  - The setpoint set when an HVAC returns from `fan_only` to heat is rounded to 0.5 like every other command (before, a value such as 21.3 was sent and sent again).
+  - A missing or unavailable climate entity is logged once (WARNING for missing, INFO for unavailable), not silently.
+  - An HVAC in table mode without `vacation_temp` no longer fails on vacation (falls back to 10).
 - **Save / spend / reduce from ElectricalManagement** (optional, ElectricalManagement 1.0.6 or later), see [ElectricalManagement](#electricalmanagement).
 - **The app now has two more files**, `cc_devices.py` and `cc_config.py`, next to `climateCommander.py` and `weather_data.py`. Copy the whole app folder when you update (HACS does).
 - **The configuration is validated with pydantic** (`cc_config.py`). A value of the wrong type (for example `window_offset: abc`, or a table entry without `out`) now logs an ERROR naming the key: an invalid device is skipped, an invalid app-level key stops that app. Before, such a value was silently used or crashed later (`vacation_temp: abc` used to fall back to 10). A single entity where a list is expected (for example `windowsensors: binary_sensor.x`) is accepted as a one-item list. See [Validation](#validation).
@@ -697,8 +705,10 @@ Messages in the AppDaemon log, and what they mean:
 | WARNING | `Notify app '<name>' not found. No notifications.` | Check `notify_app` against the name of your notification app. |
 | WARNING | `<climate>: window sensor <entity> has no last_changed. Does it exist?` | The window sensor id is wrong or the entity is missing. |
 | WARNING | `<climate>: screening entry without 'screen' is skipped: {...}` | Add `screen:` to the entry. |
+| WARNING | `<climate>: the entity does not exist in namespace '<ns>'. Nothing is controlled until it exists. Check 'climate'.` | The `climate` id is wrong or the integration is gone. Logged once, not every run. |
+| INFO | `<climate>: the entity is unavailable. Waiting for it to come back.` / `... is back (<state>).` | Logged once per outage. |
 | WARNING | `Could not read <path>: <error>. Starting with empty data.` | The JSON file is damaged or unreadable. Learning starts again. |
-| WARNING | `Could not write <path>: <error>` | The `json_path` folder does not exist, is not writable, or the path does not end with `/`. |
+| WARNING | `Could not write <path>: <error>` | The `json_path` folder does not exist, is not writable, or the path does not end with `/`. The old file is left untouched. |
 | WARNING | `Unregistered AC state: <state>. <name>. Will not automate` | The HVAC unit is in a mode such as `auto`, `dry` or `heat_cool`. The app only handles `heat`, `cool` and `fan_only`. Logged in every run. |
 | WARNING | `<climate>: unknown power state '<state>' from <source>.` | ElectricalManagement sent a state other than `normal`, `save`, `spend` or `reduce`. Check the versions. |
 | INFO | `<climate>: indoor temp is None. Aborting setting new temperature` | HVAC without a usable indoor temperature. Check `indoor_sensor_temp` and the backup. |

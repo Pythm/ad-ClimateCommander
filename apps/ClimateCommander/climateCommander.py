@@ -59,9 +59,12 @@ class JsonStore:
         return entity in self.data
 
     def save(self) -> None:
+        tmp = self.path + '.tmp'
         try:
-            with open(self.path, 'w') as f:
+            # Write to a temporary file and replace: a crash while writing cannot leave a half-written JSON
+            with open(tmp, 'w') as f:
                 json.dump(self.data, f, indent = 4)
+            os.replace(tmp, self.path)
         except OSError as e:
             self.ADapi.log(f"Could not write {self.path}: {e}", level = 'WARNING')
 
