@@ -97,7 +97,7 @@ When to suggest what:
 - Vacation: which `input_boolean`, the vacation temperature, and whether the heater may be turned off (`vacation_keep_off`).
 - Whether a window sensor exists at all and where it sits (see above). Whether the room needs different targets in different seasons (then an outdoor-temperature table, never invented values).
 - Who should get the window notifications, if anyone, and how they are sent. Two ways: (1) the user's own notification app, normally `notify_mobiles` from [Pythm_AppdaemonApps](https://github.com/Pythm/Pythm_AppdaemonApps): set `notify_app: notify_mobiles` (check the app's real name in the user's `apps.yaml`) and `notify_receiver` is a list of the **person labels** from that app's `recipients` (for example `[Me]`); a label that does not exist there gets nothing, no `notify_receiver` means nobody, and a recipient with a `tracker` only gets it while home. (2) Without `notify_app`: Home Assistant `notify/<receiver>` services, and `notify_receiver` is a list of service names such as `mobile_app_phone`. Never mix the two kinds of names. Ask which one the user has.
-- Controlled by ElectricalManagement? Then also ask for the heater's **rated power in watts** for the `power:` key in ElectricalManagement. Never take it from the consumption sensor's history or a guess: ElectricalManagement no longer learns it.
+- Controlled by ElectricalManagement? Then the heater's **rated power in watts** goes in the `power:` key in ElectricalManagement. Find it from the device's own power sensor history first (`tools/ha_peak_power.py` from the [Pythm_AppdaemonApps](https://github.com/Pythm/Pythm_AppdaemonApps) repository (the same clone that holds `tools/ha_snapshot.py` and the `.local/ha_token` file from the [LLM guide](https://github.com/Pythm/Pythm_AppdaemonApps/blob/master/LLM_GUIDE.md); if the user has not cloned it yet, `git clone https://github.com/Pythm/Pythm_AppdaemonApps.git`, or download the single file from its `tools` folder): `python3 tools/ha_peak_power.py <sensor>`, read-only, uses the user's token; take the highest value rounded to 10 W when the plateau is clear, and tell the user which value you took). Ask the user only when there is no power sensor, no history, or the plateau is not clear. Never use EM's learned or stored `normal_power`.
 - Before `controller: shadow` / `adaptive`: where the window sensor sits (glass, frame, behind a curtain, in the air flow of a heat pump, above a radiator or floor heating). The controller learns its level either way, but say that a sensor in air flow or above a heater mostly sees the device, not the sun. Whether the climate entity reports `current_temperature` and in which unit `min_temp` / `max_temp` are (adaptive uses them as limits).
 - The id for `diagnostic_sensor`, if they want one (see "Controller").
 - Offset or target table values: only from the user, never invented, never "typical" numbers.
@@ -125,7 +125,7 @@ In ElectricalManagement's YAML, not here:
 ```yaml
   climate_commander:
     - app: heater_bathroom      # this app's name
-      power: 2000               # rated watts, ask the user
+      power: 2000               # rated watts, from the sensor history or the user
       consumptionSensor: sensor.x_power
       kWhconsumptionSensor: sensor.x_energy
       pricedrop: 0.2
