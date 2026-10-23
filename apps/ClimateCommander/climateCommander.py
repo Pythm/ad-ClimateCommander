@@ -92,11 +92,11 @@ class Climate(ad.ADBase):
 
             # Validated configuration (cc_config.py)
         try:
-            self.config_model = AppConfig.model_validate(dict(self.args))
+            self.cc_model = AppConfig.model_validate(dict(self.args))
         except ValidationError as e:
             self.ADapi.log(f"Invalid configuration for {self.name}, app not started: {format_errors(e)}", level = 'ERROR')
             return
-        cfg = self.config_model
+        cfg = self.cc_model
 
             # Namespaces for HASS and MQTT
         self.HASS_namespace = cfg.HASS_namespace
@@ -261,7 +261,7 @@ class Climate(ad.ADBase):
     # ------------------------------------------------------------------ #
 
     def _find_unit(self, raw_devices) -> str | None:
-        unit = self.config_model.unit_of_measurement
+        unit = self.cc_model.unit_of_measurement
         if unit is None and self.outside_temperature:
             unit = self._unit_of(self.outside_temperature, self.HASS_namespace)
         if unit is None:
