@@ -30,14 +30,15 @@ APP_LEVEL_KEYS = (
 )
 INDOOR_INTERVAL = 720   # seconds between runs, indoor-target mode (unchanged from earlier versions)
 TABLE_INTERVAL = 900    # seconds between runs, table mode (as the ElectricalManagement heaters)
+                        # (interval_minutes replaces both for one device)
 
 UNIT_DEFAULTS = {
     'C': {'max_vacation_temp': 30, 'vacation_temp': 16, 'screening_temp': 8,
           'getting_cold': 18, 'target_indoor_temp': 22.7,
-          'unit': 'C', 'comfort_guard': 1.5, 'solar_max': 3.0},
+          'unit': 'C', 'comfort_guard': 1.5, 'solar_max': 3.0, 'max_setpoint_drop': 3.0},
     'F': {'max_vacation_temp': 86, 'vacation_temp': 61, 'screening_temp': 47,
           'getting_cold': 65, 'target_indoor_temp': 72.8,
-          'unit': 'F', 'comfort_guard': 2.7, 'solar_max': 5.4},
+          'unit': 'F', 'comfort_guard': 2.7, 'solar_max': 5.4, 'max_setpoint_drop': 5.4},
 }
 
 CONTROLLERS = ('classic', 'shadow', 'adaptive')
@@ -216,7 +217,11 @@ class DeviceConfig(_Model):
     vacation_temp: float | None = None
     max_vacation_temp: float | None = None
     vacation_keep_off: bool = False
-    options: List[str] = Field(default_factory=list)
+    options: List[str] = Field(default_factory=list)   # flags: vacation_keep_off, has_fireplace (unknown names ignored)
+
+    interval_minutes: float | None = Field(default=None, ge=1, le=120)   # None: 12 min indoor, 15 min table
+    trend_hold_hours: float = Field(default=2.0, ge=0, le=12)   # classic: no setpoint move while the room reaches target within this
+    max_setpoint_drop: float | None = Field(default=None, gt=0, le=15)   # HVAC heat, indoor: lowest setpoint target - this. None: UNIT_DEFAULTS
 
     rain_level: float = 3
     anemometer_speed: float = 40
@@ -292,6 +297,11 @@ class DeviceConfig(_Model):
     def kind(self) -> str:
         return self.type if self.type in ('heater', 'hvac') else 'heater'
 
+    @property
+    def has_fireplace(self) -> bool:
+        """ HVAC: heat -> fan_only straight at target + 0.6, without lowering the setpoint first. """
+        return 'has_fireplace' in self.options
+
     def runtime(self, *, defaults: dict, hass_namespace: str, vacation_state: str | None) -> dict:
         """ The dict cc_devices.Heater / Aircondition read. `defaults` is UNIT_DEFAULTS[unit]. """
         fields = self.model_fields_set
@@ -317,7 +327,10 @@ class DeviceConfig(_Model):
         else:
             vacation_temp = self.vacation_temp if self.vacation_temp is not None else defaults['vacation_temp']
 
-        interval = TABLE_INTERVAL if target_mode == 'table' else INDOOR_INTERVAL
+        if self.interval_minutes is not None:
+            interval = int(round(self.interval_minutes * 60))
+        else:
+            interval = TABLE_INTERVAL if target_mode == 'table' else INDOOR_INTERVAL
 
         def dump(items) -> list:
             return [i.model_dump(exclude_unset=True) for i in items]
@@ -356,6 +369,9 @@ class DeviceConfig(_Model):
             'getting_hot_offset': self.getting_hot_offset,
             'vacation': self.vacation if 'vacation' in fields else vacation_state,
             'vacation_keep_off': self.vacation_keep_off or 'vacation_keep_off' in self.options,
+            'has_fireplace': self.has_fireplace,
+            'trend_hold_hours': self.trend_hold_hours,
+            'max_setpoint_drop': self.max_setpoint_drop if self.max_setpoint_drop is not None else defaults['max_setpoint_drop'],
             'notify_receiver': [self.notify_receiver] if isinstance(self.notify_receiver, str) else self.notify_receiver,
             # Indoor controller (cc_control.py)
             'controller': self.controller,

@@ -48,16 +48,22 @@ One app controls one climate entity: a heater (floor heating, panel heater) or a
   - An HVAC in table mode without `vacation_temp` no longer fails on vacation (falls back to 10).
 - **Save / spend / reduce from ElectricalManagement** (optional, ElectricalManagement 1.0.6 or later), see [ElectricalManagement](#electricalmanagement).
 - **The app now has three more files**, `cc_devices.py`, `cc_config.py` and `cc_control.py`, next to `climateCommander.py` and `weather_data.py`. Copy the whole app folder when you update (HACS does).
-- **New, optional: `controller: shadow` / `controller: adaptive`**, a different way to find the setpoint, per device. The default `classic` is the controller described in this README and is unchanged. See [Adaptive controller](#adaptive-controller-optional).
+- **New, optional: `controller: shadow` / `controller: adaptive`**, a different way to find the setpoint, per device. The default `classic` is the controller described in this README. See [Adaptive controller](#adaptive-controller-optional).
 - **The configuration is validated with pydantic** (`cc_config.py`). A value of the wrong type (for example `window_offset: abc`, or a table entry without `out`) now logs an ERROR naming the key: an invalid device is skipped, an invalid app-level key stops that app. Before, such a value was silently used or crashed later (`vacation_temp: abc` used to fall back to 10). A single entity where a list is expected (for example `windowsensors: binary_sensor.x`) is accepted as a one-item list. See [Validation](#validation).
 - **New key `cloud_cover`** (default `90`): screens close only while the cloud cover from the Weather app is below this percentage. Before, the limit was fixed at 90, so the default keeps the old behaviour. See [Screens and covers](#screens-and-covers).
 - Behaviour changes in the indoor-target mode (HVAC, and heaters without a table):
   - The learned setpoints are no longer updated on vacation, with open windows, during `daytime_savings` / `daytime_increasing` or while ElectricalManagement sends `save`, `spend` or `reduce`. Before, vacation temperatures were learned and pulled the setpoint down after a vacation.
   - A room that stays 0.3 degrees or more away from the target is now corrected when the setpoint has not changed for 30 minutes. Before, nothing happened while the temperature did not move.
   - `backup_indoor_sensor_temp` is used only when the indoor sensor is unavailable or has not **reported** for an hour (`last_reported`). Before, a steady temperature for an hour (no change) counted as a dead sensor.
+  - The "reaches the target within 6 runs" hold is replaced by a trend over the sensor's reports of the last hour: the setpoint is kept while the room moves towards the target and reaches it within `trend_hold_hours` (default 2). Before, the change since the last run (12 minutes, often 0 or one 0.1 step) was used.
+  - A learned setpoint is approached by at most 0.5 per run (or the normal adjustment, if larger). Before, the setpoint jumped to it (for example from 21.0 to 25.0 in one run).
+  - HVAC: nothing is learned within 2 hours of a mode change or while the unit reports an `hvac_action` other than `heating` / `idle`, so heat / `fan_only` cycling no longer teaches too high setpoints.
+  - HVAC: the setpoint in heat is never set below `target_indoor_temp - max_setpoint_drop` (default 3 C / 5.4 F). Back from `fan_only`, the setpoint starts from the last one held in heat, at most the learned setpoint minus 1 (before: always the learned setpoint minus 1). See [Heat pump cycling](#heat-pump-cycling).
+- **Upgrading, HVAC in heat (indoor mode):** without `has_fireplace` an HVAC now lowers its setpoint before it switches to `fan_only` (it switches at once only when the setpoint is at its lowest or the room still rises). A room with a fireplace, or another heat source that makes the room overshoot fast, sets `options: [has_fireplace]` to keep the old behaviour (`fan_only` at once at target + 0.6).
+- **New, optional keys** `interval_minutes` (time between runs, default 12 / 15 minutes), `trend_hold_hours` (default 2), `max_setpoint_drop` (HVAC, default 3 C / 5.4 F) and the option `has_fireplace`, see [Device keys](#device-keys).
 - Window notifications are sent once per event: "Window open" (getting cold) once after windows are opened, "Window closed" (getting hot, `getting_hot_offset` above target) once after they are closed. Before, "Window open" was sent once per app start and "Window closed" never. HVAC now uses the same rule as heaters: "Window open" also needs the outdoor temperature to be below `getting_cold`.
 - Outdoor values are kept per app, not shared between all ClimateCommander apps (they used to overwrite each other). At startup the last values sent by the Weather app are used.
-- The periodic runs of the devices (every 12 minutes, 15 minutes in table mode) are spread over the interval, so many devices do not call Home Assistant in the same second.
+- The periodic runs of the devices (every 12 minutes, 15 minutes in table mode, or `interval_minutes`) are spread over the interval, so many devices do not call Home Assistant in the same second.
 - `outside_temperature`, `rain_sensor` and `anemometer` (deprecated) are read in `HASS_namespace`.
 
 #### Upgrading from 1.3 to one app per device (optional)
@@ -222,6 +228,8 @@ There are two target modes. The mode is chosen from the keys you use; set `targe
 | `indoor` | no `temperatures`, `target_heater_temp` or `target_heater_input` | HVAC, heaters without a table | 12 minutes |
 | `table` | `temperatures`, `target_heater_temp` or `target_heater_input` is set | floor heating, panel heaters | 15 minutes |
 
+`interval_minutes` (1 to 120) sets another time between the runs for one device, in both modes.
+
 The first run is between 10 seconds and one interval after the app starts (spread per entity). Between the periodic runs a device also runs:
 - 1 second after a window sensor has been `on` for 2 minutes,
 - 60 seconds after all window sensors are `off`,
@@ -245,20 +253,22 @@ The target is `target_indoor_temp`, or the value of `target_indoor_input` (an `i
 
 **Window sensor temperature.** With `window_sensor_temp` (for example a sensor in a sunny window): when it is above `target_indoor_temp + window_offset`, the setpoint is lowered by the difference.
 
+**The room trend.** The app keeps the reports of the indoor sensor in use (value and report time, from `last_reported`) for 3 hours: every report that changes the value, and at every run the latest report, also while an HVAC is in `fan_only`. The trend is the least-squares slope of the reports of the last 60 minutes, in degrees per hour. With fewer than 3 reports, or reports spanning less than 20 minutes, the trend is unknown.
+
 **The step rules.** The adjustment is the target minus the room temperature, plus the window part above.
 - A small negative adjustment (between 0 and -0.3) becomes -0.5 when the setpoint has not changed for 30 minutes.
 - A small positive adjustment (between 0 and 0.4) is ignored for 30 minutes after the last setpoint change.
+- Trend hold: when the room moves towards the target and, at its trend, reaches it within `trend_hold_hours` (default 2), the setpoint is kept. Below the target this means the setpoint is not raised, above the target that it is not lowered.
+  - Example: target 23.0, room 22.5, reports from 22.1 fifty minutes ago up to 22.5 now. That is 0.48 per hour, so the target is reached in 0.5 / 0.48 = 1.04 hours: the setpoint is kept. At 0.1 per hour it would take 5 hours, so the setpoint is raised by the rules below. The same applies 0.5 above the target with the room falling 0.6 per hour (0.83 hours): the setpoint is not lowered.
+  - When the room moves towards the target more slowly than that (with an unknown trend: when it moved towards the target since the last run), or the trend moves away from the target, the learned setpoint does not count as valid in that run.
 - Room temperature falling since the last run:
-  - if the room is above the target and, at the current rate, reaches the target within 6 runs, the setpoint is kept;
   - if the setpoint is 4 or more below the target, the room is below the target and the setpoint has not changed for 4 hours, the new setpoint is the setpoint plus the adjustment minus 1;
-  - otherwise the adjustment is added, but only if the windows were closed more than 1 hour ago or the room is more than 1 below the target. The result is not set below a valid learned setpoint.
-- Room temperature rising since the last run:
-  - if the room is below the target and, at the current rate, reaches the target within 6 runs, the setpoint is kept;
-  - otherwise the adjustment is added. The result is not set above a valid learned setpoint.
+  - otherwise the adjustment is added, but only if the windows were closed more than 1 hour ago or the room is more than 1 below the target. The result is not set below a valid learned setpoint; when that learned setpoint is above the current setpoint, the setpoint moves up towards it by at most 0.5 per run (or by the adjustment, if that is larger). Example: setpoint 21.0, learned 25.3, room 0.2 below the target: 21.5, then 22.0 at the next run, and so on.
+- Room temperature rising since the last run: the adjustment is added. The result is not set above a valid learned setpoint; when that learned setpoint is below the current setpoint, the setpoint moves down towards it by at most 0.5 per run.
 - Room temperature unchanged: when the room is 0.3 or more away from the target and the setpoint has not changed for 30 minutes, the adjustment is added.
-- Limits: the setpoint stays within 4 of a valid learned setpoint. Without a valid learned setpoint it stays within 8 of the target.
+- Limits: the setpoint stays within 4 of a valid learned setpoint. Without a valid learned setpoint it stays within 8 of the target. HVAC in heat: never below `target_indoor_temp - max_setpoint_drop` (default 3 C / 5.4 F) or the climate's `min_temp`, see [Heat pump cycling](#heat-pump-cycling).
 
-**Learning (needs `json_path`).** When the setpoint has not changed for 2 hours (and at most once every 2 hours), the setpoint is stored as a running average for the current outdoor temperature (2-degree steps) and outdoor lux (5000-lux steps). A learned setpoint counts as valid when it exists for the current outdoor temperature and lux step and has at least 10 samples. After 100 samples the count is set back to 10, so recent samples weigh more. Learning happens only in normal operation: not with open windows, not on vacation, not during `daytime_savings` or `daytime_increasing`, not while ElectricalManagement sends `save`, `spend` or `reduce`, and not while an HVAC unit cools. Without `json_path` nothing is learned and the current setpoint is the reference.
+**Learning (needs `json_path`).** When the setpoint has not changed for 2 hours (and at most once every 2 hours), the setpoint is stored as a running average for the current outdoor temperature (2-degree steps) and outdoor lux (5000-lux steps). A learned setpoint counts as valid when it exists for the current outdoor temperature and lux step and has at least 10 samples. After 100 samples the count is set back to 10, so recent samples weigh more. Learning happens only in normal operation: not with open windows, not on vacation, not during `daytime_savings` or `daytime_increasing`, not while ElectricalManagement sends `save`, `spend` or `reduce`, and not while an HVAC unit cools. An HVAC also learns nothing within 2 hours of a mode change (heat, `fan_only`, cool, off; by the app or by hand), and nothing while the climate reports an `hvac_action` other than `heating` or `idle`. Without `json_path` nothing is learned and the current setpoint is the reference.
 
 **Open windows** (any `windowsensors` entity `on` for 2 minutes): the setpoint becomes `vacation_temp`. HVAC switches to `fan_only` instead, see [HVAC modes](#hvac-modes-fan-and-preset).
 
@@ -343,14 +353,14 @@ It works in indoor mode for heaters and HVAC, and in table mode for heaters. An 
 
 ### What it does
 
-Every run (12 minutes, 15 in table mode, and on window, vacation and power-state changes) the setpoint is calculated again from these parts:
+Every run (12 minutes, 15 in table mode, or `interval_minutes`, and on window, vacation and power-state changes) the setpoint is calculated again from these parts:
 - **The target**: `target_indoor_temp` or `target_indoor_input`, or `target_table` (below). On top, the same shifts as classic, now applied to the target: +0.5 during `daytime_increasing`, -0.5 during `daytime_savings`, otherwise +0.3 with wind or rain.
 - **A feed-forward from the climate's own sensor**: a heat pump regulates its own sensor (`current_temperature`), which often reads 2 to 5 degrees above the room. The controller learns that offset (see below) and, for HVAC, adds half of it, so the setpoint moves with it before the room drifts. Heaters do not use it. `outdoor_gain` adds a fixed extra per degree that the slow outdoor temperature is below the target.
 - **A slow integral term**, which finds the setpoint that holds the room. It only runs while the room is near the target, outside a small band (room more than 0.1 above or 0.25 below the target, as the classic asymmetry), and it is frozen while a window is open or closed less than an hour ago, on vacation, in a power state, without a room sensor and (HVAC) while the sun term is large.
 - **A proportional term** on the filtered room temperature.
 - **Minus a sun term**: how far the window sensor reads above its learned level without sun. It rises at once and fades over about two hours (walls and floor keep the heat), times `solar_gain`, at most `solar_max`.
 
-The result stays within the target ± 8, the climate's `min_temp` and `max_temp` attributes, and never below the vacation temperature. It is rounded to 0.5 and sent **at most once per 12 minutes, at most 0.5 per change**. Window, vacation and the start or end of a power state are sent at once. A setpoint changed by hand (or by another app) is followed: the controller continues from it.
+The result stays within the target ± 8 (an HVAC in heat at most `max_setpoint_drop` below the target, default 3 C / 5.4 F), the climate's `min_temp` and `max_temp` attributes, and never below the vacation temperature. It is rounded to 0.5 and sent **at most once per 12 minutes, at most 0.5 per change**. Window, vacation and the start or end of a power state are sent at once. A setpoint changed by hand (or by another app) is followed: the controller continues from it.
 
 **Start and restart.** At the first run after a start or a reload the controller takes over the climate's current setpoint, so nothing jumps. If the room is then far from the target (more than about 1.4 degrees for HVAC, 3.9 for heaters) it does not wait: the setpoint is walked towards the calculated value, one 0.5 step per 12 minutes. A setpoint changed by hand is followed in the same way as in classic. When the HVAC mode changes, the `Silence` fan mode (if a `silence` period is active) is set in a separate command a few seconds later, because a mode and a fan mode sent together can lose one of them.
 
@@ -444,10 +454,10 @@ climate_living_room:
 ### What differs from classic
 
 - No learned setpoints per outdoor temperature and lux: the `"data"` entries in the JSON are neither read nor written.
-- No 6-run hold, no steady-room correction, no extra -1 after 4 hours turned down (D2), no fixed ±4 around a learned value.
+- No trend hold (`trend_hold_hours` is classic only), no steady-room correction, no extra -1 after 4 hours turned down (D2), no fixed ±4 around a learned value.
 - The trend uses the real room reading and the real time between reports. The daytime and wind / rain shifts move the target, not the reading.
 - The window sensor counts relative to its learned level, not to `target + window_offset`, and it is not added up run after run.
-- HVAC modes: heat to `fan_only` when the room is 0.6 above the effective target (plus the spend offset during `spend`) and the setpoint is at its lowest or the room still rises; `fan_only` to heat at or below the effective target, not while the sun term is large, starting half a degree below the calculated setpoint. The 0.6 hysteresis now holds during daytime periods too. At least 30 minutes in a mode before an automatic switch (window and vacation switch at once). No heat to `fan_only` within 45 minutes of wind, in the hour after `daytime_increasing` or in the hour after a power state ended. Cooling uses the classic thresholds.
+- HVAC modes: heat to `fan_only` when the room is 0.6 above the effective target (plus the spend offset during `spend`) and the setpoint is at its lowest (`max_setpoint_drop` below the target) or the room still rises 0.2 C (0.36 F) per hour; with `options: [has_fireplace]` at 0.6 above alone. After the setpoint was lowered for such an overshoot instead, the first change with the room at or below the effective target may go up by more than 0.5 in one step, to the setpoint from before the lowering and at most target + 4 C (7.2 F). `fan_only` to heat at or below the effective target, not while the sun term is large, starting half a degree below the calculated setpoint. The 0.6 hysteresis now holds during daytime periods too. At least 30 minutes in a mode before an automatic switch (window and vacation switch at once). No heat to `fan_only` within 45 minutes of wind, in the hour after `daytime_increasing` or in the hour after a power state ended. Cooling uses the classic thresholds.
 - The comfort guard during power states.
 - The room estimate from the climate's own sensor when the room sensor is gone.
 - Indoor mode: the vacation temperature is also the lowest setpoint in normal operation, and the climate's `min_temp` / `max_temp` attributes are limits. In F, make sure the climate reports them in F.
@@ -466,7 +476,7 @@ climate_living_room:
 ---
 ## HVAC modes, fan and preset
 
-An HVAC device runs every 12 minutes (15 in table mode) and acts on the climate's current mode. It never turns an HVAC unit on from `off` (except in table mode when vacation ends, as for heaters). In a mode other than `heat`, `cool`, `fan_only` or `off` it logs a WARNING and does nothing. Without an indoor temperature it logs an INFO message and does nothing.
+An HVAC device runs every 12 minutes (15 in table mode, or `interval_minutes`) and acts on the climate's current mode. It never turns an HVAC unit on from `off` (except in table mode when vacation ends, as for heaters). In a mode other than `heat`, `cool`, `fan_only` or `off` it logs a WARNING and does nothing. Without an indoor temperature it logs an INFO message and does nothing.
 
 "Room" below is the indoor temperature after the daytime, rain and wind adjustments described above, except in `fan_only`, where the sensor value is used as it is.
 
@@ -475,7 +485,10 @@ An HVAC device runs every 12 minutes (15 in table mode) and acts on the climate'
 - Vacation: setpoint `vacation_temp`. When the room is above `target_indoor_temp - 3` and above `vacation_temp + 3`: switch to `fan_only`.
 - Otherwise the setpoint comes from the indoor rules (or the table), and:
   - wind at or above `anemometer_speed` in the last 25 minutes and the room more than 0.7 below the target: preset `boost`, if the climate offers it and the fan mode is not `Silence`. When that is no longer the case, a `boost` preset is set back to `none`;
-  - room more than 0.6 above the target, no wind in the last 45 minutes, and not in the hour after a `daytime_increasing` period: switch to `fan_only`.
+  - room more than 0.6 above the target, no wind in the last 45 minutes, and not in the hour after a `daytime_increasing` period:
+    - with `options: [has_fireplace]`, in table mode, or while ElectricalManagement sends `save`, `spend` or `reduce`: switch to `fan_only`;
+    - otherwise switch to `fan_only` only when the setpoint is already at its lowest (`target_indoor_temp - max_setpoint_drop`, at least the climate's `min_temp`) or the room still rises 0.2 C (0.36 F) per hour or more. Else the setpoint is lowered by the adjustment, at most 0.5 per run and not below the lowest, and the unit stays in heat;
+  - after such a lowering: once the room is at or below the target and does not reach it within `trend_hold_hours` by itself, the setpoint goes back in one move to the value from before the lowering, at most the learned setpoint and the target + 4.
 
 **In `cool`:**
 - Windows open: switch to `fan_only`.
@@ -486,13 +499,30 @@ An HVAC device runs every 12 minutes (15 in table mode) and acts on the climate'
 
 **In `fan_only`** (not on vacation, windows closed):
 - Switch to `cool` when the room is more than 2 above the target, the outdoor temperature is above `target_indoor_temp - 4`, and either it is between sunrise and 30 minutes before sunset without rain, or the room is more than 3 above the target.
-- Switch to `heat` when the room is at or below the target. 10 seconds later the setpoint is set to the learned setpoint minus 1 (without learned data: the current setpoint minus 1, or the target minus 1 if the setpoint is more than 6 away from the target).
+- Switch to `heat` when the room is at or below the target. 10 seconds later the setpoint is set to the last setpoint the app held in heat, but at most the learned setpoint minus 1 (without learned data: the current setpoint minus 1, or the target minus 1 if the setpoint is more than 6 away from the target). After an app start or reload, before anything was held, the learned setpoint minus 1 is used. In indoor mode never below the lowest heat setpoint (`target_indoor_temp - max_setpoint_drop`).
 
 **In `fan_only` on vacation** (windows closed):
 - Switch to `heat` when the room is at or below `target_indoor_temp - 5` or at or below `vacation_temp + 2`.
 - Switch to `cool` when the room is above `max_vacation_temp` (default 30 C / 86 F).
 
 **Fan mode `Silence`**: used only if the climate lists `Silence` in its `fan_modes`. In a `silence` period the fan mode is set to `Silence`; the previous fan mode is stored (in the JSON file when `json_path` is set) and set back when the period ends. If no previous fan mode is known, `Auto` is used. The fan mode is checked in every run, whatever the HVAC mode. A daily timer runs at every `start` and `stop` time of the `silence` periods, so the fan mode changes on time and not at the next run (the same check still runs every run and 5 seconds after a mode change, because a mode and a fan mode sent together can lose one of them). Times in `silence` must be quoted strings such as `'21:00:00'`.
+
+### Heat pump cycling
+
+A heat pump whose room sensor sits in the unit's air flow can cycle between `heat` and `fan_only` all night. Seen in a real bedroom (target 23, outdoor 3 to 5 C): the sensor rose about 1 degree in 25 minutes while the unit heated and fell 1 degree in 30 minutes in `fan_only`, so it swung between 22.5 and 23.9 with a mode switch about every 25 minutes. The evening before, at 6 to 9 C outside, setpoint 21.5 held the same room at 23.2 without a single switch. Three things kept the cycle going: each return from `fan_only` sent the learned setpoint minus 1 (24.5), the next run jumped to the learned 25.5, and the learned setpoints for 0 to 5 C outdoor had been pushed up to 24.5 to 25.5 by earlier cycles. The unit idles once its setpoint is at or below its own sensor reading (22 to 28 here, while the room is 23), so a much lower setpoint only makes the way back slow.
+
+What the classic controller does about it (indoor mode, HVAC in heat):
+- **Trend hold** over the reports of the last hour (see [the step rules](#indoor-mode-keep-a-fixed-indoor-temperature)), kept up in `fan_only` too, so the first run after `fan_only` already knows that the room was falling.
+- **A learned setpoint is a ceiling, not a jump target**: the setpoint moves towards it by at most 0.5 per run. Back from `fan_only`, the setpoint starts from the last one held in heat, at most the learned setpoint minus 1.
+- **No learning within 2 hours of a mode change**, so cycling does not push the learned setpoints up further.
+- **Lower before `fan_only`** (without `has_fireplace`): at target + 0.6 the unit switches to `fan_only` only when the setpoint is already at its lowest or the room is still rising; otherwise the setpoint is lowered by the normal adjustment, at most 0.5 per run, and the unit stays in heat. The lowest setpoint is `target_indoor_temp - max_setpoint_drop` (default 3 C / 5.4 F).
+- **Fast way back**: once the room is at or below the target again, a setpoint lowered this way goes back in one move instead of 0.5 per run. Example: target 23, `max_setpoint_drop` 3 (lowest 20), learned setpoint 25.5. The room is at 23.7 with setpoint 24.5 and no longer rising: instead of `fan_only` the setpoint is lowered in steps of at most 0.5 (24.0, 23.5, ...). Say it has reached 22.5 when the room is down at 22.9 and still falling: the next run sets it straight back to min(24.5 from before the lowering, learned 25.5, 23 + 4) = 24.5.
+
+**`options: [has_fireplace]`**: in a room with a fireplace (or another heat source that makes the room overshoot fast) waiting in heat is wrong. With this option the unit switches to `fan_only` at once at target + 0.6, as before 1.4.0. The other rules above still apply.
+
+**`interval_minutes`**: a room sensor in air flow reacts within minutes; a longer interval (for example 30) gives each setpoint change time to show before the next one.
+
+If a unit still cycles after these changes, look at its learned setpoints for the current outdoor temperature in `<json_path>/<app name>.json` (`"data"`, by outdoor temperature in 2-degree steps, then lux). Values far above the setpoint that holds the room on a calm day were learned while it cycled. Stop the app, remove those entries (or the whole `"data"` of that climate) and start it again; they are learned anew.
 
 ---
 ## Screens and covers
@@ -632,7 +662,10 @@ In a one-device app these go at the top level. In the deprecated list style they
 | `vacation_temp` | number | no | indoor mode 16 C / 61 F; table mode none | Vacation setpoint. In table mode the entry's `offset` is added. Inherit. |
 | `max_vacation_temp` | number | no | 30 C / 86 F | HVAC on vacation: cool above this. Inherit. |
 | `vacation_keep_off` | bool | no | `false` | Table mode: turn the heater off on vacation. |
-| `options` | list | no | empty | `[vacation_keep_off]` is the same as `vacation_keep_off: true` (ElectricalManagement style). |
+| `options` | list | no | empty | Flags. `vacation_keep_off` is the same as `vacation_keep_off: true` (ElectricalManagement style). `has_fireplace` (HVAC): heat to `fan_only` at once at target + 0.6, without lowering the setpoint first, see [Heat pump cycling](#heat-pump-cycling). Unknown names are ignored. |
+| `interval_minutes` | number | no | 12 indoor, 15 table | Minutes between the periodic runs, 1 to 120. |
+| `trend_hold_hours` | number | no | 2 | Indoor mode (classic): the setpoint is kept while the room reaches the target within this many hours at its trend, 0 to 12 (0: never kept). See [the step rules](#indoor-mode-keep-a-fixed-indoor-temperature). |
+| `max_setpoint_drop` | number | no | 3 C / 5.4 F | HVAC in heat, indoor mode: lowest setpoint is `target_indoor_temp` minus this (at least the climate's `min_temp`). Above 0, at most 15. Also used by `controller: adaptive`. |
 | `window_sensor_temp` | entity | no | none | Temperature sensor in a window (sun). `window_temp` works as an alias. |
 | `window_offset` | number | no | -3 | The window sensor lowers the setpoint when it is above `target_indoor_temp + window_offset`. With `controller: shadow` / `adaptive` only the starting value of the learned window level (default -3 C / -5.4 F when not set). |
 | `windowsensors` | list | no | empty | Window / door `binary_sensor`s. `on` for 2 minutes counts as open. |
@@ -826,6 +859,7 @@ The configuration is checked with pydantic models (`AppConfig` and `DeviceConfig
 - Table entries: only `out` is checked; `offset`, `normal`, `save` and `vacation` are used as written.
 - `automate` must be an entity id; `true` / `false` are accepted but ignored.
 - A `target_mode` other than `indoor` or `table` is ignored, and the mode is chosen from the keys.
+- `interval_minutes` must be 1 to 120, `trend_hold_hours` 0 to 12, `max_setpoint_drop` above 0 and at most 15. Flags go in `options` (`options: [has_fireplace]`); `has_fireplace: true` as its own key is an unknown key and is ignored.
 - The [adaptive controller keys](#keys) are checked strictly: `controller` must be `classic`, `shadow` or `adaptive`; `outdoor_gain` 0 to 0.6, `solar_gain` 0 to 5, `solar_max` and `comfort_guard` above 0; `diagnostic_sensor` must look like an entity id; table entries may only have their documented keys, offsets between -30 and 30, no `out` twice, and `target_table` entries exactly one of `target` / `offset`.
 
 ---
@@ -897,13 +931,16 @@ These are intended. Please do not report them as bugs.
 - Indoor mode: small drops are rounded to -0.5 after 30 minutes, small rises wait 30 minutes (deliberate asymmetry).
 - Indoor mode: the extra -1 when the setpoint has been 4 or more below the target for 4 hours.
 - Cooling setpoints are not learned (they would mix with the heating data).
+- Indoor mode: a learned setpoint is approached by at most 0.5 per run, not jumped to.
+- HVAC without `has_fireplace`: at target + 0.6 the setpoint is lowered first; `fan_only` only at the lowest setpoint or while the room still rises. HVAC: nothing is learned within 2 hours of a mode change.
+- The "no cooling when it is cold outside" rule (`fan_only` to cool only with the outdoor temperature above `target_indoor_temp - 4`) applies with and without `has_fireplace`.
 - Learned setpoints are only updated in normal operation (not on vacation, with open windows, during daytime savings / increasing, or in an ElectricalManagement state).
 - Table mode: open windows and `reduce` use the **lowest** of the save and vacation temperature.
 - Table mode: an entry applies from its `out` value and up.
 - In cooling, rain and wind make the app cool less (same direction as in heating).
 - With two own lux sensors the highest fresh value is used. In the Weather app the lowest temperature and the highest lux are used.
 - `input_boolean.vacation` is the default vacation switch only if it exists (a convention shared with ElectricalManagement and ModeManagement).
-- Fixed values in the rules (steps of 0.3 / 0.5 / 1, the fallback 10, `getting_hot_offset` 10, 400 lux) are not converted for Fahrenheit; only the defaults in the tables above are.
+- Fixed values in the rules (steps of 0.3 / 0.5 / 1, the fallback 10, `getting_hot_offset` 10, 400 lux, the target + 4 of the fast way back) are not converted for Fahrenheit; only the defaults in the tables above are, and the 0.2 C per hour rise limit before `fan_only` (0.36 F).
 - In table mode without an indoor sensor, the climate's own `current_temperature` is compared with `target_indoor_temp`. For a floor heater this can be the floor temperature: set `indoor_sensor_temp`, or a `target_indoor_temp` that suits that sensor. (`controller: adaptive` leaves that comparison out, see [Adaptive controller](#adaptive-controller-optional).)
 - The rules above (the asymmetry, the extra -1, the learned setpoints) belong to the classic controller. The adaptive controller's own deliberate choices are listed in [What differs from classic](#what-differs-from-classic).
 

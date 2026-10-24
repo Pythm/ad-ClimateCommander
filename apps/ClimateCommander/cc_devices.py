@@ -6,7 +6,9 @@
     Two ways to find the setpoint (target_mode):
       'indoor' : keep a fixed indoor temperature (target_indoor_temp / target_indoor_input). The
                  setpoint is moved step by step after the indoor sensor, and the setpoint that held
-                 the target is learned per outdoor temperature and lux (JSON store).
+                 the target is learned per outdoor temperature and lux (JSON store). The setpoint is
+                 kept while the room trend (sensor reports of the last hour) reaches the target within
+                 trend_hold_hours; a learned setpoint is approached one step per run.
       'table'  : setpoint = target_heater_temp (or target_heater_input) + the `offset` (or the
                  absolute `normal`) from the `temperatures` table for the outdoor temperature,
                  corrected for rain, wind, a window temperature sensor and an indoor sensor above
@@ -28,7 +30,7 @@ import bisect
 import datetime
 import math
 
-from cc_control import ControlConfig, IndoorController, Inputs
+from cc_control import ControlConfig, IndoorController, Inputs, ls_slope_h
 
 UNAVAIL = ('unavailable', 'unknown')
 POWER_STATES = ('normal', 'save', 'spend', 'reduce')
@@ -37,6 +39,14 @@ STALE_SENSOR = datetime.timedelta(hours = 1)
 STABLE_CORRECTION_MIN_DIFF = 0.3   # indoor mode: correct a steady room that is this far off target
 STABLE_CORRECTION_AFTER = datetime.timedelta(minutes = 30)
 CONTROL_WRITE_EVERY = datetime.timedelta(minutes = 30)   # shadow / adaptive: JSON written at most this often (and on power-state changes)
+STEP = 0.5                         # one setpoint step (climate entities take 0.5 steps)
+TREND_WINDOW = datetime.timedelta(minutes = 60)   # room trend: least squares over the reports of the last hour ...
+TREND_MIN_POINTS = 3                               # ... with at least this many reports ...
+TREND_MIN_SPAN = datetime.timedelta(minutes = 20)  # ... spanning at least this (else the trend is unknown, 0)
+TREND_KEEP = datetime.timedelta(hours = 3)         # room reports kept this long
+FAN_RISE = 0.2                     # (C per hour) HVAC without has_fireplace: heat -> fan_only at target + 0.6 only while the room still rises this fast
+RETURN_ABOVE_TARGET = 4            # HVAC: the fast way back after lowering for an overshoot goes at most this far above target
+LEARN_AFTER_MODE_CHANGE = datetime.timedelta(hours = 2)   # HVAC: no setpoint learned this long after a mode change
 DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
              'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl')
 
@@ -70,6 +80,7 @@ class Heater:
         self.interval:int = cfg['interval']
         self.controller:str = 'classic'
         self.ctrl = None                   # cc_control.IndoorController with controller shadow / adaptive
+        self.unit_scale:float = 1.8 if cfg.get('unit') == 'F' else 1.0   # C-based temperature differences x this in F
         now = self.ADapi.datetime(aware=True)
 
             # Sensors
@@ -131,6 +142,15 @@ class Heater:
         self.automate = cfg.get('automate')
 
             # Indoor temperature trend
+        self.trend_hold_hours:float = cfg.get('trend_hold_hours', 2.0)
+        self._room_hist:dict = {'primary': [], 'backup': []}   # (report time, value) of distinct reports per sensor
+        self._in_source:str = 'primary'    # the sensor get_in_temp used last
+        for source, entity in (('primary', self.indoor_sensor_temp), ('backup', self.backup_indoor_sensor_temp)):
+            if entity:
+                self.ADapi.listen_state(self._room_reported, entity,
+                    namespace = self.namespace,
+                    source = source
+                )
         self.prev_in_temp:float = 0.0
         in_temp = to_float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = self.namespace)) if self.indoor_sensor_temp else None
         if in_temp is None and self.backup_indoor_sensor_temp is not None:
@@ -282,6 +302,9 @@ class Heater:
             )
         self.ADapi.run_in(self._set_indoortemp, 5)
 
+    def _room_reported(self, entity, attribute, old, new, **kwargs) -> None:
+        self._note_room(kwargs.get('source', 'primary'), entity)
+
     def _updateTarget(self, entity, attribute, old, new, **kwargs) -> None:
         value = to_float(new)
         if value is None:
@@ -328,23 +351,74 @@ class Heater:
     # Reading sensors
     # ------------------------------------------------------------------ #
 
-    def _sensor_age(self, entity):
-        """ Time since the sensor last reported. last_reported changes on every report, also when
+    def _sensor_stamp(self, entity):
+        """ When the sensor last reported, or None. last_reported changes on every report, also when
             the value is the same; last_updated only when it changes. """
         stamp = self.ADapi.get_state(entity, attribute = 'last_reported', namespace = self.namespace)
         if not stamp:
             stamp = self.ADapi.get_state(entity, attribute = 'last_updated', namespace = self.namespace)
         if not stamp:
-            return datetime.timedelta(0)
+            return None
         try:
-            return self.ADapi.datetime(aware=True) - self.ADapi.convert_utc(stamp)
+            return self.ADapi.convert_utc(stamp)
         except (TypeError, ValueError):
+            return None
+
+    def _sensor_age(self, entity):
+        """ Time since the sensor last reported. """
+        stamp = self._sensor_stamp(entity)
+        if stamp is None:
             return datetime.timedelta(0)
+        return self.ADapi.datetime(aware=True) - stamp
+
+    def _note_room(self, source:str, entity) -> None:
+        """ Adds the sensor's present report to the trend history when its report time is new. """
+        value = to_float(self.ADapi.get_state(entity, namespace = self.namespace))
+        if value is None:
+            return
+        now = self.ADapi.datetime(aware=True)
+        stamp = self._sensor_stamp(entity) or now
+        hist = self._room_hist[source]
+        if hist and stamp <= hist[-1][0]:
+            return
+        hist.append((stamp, value))
+        self._room_hist[source] = [(t, v) for t, v in hist if now - t <= TREND_KEEP]
+
+    def _record_room(self) -> None:
+        """ Every run, in every mode (also fan_only): a report with an unchanged value fires no state event. """
+        if self.indoor_sensor_temp:
+            self._note_room('primary', self.indoor_sensor_temp)
+        if self.backup_indoor_sensor_temp:
+            self._note_room('backup', self.backup_indoor_sensor_temp)
+
+    def _room_rate(self) -> float:
+        """ Room trend in degrees (of the sensor) per hour from the reports of the sensor in use, 0 when unknown
+            (fewer than TREND_MIN_POINTS reports spanning TREND_MIN_SPAN within TREND_WINDOW). """
+        rate = ls_slope_h(self._room_hist.get(self._in_source, []), self.ADapi.datetime(aware=True),
+                          TREND_WINDOW.total_seconds(), TREND_MIN_SPAN.total_seconds(), TREND_MIN_POINTS)
+        return 0.0 if rate is None else rate
+
+    def _trend_rule(self, in_temp:float) -> tuple[bool, bool]:
+        """ Returns (hold, not_valid). hold: the room moves towards target and reaches it within trend_hold_hours
+            at its present rate, so the setpoint is kept. not_valid: the room moves towards target too slowly (or at
+            an unknown rate), or away from it: the learned setpoint is not forced. The direction comes from the
+            time-based trend; while that is unknown, from the change since the last run. """
+        target = self.target_indoor_temp
+        rate = self._room_rate()
+        direction = rate if rate != 0 else in_temp - self.prev_in_temp
+        if (in_temp < target and direction > 0) or (in_temp > target and direction < 0):
+            if rate != 0 and abs(target - in_temp) / abs(rate) <= self.trend_hold_hours:
+                return True, False
+            return False, True
+        if rate != 0 and in_temp != target:
+            return False, True
+        return False, False
 
     def get_in_temp(self):
         """ Indoor temperature from the indoor sensor. Uses the backup sensor when the indoor sensor
             is unavailable or has not reported for an hour. None when there is no usable value. """
         in_temp = None
+        self._in_source = 'primary'
         if self.indoor_sensor_temp is not None:
             in_temp = to_float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = self.namespace))
             stale = in_temp is not None and self._sensor_age(self.indoor_sensor_temp) > STALE_SENSOR
@@ -354,6 +428,7 @@ class Heater:
             backup = to_float(self.ADapi.get_state(self.backup_indoor_sensor_temp, namespace = self.namespace))
             if backup is not None:
                 self.ADapi.log(f"{self.heater}: using backup indoor temp {backup}", level = 'DEBUG')
+                self._in_source = 'backup'
                 return backup
         return in_temp   # a stale value is better than nothing when there is no usable backup sensor
 
@@ -479,6 +554,7 @@ class Heater:
         in_temp = self.get_in_temp()
         if in_temp is None:
             return
+        self._record_room()
         heater_temp = self.get_heater_temp()
         if heater_temp is None:
             return
@@ -565,9 +641,13 @@ class Heater:
             and self.store is not None
             and self.ADapi.datetime(aware=True) - self.heater_temp_last_changed > datetime.timedelta(hours = 2)
             and self.ADapi.datetime(aware=True) - self.heater_temp_last_registered > datetime.timedelta(hours = 2)
+            and self._may_learn()
         ):
             self._registerHeatingtemp(heater_temp = new_temperature)
             self.heater_temp_last_registered = self.ADapi.datetime(aware=True)
+
+    def _may_learn(self) -> bool:
+        return True
 
     def _send_temperature(self, temperature:float) -> None:
         self.ADapi.call_service('climate/set_temperature',
@@ -612,18 +692,16 @@ class Heater:
 
         persistent_temperature, valid_temp_data = self._getHeatingTempFromPersisten()
 
+        hold, not_valid = self._trend_rule(in_temp)
+        if hold:
+            # The room reaches target within trend_hold_hours at its present rate: keep the setpoint
+            self.prev_in_temp = in_temp
+            return heater_set_temp
+        if not_valid:
+            valid_temp_data = False
+
         if self.prev_in_temp > in_temp:
             # Temp is dropping
-            if in_temp > self.target_indoor_temp:
-                diff = abs(in_temp - self.target_indoor_temp)
-                drop = abs(self.prev_in_temp - in_temp)
-                if diff / drop < 6:
-                # Set temp is already lowering temperature and will reach target within 6 x 720 seconds
-                    self.prev_in_temp = in_temp
-                    return heater_set_temp
-                else:
-                    valid_temp_data = False
-
             if (
                 new_temperature <= self.target_indoor_temp - 4
                 and in_temp < self.target_indoor_temp
@@ -644,20 +722,10 @@ class Heater:
                     and round_half(new_temperature) < round_half(persistent_temperature)
                 ):
                     self.prev_in_temp = in_temp
-                    return persistent_temperature
+                    return self._toward_learned(heater_set_temp, new_temperature, persistent_temperature)
 
         elif self.prev_in_temp < in_temp:
             # Temp is increasing
-            if in_temp < self.target_indoor_temp:
-                diff = abs(in_temp - self.target_indoor_temp)
-                increase = abs(in_temp -self.prev_in_temp)
-                if diff / increase < 6:
-                    # Set temp is already increasing temperature
-                    self.prev_in_temp = in_temp
-                    return heater_set_temp
-                else:
-                    valid_temp_data = False
-
             new_temperature += adjust_temp_by
 
             if (
@@ -665,7 +733,7 @@ class Heater:
                 and round_half(new_temperature) > round_half(persistent_temperature)
             ):
                 self.prev_in_temp = in_temp
-                return persistent_temperature
+                return self._toward_learned(heater_set_temp, new_temperature, persistent_temperature)
 
         elif (
             abs(self.target_indoor_temp - in_temp) >= STABLE_CORRECTION_MIN_DIFF
@@ -689,6 +757,16 @@ class Heater:
 
         self.prev_in_temp = in_temp
         return new_temperature
+
+    def _toward_learned(self, current:float, new:float, learned:float) -> float:
+        """ The learned setpoint limits the computed move, it is not a jump target: when it lies beyond the computed
+            setpoint, the setpoint moves at most one STEP towards it per run (or the computed move, if larger). """
+        if min(current, new) <= learned <= max(current, new):
+            return learned
+        step = current + max(-STEP, min(STEP, learned - current))
+        if (learned - current) * (new - current) > 0 and abs(new - current) > abs(step - current):
+            return new
+        return step
 
     # ------------------------------------------------------------------ #
     # Learned setpoints (JSON store, indoor mode)
@@ -989,6 +1067,9 @@ class Heater:
             comfort_guard = cfg['comfort_guard'],
             temperatures = self.temperatures,
             target_heater_temp = self.target_heater_temp,
+            has_fireplace = cfg.get('has_fireplace', False),
+            max_setpoint_drop = cfg.get('max_setpoint_drop'),
+            interval_s = self.interval,
         ))
         self.diagnostic_sensor = cfg.get('diagnostic_sensor')
         self._virtual_setpoint = None      # shadow: the setpoint and mode the controller proposed last,
@@ -1210,6 +1291,10 @@ class Aircondition(Heater):
     hvac:bool = True
 
     def __init__(self, app, cfg:dict):
+        self._last_heat_setpoint = None    # last setpoint sent in heat (indoor mode, without a power offset), memory only
+        self._last_heat_setpoint_before_lowering = None   # setpoint before it was lowered for an overshoot instead of fan_only
+        self._last_mode_change = None      # when the hvac mode last changed (set by the app or seen at a run)
+        self._mode_seen = None
         super().__init__(app, cfg)
 
         try:
@@ -1230,6 +1315,9 @@ class Aircondition(Heater):
         if self.fan_mode_persistent is None or self.fan_mode_persistent == 'Silence':
             self.fan_mode_persistent = 'Auto'
 
+        self.has_fireplace:bool = cfg.get('has_fireplace', False)
+        self.max_setpoint_drop:float = cfg.get('max_setpoint_drop') or 3.0 * self.unit_scale
+
         self._schedule_silence()
         self._setup_controller(cfg)
 
@@ -1239,6 +1327,8 @@ class Aircondition(Heater):
             hvac_mode = mode,
             namespace = self.namespace
         )
+        self._last_mode_change = self.ADapi.datetime(aware=True)
+        self._mode_seen = mode
 
     def _heat_setpoint(self, heater_temp:float, in_temp:float, real_in_temp:float) -> float:
         if self.target_mode == 'table':
@@ -1247,6 +1337,87 @@ class Aircondition(Heater):
                 return self._reduce_temperatures()[1]
             return self._table_setpoint(real_in_temp, vacation = False)
         return self._indoor_setpoint(heater_temp = heater_temp, in_temp = in_temp, mode = 'heat')
+
+    # ------------------------------------------------------------------ #
+    # Heating in indoor mode: lowest setpoint, way back after lowering, restart from fan_only
+    # ------------------------------------------------------------------ #
+
+    def _lowest_heat(self) -> float:
+        """ Lowest heat setpoint in indoor mode. A unit idles once its setpoint is at or below its own sensor reading,
+            so a lower setpoint only makes the way back up slow. """
+        return max(self.min_temp, self.target_indoor_temp - self.max_setpoint_drop)
+
+    def _send_temperature(self, temperature:float) -> None:
+        super()._send_temperature(temperature)
+        self._note_heat_setpoint(temperature)
+
+    def _note_heat_setpoint(self, temperature:float) -> None:
+        """ Remembers the setpoint sent in heat (indoor mode, not on vacation or with a window open) without the
+            power-state offset in it. Used for the start after fan_only. """
+        if (
+            self.target_mode == 'indoor'
+            and not self.vacation_state
+            and not self.windows_is_open
+            and self.ADapi.get_state(self.heater, namespace = self.namespace) == 'heat'
+        ):
+            self._last_heat_setpoint = temperature - self._applied_offset
+
+    def _setHeatingTempFromPersisten(self, **kwargs) -> None:
+        """ Setpoint after fan_only -> heat (offset -1). Indoor mode: the setpoint held in heat before, with the learned
+            setpoint + offset as the ceiling (after an app restart only the latter), not below _lowest_heat(). """
+        if self.target_mode != 'indoor':
+            super()._setHeatingTempFromPersisten(**kwargs)
+            return
+        temp, valid_temp_data = self._getHeatingTempFromPersisten()
+        temp += kwargs.get('offset', 0.0)
+        if self._last_heat_setpoint is not None:
+            temp = min(temp, self._last_heat_setpoint)
+        self._send_temperature(round_half(max(temp, self._lowest_heat())))
+
+    def _learned_ceiling(self):
+        """ The learned setpoint for the present weather, None without learned data. """
+        if self.store is None or not self.store.device(self.heater).get('data'):
+            return None
+        return self._getHeatingTempFromPersisten()[0]
+
+    def _heat_limits(self, heater_temp:float, in_temp:float, new_temperature:float) -> float:
+        """ Indoor mode, normal power state. After the setpoint was lowered for an overshoot (instead of fan_only), the
+            way back is one move once the room is at or below target and not reaching it in time by itself: to the
+            setpoint from before the lowering, at most the learned setpoint and target + RETURN_ABOVE_TARGET.
+            The result is never below _lowest_heat(). """
+        before = self._last_heat_setpoint_before_lowering
+        if before is not None and in_temp <= self.target_indoor_temp:
+            rate = self._room_rate()
+            rising = rate > 0 and (self.target_indoor_temp - in_temp) / rate <= self.trend_hold_hours
+            if heater_temp >= before:
+                self._last_heat_setpoint_before_lowering = None
+            elif not rising:
+                goal = min(before, self.target_indoor_temp + RETURN_ABOVE_TARGET)
+                ceiling = self._learned_ceiling()
+                if ceiling is not None:
+                    goal = min(goal, ceiling)
+                new_temperature = max(new_temperature, goal)
+                self._last_heat_setpoint_before_lowering = None
+        return max(new_temperature, self._lowest_heat())
+
+    def _fan_only_now(self, heater_temp:float) -> bool:
+        """ heat -> fan_only at target + 0.6: at once with has_fireplace, in table mode and in a power state. Else only
+            when the setpoint is at _lowest_heat() or the room still rises FAN_RISE per hour; until then the setpoint
+            is lowered one step per run and the unit stays in heat. """
+        if self.has_fireplace or self.target_mode != 'indoor' or self.power_state != 'normal':
+            return True
+        return heater_temp <= self._lowest_heat() or self._room_rate() >= FAN_RISE * self.unit_scale
+
+    def _may_learn(self) -> bool:
+        """ No learning within LEARN_AFTER_MODE_CHANGE of a mode change (cycling heat / fan_only teaches too high
+            setpoints) or while the unit reports an hvac_action other than heating / idle. """
+        if (
+            self._last_mode_change is not None
+            and self.ADapi.datetime(aware=True) - self._last_mode_change < LEARN_AFTER_MODE_CHANGE
+        ):
+            return False
+        action = self.ADapi.get_state(self.heater, attribute = 'hvac_action', namespace = self.namespace)
+        return action is None or action in ('heating', 'idle')
 
     # ------------------------------------------------------------------ #
     # Silence fan mode
@@ -1324,7 +1495,7 @@ class Aircondition(Heater):
 
     def _schedule_silence(self) -> None:
         """ One daily timer at every start and stop time of the silence periods, so the fan mode changes on time
-            and not at the next 12 minute run. """
+            and not at the next run. """
         times = set()
         for period in self.silence:
             for key in ('start', 'stop'):
@@ -1351,9 +1522,14 @@ class Aircondition(Heater):
         if in_temp is None:
             self.ADapi.log(f"{self.heater}: indoor temp is None. Aborting setting new temperature", level = 'INFO')
             return
+        self._record_room()
         real_in_temp = in_temp
         heater_temp = self.get_heater_temp()
         ac_state = self.ADapi.get_state(self.heater, namespace = self.namespace)
+        if ac_state in ('heat', 'cool', 'fan_only', 'off') and ac_state != self._mode_seen:
+            if self._mode_seen is not None:
+                self._last_mode_change = self.ADapi.datetime(aware=True)
+            self._mode_seen = ac_state
 
         self._silence()
         self._window_notifications(real_in_temp)
@@ -1389,6 +1565,8 @@ class Aircondition(Heater):
             # Holliday temperature
             if self.vacation_state:
                 self._clear_power_offset()
+                self._last_heat_setpoint = None
+                self._last_heat_setpoint_before_lowering = None
                 new_temperature = self.vacation_temp
                 if (
                     in_temp > self.target_indoor_temp -3
@@ -1405,6 +1583,8 @@ class Aircondition(Heater):
             else:
                 new_temperature = self._heat_setpoint(heater_temp, in_temp, real_in_temp)
                 learn = self.target_mode == 'indoor' and not shifted and self.power_state == 'normal'
+                if self.target_mode == 'indoor' and self.power_state == 'normal':
+                    new_temperature = self._heat_limits(heater_temp, in_temp, new_temperature)
 
                 # Check if there is a need to boost the ac when windy
                 if (
@@ -1439,9 +1619,15 @@ class Aircondition(Heater):
                         in_temp > self.target_indoor_temp + 0.6
                         and not afterDaytimeIncrease
                     ):
-                        self._set_hvac_mode('fan_only')
-                        self.ADapi.run_in(self._set_indoortemp, 5) # To set silence to new fan mode, if time for it
-                        return
+                        if self._fan_only_now(heater_temp):
+                            self._set_hvac_mode('fan_only')
+                            self.ADapi.run_in(self._set_indoortemp, 5) # To set silence to new fan mode, if time for it
+                            return
+                        # Lower by the computed adjustment, at most one step and not below the lowest setpoint
+                        lowered = min(heater_temp, max(new_temperature, heater_temp - STEP, self._lowest_heat()))
+                        if round_half(lowered) < heater_temp and self._last_heat_setpoint_before_lowering is None:
+                            self._last_heat_setpoint_before_lowering = heater_temp
+                        new_temperature = lowered
                 else:
                     for s in self.screening:
                         s.can_close_on_lux = False

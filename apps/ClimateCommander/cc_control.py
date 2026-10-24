@@ -43,6 +43,12 @@ EST_TAU_S = 3600                # smoothing of the internal-sensor estimate (cli
 MODE_MIN_S = 1800               # HVAC: minimum time in heat / fan_only / cool before an automatic switch
 FAN_ABOVE = 0.6                 # (deg) heat -> fan_only when the room is this far above target_eff ...
 FAN_RISE = 0.2                  # (deg per h) ... and the setpoint is at its lower clamp or the room rises this fast
+                                #    (has_fireplace: at FAN_ABOVE alone)
+MAX_DROP = 3.0                  # (deg) HVAC heat: lowest setpoint this far below target when max_setpoint_drop is not set (as
+                                #    classic): the unit idles below its own sensor reading, lower only slows the way back
+RETURN_JUMP = 4.0               # (deg) HVAC heat: once the setpoint was lowered for an overshoot (room above target + FAN_ABOVE,
+                                #    no fan_only), the first change with the room at or below target may skip the STEP
+                                #    limit, up to the setpoint before the lowering and at most target + this
 POWER_END_HOLD_S = 3600         # no automatic heat -> fan_only this long after a power state ended (the room was
                                 #    moved on purpose by spend; found in R2 on room_B S7)
 DB_ABOVE = 0.1                  # (deg) D1: integrate when the room is above target_eff by more than this
@@ -294,6 +300,9 @@ class ControlConfig:
     comfort_guard: float | None = None    # None: 1.5 C / 2.7 F
     temperatures: list | None = None      # table mode, as classic
     target_heater_temp: float | None = None
+    has_fireplace: bool = False           # HVAC: heat -> fan_only at FAN_ABOVE without waiting for the lower clamp or a rise
+    max_setpoint_drop: float | None = None    # HVAC heat: lowest setpoint below target, device unit (None: 3 C / 5.4 F)
+    interval_s: float = 720.0             # seconds between control runs (interval_minutes)
 
 
 @dataclass
@@ -389,6 +398,7 @@ class IndoorController:
         self.pw_ended = None              # when the last power state ended
         self.last_commanded = None
         self.last_change = None
+        self.pre_lower = None             # HVAC heat: setpoint before it was lowered for an overshoot (RETURN_JUMP)
         self.mode_seen = None
         self.mode_since = None
         self.mode_forced = False          # the current mode was set by an override (window / vacation)
@@ -604,9 +614,13 @@ class IndoorController:
         self.ff_prev, self.ff_ok_prev = ff, ok
         return ff
 
-    def limits(self, base):
+    def limits(self, base, mode = 'heat'):
+        """ Setpoint range: base +- SP_SPAN; an HVAC in heat at most max_setpoint_drop (MAX_DROP) below base. """
         cfg, s = self.cfg, self.s
-        lo = max(cfg.min_temp, base - SP_SPAN * s)
+        drop = SP_SPAN * s
+        if cfg.kind == 'hvac' and mode == 'heat':
+            drop = min(drop, cfg.max_setpoint_drop if cfg.max_setpoint_drop is not None else MAX_DROP * s)
+        lo = max(cfg.min_temp, base - drop)
         if cfg.vacation_temp is not None:
             lo = max(lo, cfg.vacation_temp)
         return lo, min(cfg.max_temp, base + SP_SPAN * s)
@@ -619,9 +633,10 @@ class IndoorController:
             return sign * (self.cfg.save_temp_offset if self.cfg.save_temp_offset is not None else SAVE_OFFSET)
         return sign * self.cfg.spend_temp_offset
 
-    def _send(self, d, inp, now, sp, bypass = False, step_limit = True):
+    def _send(self, d, inp, now, sp, bypass = False, step_limit = True, jump_to = None):
         """ Output stage. Normal: only when |sp - setpoint| >= SEND_HYST, at most one change per MIN_CHANGE_S,
-            at most STEP per change. bypass (overrides, power-state edges, mode switches): round_half(sp) now. """
+            at most STEP per change. bypass (overrides, power-state edges, mode switches): round_half(sp) now.
+            jump_to (RETURN_JUMP): an upward change may skip the STEP limit, up to jump_to. """
         cur = inp.setpoint
         want = round_half(sp)
         new = None
@@ -629,7 +644,12 @@ class IndoorController:
             new = want
         elif abs(sp - cur) >= self.t.send_hyst * self.s and (
                 self.last_change is None or (now - self.last_change).total_seconds() >= MIN_CHANGE_S - 1):
-            new = round_half(cur + clamp(want - cur, -STEP, STEP)) if step_limit else want
+            if not step_limit:
+                new = want
+            elif jump_to is not None and want > cur + STEP:
+                new = max(round_half(cur + STEP), min(want, round_half(jump_to)))
+            else:
+                new = round_half(cur + clamp(want - cur, -STEP, STEP))
         if new is not None and new != cur:
             d.temperature = new
             self.last_commanded = new
@@ -732,13 +752,13 @@ class IndoorController:
         """ sp_ctrl = clamp(tgt + ff + i + p - solar). The integral (attr) runs only when allowed, outside the
             D1 deadband, and not further into a clamp (anti-windup). """
         s = self.s
-        lo, hi = self.limits(base)
+        lo, hi = self.limits(base, 'cool' if attr == 'i_cool' else 'heat')
         if self.in_f is None:
             return clamp(tgt + ff + getattr(self, attr) - solar, lo, hi), 0.0
         p = self.t.kp * (tgt - (self.in_f + rate * self.t.lead_h))
         e = tgt - self.in_f
         ei = tgt - (self.in_f + rate * self.t.lead_h) if self.t.i_pred else e
-        if (integrate and dt_s <= 3 * MIN_CHANGE_S and abs(e) <= self.t.i_band * s
+        if (integrate and dt_s <= 3 * max(MIN_CHANGE_S, self.cfg.interval_s) and abs(e) <= self.t.i_band * s
                 and (ei > DB_BELOW * s or ei < -DB_ABOVE * s)):
             raw = tgt + ff + getattr(self, attr) + p - solar
             if not ((raw >= hi and ei > 0) or (raw <= lo and ei < 0)):
@@ -822,6 +842,7 @@ class IndoorController:
         vac = cfg.vacation_temp if cfg.vacation_temp is not None else 10.0
         if inp.windows_open or inp.vacation:
             self._clear_pw()
+            self.pre_lower = None
             if cfg.kind == 'hvac' and inp.windows_open:
                 self._mode(d, now, 'fan_only', forced = True)
                 return
@@ -835,7 +856,7 @@ class IndoorController:
             if src in ('primary', 'backup'):
                 extra = cfg.spend_temp_offset if (inp.power_state == 'spend' and active) else 0.0
                 held = self.pw_ended is not None and (now - self.pw_ended).total_seconds() < POWER_END_HOLD_S
-                if (self.in_f > tgt + FAN_ABOVE * s + extra and (sp_ctrl <= lo + 1e-9 or rate >= FAN_RISE * s)
+                if (self.in_f > tgt + FAN_ABOVE * s + extra and (cfg.has_fireplace or sp_ctrl <= lo + 1e-9 or rate >= FAN_RISE * s)
                         and not held and (inp.since_windy_s is None or inp.since_windy_s > FAN_WIND_S)
                         and not inp.after_increase and self._mode_time_ok(now)):
                     self._clear_pw()
@@ -849,8 +870,19 @@ class IndoorController:
                 d.preset = 'none'
         if active:
             self._send(d, inp, now, self.pw_base + self.power_offset(inp.power_state, 'heat'), bypass = True)
-        else:
-            self._send(d, inp, now, sp_ctrl, bypass = edge)
+            return
+        back = None
+        if cfg.kind == 'hvac' and self.pre_lower is not None and self.in_f is not None and self.in_f <= tgt:
+            back = min(self.pre_lower, base + RETURN_JUMP * s)
+        self._send(d, inp, now, sp_ctrl, bypass = edge, jump_to = back)
+        cur, sent = inp.setpoint, d.temperature
+        if cfg.kind != 'hvac' or cur is None:
+            return
+        if self.pre_lower is not None and (cur >= self.pre_lower or (back is not None and sent is not None and sent > cur)):
+            self.pre_lower = None                   # the way back is done
+        elif (self.pre_lower is None and sent is not None and sent < cur and self.in_f is not None
+              and self.in_f > tgt + FAN_ABOVE * s):
+            self.pre_lower = cur                    # lowered for an overshoot instead of fan_only
 
     def _fan_only(self, d, inp, now, dt_s, R, src, base, solar, rate, windy, raining):
         cfg, s = self.cfg, self.s
@@ -885,6 +917,7 @@ class IndoorController:
         cfg, s = self.cfg, self.s
         tgt = self.target_eff(base, inp, windy, raining, 'cool')
         real = src in ('primary', 'backup')
+        self.pre_lower = None
         if inp.windows_open:
             self._clear_pw()
             self._mode(d, now, 'fan_only', forced = True)
@@ -930,7 +963,7 @@ class IndoorController:
         sp -= min(TABLE_ADJ_MAX * s, cfg.solar_gain * self.solar_f + room_term)
         if (src in ('primary', 'backup') and not inp.vacation and inp.power_state == 'normal' and not inp.saving
                 and (inp.since_window_closed_s is None or inp.since_window_closed_s >= WINDOW_CLOSED_S)
-                and dt_s <= 3 * 900):
+                and dt_s <= 3 * max(900, cfg.interval_s)):
             err = base - self.in_f
             if err > DB_BELOW * s or err < -DB_ABOVE * s:
                 self.trim_i = clamp(self.trim_i + self.t.ki_h * err * dt_s / 3600, -TRIM_CLAMP * s, TRIM_CLAMP * s)
