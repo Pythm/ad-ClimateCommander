@@ -49,6 +49,12 @@ MAX_DROP = 3.0                  # (deg) HVAC heat: lowest setpoint this far belo
 RETURN_JUMP = 4.0               # (deg) HVAC heat: once the setpoint was lowered for an overshoot (room above target + FAN_ABOVE,
                                 #    no fan_only), the first change with the room at or below target may skip the STEP
                                 #    limit, up to the setpoint before the lowering and at most target + this
+COLD_START_DEFICIT = 2.0        # (deg) vacation end with the room at least this far below target_eff (cold_start_deficit):
+                                #    cold start ...
+COLD_START_MAX = 6.0            # (deg) owner: ... at target_eff + the deficit, at most this above it (and max_temp), sent at
+                                #    once and held ...
+COLD_BACK_WITHIN = 1.0          # (deg) owner: ... until the room is this close to target_eff ...
+COLD_START_MAX_H = 8            # owner: ... or this many hours (safety); then one move to sp_ctrl, the integral set to it
 POWER_END_HOLD_S = 3600         # no automatic heat -> fan_only this long after a power state ended (the room was
                                 #    moved on purpose by spend; found in R2 on room_B S7)
 DB_ABOVE = 0.1                  # (deg) D1: integrate when the room is above target_eff by more than this
@@ -303,6 +309,7 @@ class ControlConfig:
     has_fireplace: bool = False           # HVAC: heat -> fan_only at FAN_ABOVE without waiting for the lower clamp or a rise
     max_setpoint_drop: float | None = None    # HVAC heat: lowest setpoint below target, device unit (None: 3 C / 5.4 F)
     interval_s: float = 720.0             # seconds between control runs (interval_minutes)
+    cold_start_deficit: float | None = None   # vacation end: cold start when the room is this far below target (None: 2 C / 3.6 F)
 
 
 @dataclass
@@ -411,6 +418,10 @@ class IndoorController:
         self.last_bias_sample = None
         self.last_save = None
         self.started = False              # bumpless start done
+        self.vac_prev = None              # vacation flag of the last run (memory only: no cold start after a restart)
+        self.vac_end = False              # this run is the first one after a vacation ended
+        self.cold_start = None            # when the cold start after a vacation began (memory only)
+        self.cold_sp = None               # its setpoint
         self.logged = set()               # log-once flags
 
     # ---- persistence ------------------------------------------------------------------------------- #
@@ -701,6 +712,8 @@ class IndoorController:
         dt_s = 720.0 if self.last_run is None else clamp((now - self.last_run).total_seconds(), 0.0, 6 * 3600.0)
         self.last_run = now
         self._track(inp, now, dt_s)
+        self.vac_end = self.vac_prev is True and not inp.vacation
+        self.vac_prev = bool(inp.vacation)
         windy = inp.since_windy_s is not None and inp.since_windy_s < WINDY_S
         raining = bool(inp.raining)
         R, src = self._room(d, inp, windy, raining)
@@ -833,9 +846,12 @@ class IndoorController:
         first = not self.started
         if first or self._manual(d, inp):
             self._bumpless(d, inp, tgt, ff, solar, rate, first = first)
+            self.cold_start = None
         freeze = self._freeze(inp, src, tgt)
         if freeze is None and self.t.sun_freeze > 0 and solar >= self.t.sun_freeze * s:
             freeze = 'sun'
+        if freeze is None and self.cold_start is not None:
+            freeze = 'cold start'
         sp_ctrl, p = self._pi(tgt, ff, solar, rate, base, dt_s, freeze is None)
         lo, hi = self.limits(base)
         d.diag.update(mode = 'heat', target_eff = tgt, ff = ff, i = self.i_term, p = p, sp_ctrl = sp_ctrl, frozen = freeze)
@@ -843,6 +859,7 @@ class IndoorController:
         if inp.windows_open or inp.vacation:
             self._clear_pw()
             self.pre_lower = None
+            self.cold_start = None
             if cfg.kind == 'hvac' and inp.windows_open:
                 self._mode(d, now, 'fan_only', forced = True)
                 return
@@ -851,6 +868,7 @@ class IndoorController:
                     and self.in_f > inp.target - 3 * s and self.in_f > vac + 3 * s):
                 self._mode(d, now, 'fan_only', forced = True)
             return
+        self._cold_begin(d, inp, now, tgt)
         active, edge = self._power_layer(d, inp, tgt, 'heat')
         if cfg.kind == 'hvac':
             if src in ('primary', 'backup'):
@@ -868,6 +886,23 @@ class IndoorController:
                 d.preset = 'boost'
             elif not boost and inp.preset == 'boost':
                 d.preset = 'none'
+        if self.cold_start is not None:
+            if self.in_f is None or (self.in_f < tgt - COLD_BACK_WITHIN * s
+                                     and (now - self.cold_start).total_seconds() < COLD_START_MAX_H * 3600):
+                if not active:
+                    if edge:
+                        self._send(d, inp, now, self.cold_sp, bypass = True)   # a power state ended: back to the start setpoint
+                    return
+            else:
+                # The way down: one move to sp_ctrl; the integral is set so that sp_ctrl is the value sent (no jump back)
+                goal = round_half(sp_ctrl)
+                self.i_term = clamp(goal - (tgt + ff + p - solar), -I_CLAMP * s, I_CLAMP * s)
+                self.cold_start = None
+                d.logs.append(('INFO', "cold start ended: room %.1f, target %.1f, setpoint %s." % (self.in_f, tgt, goal)))
+                if not active:
+                    self._send(d, inp, now, goal, bypass = True)
+                    return
+                self.pw_base = goal
         if active:
             self._send(d, inp, now, self.pw_base + self.power_offset(inp.power_state, 'heat'), bypass = True)
             return
@@ -884,6 +919,25 @@ class IndoorController:
               and self.in_f > tgt + FAN_ABOVE * s):
             self.pre_lower = cur                    # lowered for an overshoot instead of fan_only
 
+    def _cold_begin(self, d, inp, now, tgt) -> bool:
+        """ First run after a vacation ended, room at least cold_start_deficit below tgt: the cold start setpoint
+            tgt + the deficit (at most COLD_START_MAX above tgt and max_temp) at once. A power state that is on keeps it
+            as its base. True when started. """
+        cfg, s = self.cfg, self.s
+        if not self.vac_end or self.in_f is None:
+            return False
+        deficit = tgt - self.in_f
+        if deficit < (cfg.cold_start_deficit if cfg.cold_start_deficit is not None else COLD_START_DEFICIT * s):
+            return False
+        start = round_half(min(cfg.max_temp, tgt + min(deficit, COLD_START_MAX * s)))
+        self.cold_start, self.cold_sp, self.pre_lower = now, start, None
+        if inp.power_state != 'normal':
+            self.pw_base = start
+        d.logs.append(('INFO', "vacation ended with the room %.1f below target: cold start at %s until the room is near "
+                       "the target." % (deficit, start)))
+        self._send(d, inp, now, start, bypass = True)
+        return True
+
     def _fan_only(self, d, inp, now, dt_s, R, src, base, solar, rate, windy, raining):
         cfg, s = self.cfg, self.s
         tgt = self.target_eff(base, inp, windy, raining, 'heat')
@@ -891,6 +945,7 @@ class IndoorController:
         sp_ctrl, p = self._pi(tgt, ff, solar, rate, base, dt_s, False)
         d.diag.update(mode = 'fan_only', target_eff = tgt, ff = ff, i = self.i_term, p = p, sp_ctrl = sp_ctrl)
         self._clear_pw()
+        self.cold_start = None
         real = src in ('primary', 'backup')
         if inp.windows_open or not real:
             return    # no mode change on an estimate (addendum 1.4)
@@ -910,7 +965,8 @@ class IndoorController:
             return
         if self.in_f <= tgt and solar < 1.0 * s:
             self._mode(d, now, 'heat')
-            self._send(d, inp, now, sp_ctrl - STEP, bypass = True)   # replaces D5
+            if not self._cold_begin(d, inp, now, tgt):
+                self._send(d, inp, now, sp_ctrl - STEP, bypass = True)   # replaces D5
             self.started = True
 
     def _cool(self, d, inp, now, dt_s, R, src, base, solar, rate, windy, raining):
@@ -918,6 +974,7 @@ class IndoorController:
         tgt = self.target_eff(base, inp, windy, raining, 'cool')
         real = src in ('primary', 'backup')
         self.pre_lower = None
+        self.cold_start = None
         if inp.windows_open:
             self._clear_pw()
             self._mode(d, now, 'fan_only', forced = True)

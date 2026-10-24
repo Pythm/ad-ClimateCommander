@@ -8,7 +8,9 @@
                  setpoint is moved step by step after the indoor sensor, and the setpoint that held
                  the target is learned per outdoor temperature and lux (JSON store). The setpoint is
                  kept while the room trend (sensor reports of the last hour) reaches the target within
-                 trend_hold_hours; a learned setpoint is approached one step per run.
+                 trend_hold_hours; a learned setpoint is approached one step per run. A normal move is at most
+                 one step (0.5) per run. After a vacation a cold room gets a higher start setpoint (cold start)
+                 until it is near the target.
       'table'  : setpoint = target_heater_temp (or target_heater_input) + the `offset` (or the
                  absolute `normal`) from the `temperatures` table for the outdoor temperature,
                  corrected for rain, wind, a window temperature sensor and an indoor sensor above
@@ -47,6 +49,10 @@ TREND_KEEP = datetime.timedelta(hours = 3)         # room reports kept this long
 FAN_RISE = 0.2                     # (C per hour) HVAC without has_fireplace: heat -> fan_only at target + 0.6 only while the room still rises this fast
 RETURN_ABOVE_TARGET = 4            # HVAC: the fast way back after lowering for an overshoot goes at most this far above target
 LEARN_AFTER_MODE_CHANGE = datetime.timedelta(hours = 2)   # HVAC: no setpoint learned this long after a mode change
+COLD_START_MAX = 6.0               # vacation end, indoor mode: the cold start setpoint is at most this above target (x unit_scale) ...
+COLD_BACK_WITHIN = 1.0             # ... and is held until the room is this close to target (x unit_scale) ...
+COLD_START_MAX_TIME = datetime.timedelta(hours = 8)   # ... or this long after the vacation end
+COLD_GOAL_ABOVE = 1.0              # way down without a held or learned setpoint: target + this (x unit_scale)
 DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
              'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl')
 
@@ -136,6 +142,12 @@ class Heater:
             self.vacation_temp = 10
         self.vacation_keep_off:bool = cfg['vacation_keep_off']
         self.off_retry_count:int = 3
+        self.cold_start_deficit:float = cfg.get('cold_start_deficit') or 2.0 * self.unit_scale
+        self._vacation_ended:bool = False  # vacation went from on to off: the next run starts the heating (indoor mode)
+        self._cold_start:bool = False      # the cold start setpoint after a vacation is held (memory only)
+        self._cold_start_since = None
+        self._heat_setpoint_before_vacation = None
+        self._window_closed:bool = False   # heater: all windows closed, the next normal move is not limited to one step
 
         self.daytime_savings:list = cfg.get('daytime_savings') or []
         self.daytime_increasing:list = cfg.get('daytime_increasing') or []
@@ -287,8 +299,14 @@ class Heater:
     # ------------------------------------------------------------------ #
 
     def _vacationStateListen(self, entity, attribute, old, new, **kwargs) -> None:
+        if new == 'on' and not self.vacation_state:
+            self._heat_setpoint_before_vacation = self._held_heat_setpoint()
         self.vacation_state = new == 'on'
         self.off_retry_count = 3
+        if new == 'on':
+            self._end_cold_start()
+        elif old == 'on' and new == 'off':
+            self._note_vacation_end()
         if (
             self.target_mode == 'table'
             and new == 'off'
@@ -324,12 +342,14 @@ class Heater:
             if not self.windows_is_open:
                 self.notify_cold_armed = True
             self.windows_is_open = True
+            self._end_cold_start()
             self.ADapi.run_in(self._set_indoortemp, 1)
 
     def _windowClosed(self, entity, attribute, old, new, **kwargs) -> None:
         if self.windowsopened() == 0:
             if self.windows_is_open:
                 self.notify_hot_armed = True
+                self._window_closed = not self.hvac   # an HVAC returns through fan_only -> heat (restart setpoint)
             self.window_last_closed = self.ADapi.datetime(aware=True)
             self.windows_is_open = False
             self.ADapi.run_in(self._set_indoortemp, 60)
@@ -582,6 +602,7 @@ class Heater:
         if self.windows_is_open:
             new_temperature = self.vacation_temp
             self._clear_power_offset()
+            self._vacation_ended = False
 
         elif self.vacation_state:
             new_temperature = self.vacation_temp
@@ -590,7 +611,11 @@ class Heater:
                 if self.weather.out_temp > self.screening_temp:
                     for s in self.screening:
                         s.try_screen_close()
+        elif self._vacation_ended:
+            new_temperature = self._after_vacation(in_temp)
         else:
+            if self._cold_start and self.ADapi.get_state(self.heater, namespace = self.namespace) == 'off':
+                self._end_cold_start()
             new_temperature = self._indoor_setpoint(heater_temp = heater_temp, in_temp = in_temp)
             learn = not shifted and self.power_state == 'normal'
 
@@ -614,23 +639,121 @@ class Heater:
             the setpoint is held at the value from before the state plus the state's offset, so the
             regulation does not work against the saving and nothing is learned. """
         offset = self._power_offset(mode)
+        cold = self._cold_start and mode == 'heat'
         if offset == 0:
             base = heater_temp
+            ending = self._applied_offset != 0   # a power state just ended: the move is not limited to one step
             if self._applied_offset != 0 and self._base_setpoint is not None:
                 if self._last_commanded is not None and heater_temp != self._last_commanded:
                     base = heater_temp - self._applied_offset   # changed by hand during the state
                 else:
                     base = self._base_setpoint
             self._clear_power_offset()
-            return self.adjust_set_temperature_by(heater_set_temp = base, in_temp = in_temp)
+            if cold:
+                return self._cold_start_step(base, in_temp)
+            new_temperature = self.adjust_set_temperature_by(heater_set_temp = base, in_temp = in_temp)
+            if ending or self._window_closed or self.target_mode != 'indoor':
+                self._window_closed = False
+                return new_temperature
+            return self._capped(heater_temp, new_temperature)
 
         if self._applied_offset == 0 or self._base_setpoint is None:
             self._base_setpoint = heater_temp
         elif self._last_commanded is not None and heater_temp != self._last_commanded:
             self._base_setpoint = heater_temp - self._applied_offset   # changed by hand during the state
+        if cold:
+            self._base_setpoint = self._cold_start_step(self._base_setpoint, in_temp)
         self._applied_offset = offset
         self.prev_in_temp = in_temp
         return self._base_setpoint + offset
+
+    def _capped(self, current:float, new:float) -> float:
+        """ Indoor mode: a normal setpoint move is at most STEP per run, on the 0.5 grid. """
+        return round_half(current + max(-STEP, min(STEP, new - current)))
+
+    # ------------------------------------------------------------------ #
+    # After a vacation (indoor mode): cold start, way down
+    # ------------------------------------------------------------------ #
+
+    def _note_vacation_end(self) -> None:
+        if self.target_mode == 'indoor':
+            self._vacation_ended = True
+
+    def _end_cold_start(self) -> None:
+        self._cold_start = False
+        self._cold_start_since = None
+
+    def _held_heat_setpoint(self):
+        """ The setpoint the heater holds now without a power-state offset (None with an open window or in table mode). """
+        heater_temp = self.get_heater_temp()
+        if self.target_mode != 'indoor' or self.windows_is_open or heater_temp is None:
+            return None
+        return heater_temp - self._applied_offset
+
+    def _lowest_heat(self) -> float:
+        """ Heater: the climate's min_temp (max_setpoint_drop is for HVAC). """
+        return self.min_temp
+
+    def _max_temp(self):
+        return to_float(self.ADapi.get_state(self.heater, attribute = 'max_temp', namespace = self.namespace))
+
+    def _learned_ceiling(self):
+        """ The learned setpoint for the present weather, None without learned data. """
+        if self.store is None or not self.store.device(self.heater).get('data'):
+            return None
+        return self._getHeatingTempFromPersisten()[0]
+
+    def _after_vacation(self, in_temp:float) -> float:
+        """ The first run after a vacation ended. Room at least cold_start_deficit below target: the cold start setpoint
+            target + the deficit (at most COLD_START_MAX above target and the climate's max_temp), held by
+            _cold_start_step. Else the restart setpoint as after fan_only: the setpoint held before the vacation, at
+            most the learned setpoint (without learned data: the target) minus 1, not below _lowest_heat(). """
+        self._vacation_ended = False
+        deficit = self.target_indoor_temp - in_temp
+        if deficit >= self.cold_start_deficit:
+            start = self.target_indoor_temp + min(deficit, COLD_START_MAX * self.unit_scale)
+            max_temp = self._max_temp()
+            if max_temp is not None:
+                start = min(start, max_temp)
+            self._cold_start = True
+            self._cold_start_since = self.ADapi.datetime(aware=True)
+            self.ADapi.log(f"{self.heater}: vacation ended with the room {round(deficit, 1)} below target: "
+                           f"cold start at {round_half(start)} until the room is near the target.", level = 'INFO')
+            self.prev_in_temp = in_temp
+            return round_half(start)
+        learned = self._learned_ceiling()
+        temp = (learned if learned is not None else self.target_indoor_temp) - 1
+        if self._heat_setpoint_before_vacation is not None:
+            temp = min(temp, self._heat_setpoint_before_vacation)
+        self._heat_setpoint_before_vacation = None
+        self.prev_in_temp = in_temp
+        return round_half(max(temp, self._lowest_heat()))
+
+    def _cold_start_step(self, current:float, in_temp:float) -> float:
+        """ While the cold start runs: the setpoint is held until the room is within COLD_BACK_WITHIN of target, or
+            COLD_START_MAX_TIME after the vacation end; then one move to _cold_start_goal() and the normal rules. """
+        self.prev_in_temp = in_temp
+        if (
+            in_temp < self.target_indoor_temp - COLD_BACK_WITHIN * self.unit_scale
+            and self.ADapi.datetime(aware=True) - self._cold_start_since < COLD_START_MAX_TIME
+        ):
+            return current
+        self._end_cold_start()
+        return self._cold_start_goal()
+
+    def _cold_start_goal(self) -> float:
+        """ The way down after a cold start: the lower of the setpoint held before the vacation and the learned setpoint
+            (the one that exists, else target + COLD_GOAL_ABOVE), not below _lowest_heat(), not above max_temp. """
+        held, learned = self._heat_setpoint_before_vacation, self._learned_ceiling()
+        self._heat_setpoint_before_vacation = None
+        known = [v for v in (held, learned) if v is not None]
+        goal = min(known) if known else self.target_indoor_temp + COLD_GOAL_ABOVE * self.unit_scale
+        goal = max(goal, self._lowest_heat())
+        max_temp = self._max_temp()
+        if max_temp is not None:
+            goal = min(goal, max_temp)
+        self.ADapi.log(f"{self.heater}: cold start ended, setpoint {round_half(goal)}.", level = 'INFO')
+        return round_half(goal)
 
     def updateClimateTemperature(self, heater_temp, new_temperature, learn:bool = True) -> None:
         """ Updates climate with new temperature and learns the setpoint when it has been stable. """
@@ -647,7 +770,7 @@ class Heater:
             self.heater_temp_last_registered = self.ADapi.datetime(aware=True)
 
     def _may_learn(self) -> bool:
-        return True
+        return not self._cold_start
 
     def _send_temperature(self, temperature:float) -> None:
         self.ADapi.call_service('climate/set_temperature',
@@ -1070,6 +1193,7 @@ class Heater:
             has_fireplace = cfg.get('has_fireplace', False),
             max_setpoint_drop = cfg.get('max_setpoint_drop'),
             interval_s = self.interval,
+            cold_start_deficit = cfg.get('cold_start_deficit'),
         ))
         self.diagnostic_sensor = cfg.get('diagnostic_sensor')
         self._virtual_setpoint = None      # shadow: the setpoint and mode the controller proposed last,
@@ -1352,15 +1476,24 @@ class Aircondition(Heater):
         self._note_heat_setpoint(temperature)
 
     def _note_heat_setpoint(self, temperature:float) -> None:
-        """ Remembers the setpoint sent in heat (indoor mode, not on vacation or with a window open) without the
-            power-state offset in it. Used for the start after fan_only. """
+        """ Remembers the setpoint sent in heat (indoor mode; not on vacation, not with a window open, not during a cold
+            start) without the power-state offset in it. Used for the start after fan_only and after a vacation. """
         if (
             self.target_mode == 'indoor'
             and not self.vacation_state
             and not self.windows_is_open
+            and not self._cold_start
             and self.ADapi.get_state(self.heater, namespace = self.namespace) == 'heat'
         ):
             self._last_heat_setpoint = temperature - self._applied_offset
+
+    def _held_heat_setpoint(self):
+        """ The last setpoint sent in heat; before anything was sent (app start) the one the unit holds in heat. """
+        if self._last_heat_setpoint is not None:
+            return self._last_heat_setpoint
+        if self.ADapi.get_state(self.heater, namespace = self.namespace) != 'heat':
+            return None
+        return super()._held_heat_setpoint()
 
     def _setHeatingTempFromPersisten(self, **kwargs) -> None:
         """ Setpoint after fan_only -> heat (offset -1). Indoor mode: the setpoint held in heat before, with the learned
@@ -1373,12 +1506,6 @@ class Aircondition(Heater):
         if self._last_heat_setpoint is not None:
             temp = min(temp, self._last_heat_setpoint)
         self._send_temperature(round_half(max(temp, self._lowest_heat())))
-
-    def _learned_ceiling(self):
-        """ The learned setpoint for the present weather, None without learned data. """
-        if self.store is None or not self.store.device(self.heater).get('data'):
-            return None
-        return self._getHeatingTempFromPersisten()[0]
 
     def _heat_limits(self, heater_temp:float, in_temp:float, new_temperature:float) -> float:
         """ Indoor mode, normal power state. After the setpoint was lowered for an overshoot (instead of fan_only), the
@@ -1410,7 +1537,9 @@ class Aircondition(Heater):
 
     def _may_learn(self) -> bool:
         """ No learning within LEARN_AFTER_MODE_CHANGE of a mode change (cycling heat / fan_only teaches too high
-            setpoints) or while the unit reports an hvac_action other than heating / idle. """
+            setpoints) or while the unit reports an hvac_action other than heating / idle, nor during a cold start. """
+        if self._cold_start:
+            return False
         if (
             self._last_mode_change is not None
             and self.ADapi.datetime(aware=True) - self._last_mode_change < LEARN_AFTER_MODE_CHANGE
@@ -1530,6 +1659,10 @@ class Aircondition(Heater):
             if self._mode_seen is not None:
                 self._last_mode_change = self.ADapi.datetime(aware=True)
             self._mode_seen = ac_state
+        if ac_state != 'heat':
+            self._end_cold_start()
+            if ac_state != 'fan_only':
+                self._vacation_ended = False
 
         self._silence()
         self._window_notifications(real_in_temp)
@@ -1540,6 +1673,7 @@ class Aircondition(Heater):
 
             if self.windows_is_open:
                 self._clear_power_offset()
+                self._vacation_ended = False
                 self._set_hvac_mode('fan_only')
                 return
 
@@ -1580,6 +1714,8 @@ class Aircondition(Heater):
                 else:
                     for s in self.screening:
                         s.can_close_on_lux = False
+            elif self._vacation_ended:
+                new_temperature = self._after_vacation(in_temp)
             else:
                 new_temperature = self._heat_setpoint(heater_temp, in_temp, real_in_temp)
                 learn = self.target_mode == 'indoor' and not shifted and self.power_state == 'normal'
@@ -1711,7 +1847,10 @@ class Aircondition(Heater):
                 elif in_temp <= self.target_indoor_temp:
                     self._set_hvac_mode('heat')
                     # Set new temperature after change to heating
-                    self.ADapi.run_in(self._setHeatingTempFromPersisten, 10, offset = -1)
+                    if self._vacation_ended:
+                        self.ADapi.run_in(self._set_indoortemp, 10)   # the heat run starts after the vacation
+                    else:
+                        self.ADapi.run_in(self._setHeatingTempFromPersisten, 10, offset = -1)
                     return
             elif not self.windows_is_open: # And vacation
                 if (
@@ -1724,6 +1863,7 @@ class Aircondition(Heater):
                 elif in_temp > self.max_vacation_temp:
                     self._set_hvac_mode('cool')
                     self.ADapi.run_in(self._set_indoortemp, 20)
+            self._vacation_ended = False   # still fan_only (room above target, or a window open): no start after the vacation
 
             if self.weather.out_temp > float(self.screening_temp):
                 for s in self.screening:

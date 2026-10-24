@@ -35,10 +35,12 @@ TABLE_INTERVAL = 900    # seconds between runs, table mode (as the ElectricalMan
 UNIT_DEFAULTS = {
     'C': {'max_vacation_temp': 30, 'vacation_temp': 16, 'screening_temp': 8,
           'getting_cold': 18, 'target_indoor_temp': 22.7,
-          'unit': 'C', 'comfort_guard': 1.5, 'solar_max': 3.0, 'max_setpoint_drop': 3.0},
+          'unit': 'C', 'comfort_guard': 1.5, 'solar_max': 3.0, 'max_setpoint_drop': 3.0,
+          'cold_start_deficit': 2.0},
     'F': {'max_vacation_temp': 86, 'vacation_temp': 61, 'screening_temp': 47,
           'getting_cold': 65, 'target_indoor_temp': 72.8,
-          'unit': 'F', 'comfort_guard': 2.7, 'solar_max': 5.4, 'max_setpoint_drop': 5.4},
+          'unit': 'F', 'comfort_guard': 2.7, 'solar_max': 5.4, 'max_setpoint_drop': 5.4,
+          'cold_start_deficit': 3.6},
 }
 
 CONTROLLERS = ('classic', 'shadow', 'adaptive')
@@ -222,6 +224,7 @@ class DeviceConfig(_Model):
     interval_minutes: float | None = Field(default=None, ge=1, le=120)   # None: 30 min indoor, 15 min table
     trend_hold_hours: float = Field(default=2.0, ge=0, le=12)   # classic: no setpoint move while the room reaches target within this
     max_setpoint_drop: float | None = Field(default=None, gt=0, le=15)   # HVAC heat, indoor: lowest setpoint target - this. None: UNIT_DEFAULTS
+    cold_start_deficit: float | None = Field(default=None, ge=0.5, le=10)   # indoor: vacation end with the room this far below target: cold start. None: UNIT_DEFAULTS
 
     rain_level: float = 3
     anemometer_speed: float = 40
@@ -372,6 +375,7 @@ class DeviceConfig(_Model):
             'has_fireplace': self.has_fireplace,
             'trend_hold_hours': self.trend_hold_hours,
             'max_setpoint_drop': self.max_setpoint_drop if self.max_setpoint_drop is not None else defaults['max_setpoint_drop'],
+            'cold_start_deficit': self.cold_start_deficit if self.cold_start_deficit is not None else defaults['cold_start_deficit'],
             'notify_receiver': [self.notify_receiver] if isinstance(self.notify_receiver, str) else self.notify_receiver,
             # Indoor controller (cc_control.py)
             'controller': self.controller,
