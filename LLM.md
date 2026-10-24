@@ -11,7 +11,7 @@ Read this with [README.md](README.md). The workflow for finding the user's real 
 
 ## What the app does
 
-Controls one climate entity per app (heater or HVAC) and optional screening covers. It sets the temperature (and for HVAC the mode heat / cool / fan_only, the fan *Silence* mode and the *boost* preset). It acts on its own every 12 minutes (15 in table mode; `interval_minutes` changes it per device), so the user must say yes before it is added. It needs the [ad-Weather](https://github.com/Pythm/ad-Weather) app for outdoor values. ElectricalManagement can send it save / spend / reduce states.
+Controls one climate entity per app (heater or HVAC) and optional screening covers. It sets the temperature (and for HVAC the mode heat / cool / fan_only, the fan *Silence* mode and the *boost* preset). It acts on its own every 30 minutes (15 in table mode; `interval_minutes` changes it per device), so the user must say yes before it is added. It needs the [ad-Weather](https://github.com/Pythm/ad-Weather) app for outdoor values. ElectricalManagement can send it save / spend / reduce states.
 
 ## Config (apps.yaml), one app per climate entity
 
@@ -94,7 +94,7 @@ When to suggest what:
 - Heater or HVAC, and which target method: a fixed indoor temperature, or a table by outdoor temperature (and the table values). Never invent table offsets.
 - Two temperature sensors of one kind (two in one room, or a window sensor and a room sensor): ALWAYS ask how they are used: main and backup in the same room, a sensor on another side of the house, or something else. Never decide from names or areas. A window sensor is only for sun detection; ask where it sits (airflow, above a heater, in direct sun) because that changes how its readings must be read.
 - HVAC (heat pump) that heats: "Does this room have a fireplace (or another heat source that can make it overshoot fast, such as a wood stove)?" ALWAYS ask, never decide from the room name or area. Yes: `options: [has_fireplace]` (heat to fan_only at once at target + 0.6, as before 1.4.0). No: leave it out (the setpoint is lowered first and fan_only comes only at the lowest setpoint or while the room still rises). See README "Heat pump cycling".
-- `interval_minutes`: leave it out (12 min) unless the user asks or reports a unit that cycles between heat and fan_only with its room sensor in the unit's air flow; then suggest 30 and say why (each change gets time to show). Never set it below 12 without a reason from the user.
+- `interval_minutes`: leave it out (30 min default) unless the user asks for faster reactions (12 was the default before this version) or has a room sensor that needs it; say that a shorter interval can chase a sensor in the unit's air flow. Never set it below 12 without a reason from the user.
 - Which windows belong to the room, and whether an open window should lower the heat at all.
 - Vacation: which `input_boolean`, the vacation temperature, and whether the heater may be turned off (`vacation_keep_off`).
 - Whether a window sensor exists at all and where it sits (see above). Whether the room needs different targets in different seasons (then an outdoor-temperature table, never invented values).

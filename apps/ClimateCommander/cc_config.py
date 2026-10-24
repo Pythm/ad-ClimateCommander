@@ -28,7 +28,7 @@ APP_LEVEL_KEYS = (
     'vacation_temp', 'max_vacation_temp', 'screening_temp', 'getting_cold', 'getting_hot_offset',
     'rain_level', 'anemometer_speed', 'spend_temp_offset', 'notify_receiver', 'cloud_cover',
 )
-INDOOR_INTERVAL = 720   # seconds between runs, indoor-target mode (unchanged from earlier versions)
+INDOOR_INTERVAL = 1800  # seconds between runs, indoor-target mode (30 min; was 12 min before 1.4.0 dev, interval_minutes: 12 gives that back)
 TABLE_INTERVAL = 900    # seconds between runs, table mode (as the ElectricalManagement heaters)
                         # (interval_minutes replaces both for one device)
 
@@ -219,7 +219,7 @@ class DeviceConfig(_Model):
     vacation_keep_off: bool = False
     options: List[str] = Field(default_factory=list)   # flags: vacation_keep_off, has_fireplace (unknown names ignored)
 
-    interval_minutes: float | None = Field(default=None, ge=1, le=120)   # None: 12 min indoor, 15 min table
+    interval_minutes: float | None = Field(default=None, ge=1, le=120)   # None: 30 min indoor, 15 min table
     trend_hold_hours: float = Field(default=2.0, ge=0, le=12)   # classic: no setpoint move while the room reaches target within this
     max_setpoint_drop: float | None = Field(default=None, gt=0, le=15)   # HVAC heat, indoor: lowest setpoint target - this. None: UNIT_DEFAULTS
 
