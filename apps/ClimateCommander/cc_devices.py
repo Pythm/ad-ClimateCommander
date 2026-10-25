@@ -32,7 +32,7 @@ import bisect
 import datetime
 import math
 
-from cc_control import ControlConfig, IndoorController, Inputs, ls_slope_h
+from cc_control import ControlConfig, IndoorController, Inputs, ROOM_STALE_S, ls_slope_h
 
 UNAVAIL = ('unavailable', 'unknown')
 POWER_STATES = ('normal', 'save', 'spend', 'reduce')
@@ -53,6 +53,9 @@ COLD_START_MAX = 6.0               # vacation end, indoor mode: the cold start s
 COLD_BACK_WITHIN = 1.0             # ... and is held until the room is this close to target (x unit_scale) ...
 COLD_START_MAX_TIME = datetime.timedelta(hours = 8)   # ... or this long after the vacation end
 COLD_GOAL_ABOVE = 1.0              # way down without a held or learned setpoint: target + this (x unit_scale)
+ROOM_SCREEN_EVERY = datetime.timedelta(minutes = 5)   # room trigger (_room_screens): at most one screen-close attempt per device
+                                   # this often. A room sensor in the airflow reports every few seconds, and every attempt
+                                   # reads several HA states per screen; one try per 5 min is still 6 times the run cadence.
 DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
              'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl')
 
@@ -157,6 +160,7 @@ class Heater:
         self.trend_hold_hours:float = cfg.get('trend_hold_hours', 2.0)
         self._room_hist:dict = {'primary': [], 'backup': []}   # (report time, value) of distinct reports per sensor
         self._in_source:str = 'primary'    # the sensor get_in_temp used last
+        self._room_screen_last = None      # when the room trigger last tried to close the screens (ROOM_SCREEN_EVERY)
         for source, entity in (('primary', self.indoor_sensor_temp), ('backup', self.backup_indoor_sensor_temp)):
             if entity:
                 self.ADapi.listen_state(self._room_reported, entity,
@@ -322,6 +326,7 @@ class Heater:
 
     def _room_reported(self, entity, attribute, old, new, **kwargs) -> None:
         self._note_room(kwargs.get('source', 'primary'), entity)
+        self._room_screens(kwargs.get('source', 'primary'))
 
     def _updateTarget(self, entity, attribute, old, new, **kwargs) -> None:
         value = to_float(new)
@@ -366,6 +371,81 @@ class Heater:
         """ Tries to open screens on weather updates from rain and lux sensors """
         for s in self.screening:
             s.check_if_try_screen_open()
+
+    # ------------------------------------------------------------------ #
+    # Screens between runs: the room trigger (a report from the room sensor in use)
+    # ------------------------------------------------------------------ #
+
+    def _room_warm(self, room:float) -> bool:
+        """ The normal close condition of the runs: the room above target + 0.2 and no wind for 45 min. """
+        return (
+            room > self.target_indoor_temp + 0.2
+            and self.ADapi.datetime(aware=True) - self.last_windy_time > datetime.timedelta(minutes = 45)
+        )
+
+    def _heater_room_warm(self, room:float) -> bool:
+        """ The heater's close condition: on vacation the room above target (no +0.2, no wind check, as the classic
+            vacation branch), otherwise _room_warm. The outdoor check (screening_temp) is separate. """
+        if self.vacation_state:
+            return room > self.target_indoor_temp
+        return self._room_warm(room)
+
+    def _screen_room(self):
+        """ (room value, 'primary' / 'backup') for the room trigger, read only. Controller adaptive: the indoor sensor
+            when it reported within ROOM_STALE_S, else the backup plus the controller's learned bias, never the
+            estimate. Classic and shadow: the sensor the classic run would use (_room_now). (None, None) without one. """
+        if self.controller != 'adaptive' or self.ctrl is None:
+            return self._room_now()
+        room, age = self._sensor_reading(self.indoor_sensor_temp)
+        if room is not None and age <= ROOM_STALE_S:
+            return room, 'primary'
+        backup, age = self._sensor_reading(self.backup_indoor_sensor_temp)
+        if backup is not None and age <= ROOM_STALE_S:
+            return backup + (self.ctrl.backup_bias or 0.0), 'backup'
+        return None, None
+
+    def _room_screen_rule(self, room:float) -> bool:
+        """ Whether the room trigger may try to close the screens now: the close rule of the run that is in control,
+            on the raw room value. Classic and shadow: heaters (indoor and table mode) use the heater rule; an HVAC only
+            in heat and not on vacation (cool, fan_only, off and the HVAC vacation rule are left to the run).
+            Adaptive: the _controller_screens rule in every mode but cool. """
+        out_warm = self.weather.out_temp > self.screening_temp
+        state = self.ADapi.get_state(self.heater, namespace = self.namespace)
+        if self.controller == 'adaptive':
+            if self.hvac:
+                if state not in ('heat', 'fan_only', 'off'):
+                    return False
+                return out_warm and self._room_warm(room)
+            if state is None or state in UNAVAIL:
+                return False
+            return out_warm and self._heater_room_warm(room)
+        if self.hvac:
+            if state != 'heat' or self.vacation_state:
+                return False
+            return out_warm and self._room_warm(room)
+        return out_warm and self._heater_room_warm(room)
+
+    def _room_screens(self, source:str) -> None:
+        """ Room trigger, called from _room_reported: closes the screens between runs as soon as the room sensor in use
+            says the room is warm, instead of up to one interval later. It only closes (Screen.try_screen_close, which
+            applies rain, wind, Screen windows, not_when_home, lux and cloud cover): it never clears can_close_on_lux
+            and never touches the setpoint, the HVAC mode or any state of the run. At most one attempt per
+            ROOM_SCREEN_EVERY; a report from the sensor that is not in use is ignored. """
+        if not getattr(self, 'screening', None) or self._automation_off() or self.windows_is_open or self._vacation_ended:
+            return
+        if self.target_indoor_temp is None:
+            return
+        room, picked = self._screen_room()
+        if room is None or picked != source:
+            return
+        now = self.ADapi.get_now()
+        if self._room_screen_last is not None and now - self._room_screen_last < ROOM_SCREEN_EVERY:
+            return
+        if not self._room_screen_rule(room):
+            return
+        self._room_screen_last = now
+        for s in self.screening:
+            s.try_screen_close()
 
     # ------------------------------------------------------------------ #
     # Reading sensors
@@ -434,23 +514,32 @@ class Heater:
             return False, True
         return False, False
 
-    def get_in_temp(self):
-        """ Indoor temperature from the indoor sensor. Uses the backup sensor when the indoor sensor
-            is unavailable or has not reported for an hour. None when there is no usable value. """
+    def _room_now(self):
+        """ (value, source) of the room sensor the run uses, with no side effects: the indoor sensor when it has a value
+            and reported within STALE_SENSOR, else the backup sensor ('backup'); without a usable backup the stale
+            indoor value ('primary', better than nothing); (None, None) when there is no value at all. """
         in_temp = None
-        self._in_source = 'primary'
         if self.indoor_sensor_temp is not None:
             in_temp = to_float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = self.namespace))
             stale = in_temp is not None and self._sensor_age(self.indoor_sensor_temp) > STALE_SENSOR
             if in_temp is not None and not stale:
-                return in_temp
+                return in_temp, 'primary'
         if self.backup_indoor_sensor_temp is not None:
             backup = to_float(self.ADapi.get_state(self.backup_indoor_sensor_temp, namespace = self.namespace))
             if backup is not None:
-                self.ADapi.log(f"{self.heater}: using backup indoor temp {backup}", level = 'DEBUG')
-                self._in_source = 'backup'
-                return backup
-        return in_temp   # a stale value is better than nothing when there is no usable backup sensor
+                return backup, 'backup'
+        return in_temp, ('primary' if in_temp is not None else None)
+
+    def get_in_temp(self):
+        """ Indoor temperature from the indoor sensor. Uses the backup sensor when the indoor sensor
+            is unavailable or has not reported for an hour. None when there is no usable value.
+            Remembers the sensor used (_in_source, for the trend) and logs the backup use. """
+        in_temp, source = self._room_now()
+        self._in_source = 'primary'
+        if source == 'backup':
+            self.ADapi.log(f"{self.heater}: using backup indoor temp {in_temp}", level = 'DEBUG')
+            self._in_source = 'backup'
+        return in_temp
 
     def get_heater_temp(self):
         """ Returns set heater temperature for the climate entity. """
@@ -600,7 +689,7 @@ class Heater:
 
         learn = False
         if self.windows_is_open:
-            new_temperature = self.vacation_temp
+            new_temperature = self._window_open_temp()
             self._clear_power_offset()
             self._vacation_ended = False
 
@@ -611,6 +700,10 @@ class Heater:
                 if self.weather.out_temp > self.screening_temp:
                     for s in self.screening:
                         s.try_screen_close()
+            else:
+                # Room not warm: an armed close attempt must not wait for the next bright moment (as the HVAC run)
+                for s in self.screening:
+                    s.can_close_on_lux = False
         elif self._vacation_ended:
             new_temperature = self._after_vacation(in_temp)
         else:
@@ -627,6 +720,10 @@ class Heater:
                 if self.weather.out_temp > self.screening_temp:
                     for s in self.screening:
                         s.try_screen_close()
+            else:
+                # Room not warm (or wind within 45 min): stop waiting for lux, as the HVAC run does
+                for s in self.screening:
+                    s.can_close_on_lux = False
 
         self.updateClimateTemperature(heater_temp = heater_temp, new_temperature = new_temperature, learn = learn)
 
@@ -1037,11 +1134,14 @@ class Heater:
             current_target_temp = self.min_temp   # nothing configured: the climate's own minimum
         return current_target_temp
 
-    def _table_in_temp(self):
-        in_temp = self.get_in_temp()
-        if in_temp is None:
-            in_temp = to_float(self.ADapi.get_state(self.heater, attribute = 'current_temperature', namespace = self.namespace))
-        return in_temp
+    def _window_open_temp(self) -> float:
+        """ Setpoint of an indoor mode heater with a window open: the lowest of vacation_temp and, when one is
+            configured, save_temp (a heater whose vacation_temp is above its save_temp must not heat more for an
+            open window than for a save period). Same rule as table mode (_apply_reduce); nothing configured for
+            save means vacation_temp, as before. """
+        if self.save_temp is not None:
+            return min(self.vacation_temp, self.save_temp)
+        return self.vacation_temp
 
     def _apply_reduce(self) -> None:
         """ Overconsumption and open windows: the lowest of the save and the vacation temperature
@@ -1111,6 +1211,20 @@ class Heater:
             new_temperature = self.min_temp
         return new_temperature
 
+    def _table_screens(self, room) -> None:
+        """ Table-mode heater: screens as in indoor mode, on the room sensor only (not the climate's own sensor) and
+            with target_indoor_temp. Closes with the heater rule (normal / vacation), else clears can_close_on_lux
+            as the HVAC run does. Without a room value or a target nothing happens. """
+        if not self.screening or room is None or self.target_indoor_temp is None:
+            return
+        if self._heater_room_warm(room):
+            if self.weather.out_temp > self.screening_temp:
+                for s in self.screening:
+                    s.try_screen_close()
+        else:
+            for s in self.screening:
+                s.can_close_on_lux = False
+
     def _table_cycle(self) -> None:
         if not self.weather.out_temp_known:
             # The table needs the outdoor temperature. Wait for the Weather app instead of using a default.
@@ -1126,7 +1240,10 @@ class Heater:
         heater_temp = self.get_heater_temp()
         if heater_temp is None:
             heater_temp = self.target_heater_temp
-        in_temp = self._table_in_temp()
+        room = self.get_in_temp()
+        in_temp = room
+        if in_temp is None:
+            in_temp = to_float(self.ADapi.get_state(self.heater, attribute = 'current_temperature', namespace = self.namespace))
         self._window_notifications(in_temp)
 
         if self.windows_is_open:
@@ -1140,6 +1257,7 @@ class Heater:
                 )
                 self.off_retry_count -= 1
             return
+        self._table_screens(room)
 
         new_temperature = self._table_setpoint(in_temp, vacation = self.vacation_state)
         if heater_temp != round_half(new_temperature):
@@ -1334,22 +1452,22 @@ class Heater:
         self._controller_report(dec, holds, mode, classic_setpoint, classic_mode)
 
     def _controller_screens(self, room, mode:str) -> None:
-        """ Screens as in classic: always tried in cool, else when the room is 0.2 above target, no wind for 45 min
-            and the outdoor temperature is above screening_temp. """
+        """ Screens as in classic: an HVAC always tries in cool, else when the room is 0.2 above target, no wind for
+            45 min and the outdoor temperature is above screening_temp; a heater uses the classic heater rule (on
+            vacation: room above target, no wind check). When the room is not warm enough, can_close_on_lux is
+            cleared (heaters too, so an armed attempt does not close on the next bright moment regardless of the room). """
         if not self.screening or room is None:
             return
         if mode == 'cool':
             for s in self.screening:
                 s.try_screen_close()
             return
-        if (
-            room > self.target_indoor_temp + 0.2
-            and self.ADapi.datetime(aware=True) - self.last_windy_time > datetime.timedelta(minutes = 45)
-        ):
+        warm = self._room_warm(room) if self.hvac else self._heater_room_warm(room)
+        if warm:
             if self.weather.out_temp > self.screening_temp:
                 for s in self.screening:
                     s.try_screen_close()
-        elif self.hvac:
+        else:
             for s in self.screening:
                 s.can_close_on_lux = False
 

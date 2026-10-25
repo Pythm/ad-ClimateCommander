@@ -50,6 +50,10 @@ One app controls one climate entity: a heater (floor heating, panel heater) or a
 - **The app now has three more files**, `cc_devices.py`, `cc_config.py` and `cc_control.py`, next to `climateCommander.py` and `weather_data.py`. Copy the whole app folder when you update (HACS does).
 - **New, optional: `controller: shadow` / `controller: adaptive`**, a different way to find the setpoint, per device. The default `classic` is the controller described in this README. See [Adaptive controller](#adaptive-controller-optional).
 - **The configuration is validated with pydantic** (`cc_config.py`). A value of the wrong type (for example `window_offset: abc`, or a table entry without `out`) now logs an ERROR naming the key: an invalid device is skipped, an invalid app-level key stops that app. Before, such a value was silently used or crashed later (`vacation_temp: abc` used to fall back to 10). A single entity where a list is expected (for example `windowsensors: binary_sensor.x`) is accepted as a one-item list. See [Validation](#validation).
+- **Screens react to the room sensor** between runs, see [Room trigger](#room-trigger). Nothing to configure. In short: screens close within seconds of the room getting warm (and bright) instead of up to one interval later, and on borderline days with a sensor in the airflow they may close more often than before.
+- **Table mode heaters now close screens** (they never did): the same rule as an indoor mode heater, with `indoor_sensor_temp` and `target_indoor_temp`.
+- **Indoor mode heaters, open window:** the setpoint is the lowest of `vacation_temp` and `save_temp` (when `save_temp` is set). Before it was always `vacation_temp`, so a heater with a `vacation_temp` above its `save_temp` heated more for an open window than for a save period. Nothing changes without `save_temp`. Table mode did this already; HVAC goes to `fan_only`.
+- **Heaters stop waiting for lux** when the room is not warm. Before, after one attempt that failed on lux, any later bright `WEATHER_CHANGE` could close a heater's screens with no check of the room, until a restart. With `controller: adaptive` a heater on vacation uses the vacation rule (room above the target).
 - **New key `cloud_cover`** (default `90`): screens close only while the cloud cover from the Weather app is below this percentage. Before, the limit was fixed at 90, so the default keeps the old behaviour. See [Screens and covers](#screens-and-covers).
 - Behaviour changes in the indoor-target mode (HVAC, and heaters without a table):
   - The learned setpoints are no longer updated on vacation, with open windows, during `daytime_savings` / `daytime_increasing` or while ElectricalManagement sends `save`, `spend` or `reduce`. Before, vacation temperatures were learned and pulled the setpoint down after a vacation.
@@ -274,7 +278,7 @@ The target is `target_indoor_temp`, or the value of `target_indoor_input` (an `i
 
 **Learning (needs `json_path`).** When the setpoint has not changed for 2 hours (and at most once every 2 hours), the setpoint is stored as a running average for the current outdoor temperature (2-degree steps) and outdoor lux (5000-lux steps). A learned setpoint counts as valid when it exists for the current outdoor temperature and lux step and has at least 10 samples. After 100 samples the count is set back to 10, so recent samples weigh more. Learning happens only in normal operation: not with open windows, not on vacation, not during `daytime_savings` or `daytime_increasing`, not while ElectricalManagement sends `save`, `spend` or `reduce`, and not while an HVAC unit cools. An HVAC also learns nothing within 2 hours of a mode change (heat, `fan_only`, cool, off; by the app or by hand), and nothing while the climate reports an `hvac_action` other than `heating` or `idle`. Without `json_path` nothing is learned and the current setpoint is the reference.
 
-**Open windows** (any `windowsensors` entity `on` for 2 minutes): the setpoint becomes `vacation_temp`. HVAC switches to `fan_only` instead, see [HVAC modes](#hvac-modes-fan-and-preset).
+**Open windows** (any `windowsensors` entity `on` for 2 minutes): the heater setpoint becomes `vacation_temp`, or `save_temp` when that is set and lower (the lowest of the two, as in table mode). HVAC switches to `fan_only` instead, see [HVAC modes](#hvac-modes-fan-and-preset).
 
 **Vacation** (`vacation` entity `on`): the setpoint becomes `vacation_temp` (default 16 C / 61 F). When it ends, see [Cold start after vacation](#cold-start-after-vacation).
 
@@ -544,7 +548,9 @@ If a unit still cycles after these changes, look at its learned setpoints for th
 
 Each device can control a list of covers under `screening`. The covers need a `current_position` attribute (100 = open).
 
-**Closing.** A device tries to close its screens in its own run when the room is warm:
+**Closing.** A device tries to close its screens in its own run when the room is warm, and also **between runs**: every time the room sensor in use reports a new value (see [Room trigger](#room-trigger)).
+
+The rules of the run:
 
 | Device and situation | Tries to close when |
 |---|---|
@@ -553,7 +559,7 @@ Each device can control a list of covers under `screening`. The covers need a `c
 | HVAC on vacation in `heat` | when it switches to `fan_only` (see above) and outdoor temperature above `screening_temp` |
 | HVAC in `cool` | every run |
 | HVAC in `fan_only` | every run with outdoor temperature above `screening_temp` |
-| Table mode heater | never (screens only open) |
+| Table mode heater (needs `indoor_sensor_temp` and `target_indoor_temp`) | same as an indoor mode heater, normal operation and vacation |
 
 A close attempt closes a cover only when all of these are true:
 - no rain (rain is 0) and wind below `anemometer_speed`,
@@ -563,7 +569,18 @@ A close attempt closes a cover only when all of these are true:
 - cloud cover below `cloud_cover` (default 90 %),
 - the cover is fully open (position 100) and has not been moved by hand since the app last moved it.
 
-If the attempt fails only because of lux or cloud cover, the screen waits: on the next `WEATHER_CHANGE` event with lux at or above `lux_close` and cloud cover below `cloud_cover`, it tries again. An HVAC run where the room is no longer warm stops the waiting.
+If the attempt fails only because of lux or cloud cover, the screen waits: on the next `WEATHER_CHANGE` event with lux at or above `lux_close` and cloud cover below `cloud_cover`, it tries again. A run where the room is no longer warm stops the waiting (heaters too, since this version).
+
+### Room trigger
+
+Closing used to wait for the next run, up to 30 minutes after the room got warm. Now the indoor sensor (`indoor_sensor_temp`, or `backup_indoor_sensor_temp` while the indoor sensor is unavailable or has not reported for an hour) triggers a close attempt as soon as it reports a value that satisfies the same rule as the run. Nothing to configure, it is always on.
+
+- It uses the sensor's raw value. The daytime shifts of the run (`daytime_savings`, `daytime_increasing`) and wind and rain corrections are not applied, and there is no hold time.
+- It only closes screens. It never changes the setpoint or the HVAC mode, never writes the learned data and never clears the waiting for lux (the run does that).
+- At most one attempt per device every 5 minutes, however often the sensor reports.
+- Heaters (indoor and table mode): the heater rules in the table above. HVAC: only in `heat`, not on vacation; `cool`, `fan_only`, `off` and the vacation rule stay with the run. With `controller: adaptive` the controller's rule is used in every mode except `cool`, with the indoor sensor, or the backup sensor plus its learned bias; the estimate is never used.
+- Nothing happens without an indoor or backup sensor, without `target_indoor_temp`, while a device window sensor is `on`, or right after a vacation ended.
+- A room sensor that sits in the airflow of the unit swings and may cross the limit more often than the run noticed. The close attempt still needs the lux, cloud cover, wind, rain and window conditions below.
 
 **`cloud_cover`** is a number (percent). The cloud cover comes from the Weather app's `WEATHER_CHANGE` event. If the Weather app does not send it, the value is 0 and this check always passes. Set it per app (one-device apps), per list entry, or once at the app level in the deprecated list style, where every device inherits it. It applies to all screens of the device; it cannot be set per screen.
 
@@ -671,7 +688,7 @@ In a one-device app these go at the top level. In the deprecated list style they
 | `target_heater_temp` | number | no | `target_indoor_temp` | Table mode: heater setpoint at offset 0. |
 | `target_heater_input` | entity | no | `target_indoor_input` if neither heater key is set | Table mode: `input_number` for the heater setpoint. |
 | `save_temp_offset` | number | no | -0.3 in indoor mode, none in table mode | Indoor mode: added to the held setpoint in `save` and `reduce`. Table mode: rule 1 of the save temperature. |
-| `save_temp` | number | no | none | Table mode: save temperature (the entry's `offset` is added). |
+| `save_temp` | number | no | none | Table mode: save temperature (the entry's `offset` is added). Indoor mode heater: an open window sets the lowest of `vacation_temp` and `save_temp`. |
 | `spend_temp_offset` | number | no | 1 | Added in `spend` (subtracted when cooling). Inherit. |
 | `vacation` | entity | no | app-level `vacation` | Own vacation `input_boolean` for this device. |
 | `vacation_temp` | number | no | indoor mode 16 C / 61 F; table mode none | Vacation setpoint. In table mode the entry's `offset` is added. Inherit. |

@@ -106,6 +106,8 @@ When to suggest what:
 
 ## Behaviour not to "fix"
 
+- Open window: an indoor mode heater gets the lowest of `vacation_temp` and `save_temp` (if set); table mode the lowest of save and vacation; an HVAC goes to `fan_only` and its setpoint is not touched.
+- Screens also close from the room sensor between runs (the room trigger, always on): raw room value, at most one attempt per 5 minutes, closes only, never touches the setpoint or the HVAC mode and never clears the wait for lux. There is deliberately no `fan_only` on screen close (the solar gain disappears and the unit would cycle). Table mode heaters close screens too. Do not add a setting for any of this unless the user asks.
 - Indoor mode: small drops are rounded to -0.5 after 30 min, small rises wait 30 min (deliberate asymmetry); the extra -1 after 4 h turned down is deliberate in the current (classic) controller; cooling setpoints are not learned.
 - Table mode: open windows and `reduce` use the LOWEST of the save and vacation temperature (owner decision). An entry applies from its `out` value and up.
 - Learned setpoints are only updated in normal operation (not on vacation, open window, daytime savings/increasing or ElectricalManagement states); an HVAC learns nothing within 2 h of a mode change or while `hvac_action` is not heating/idle.

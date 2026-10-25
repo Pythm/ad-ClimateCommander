@@ -863,6 +863,8 @@ class IndoorController:
             if cfg.kind == 'hvac' and inp.windows_open:
                 self._mode(d, now, 'fan_only', forced = True)
                 return
+            if inp.windows_open and cfg.save_temp is not None:
+                vac = min(vac, cfg.save_temp)   # open window: the lowest of vacation and save (as table mode)
             self._send(d, inp, now, vac, bypass = True)
             if (cfg.kind == 'hvac' and src in ('primary', 'backup')
                     and self.in_f > inp.target - 3 * s and self.in_f > vac + 3 * s):
