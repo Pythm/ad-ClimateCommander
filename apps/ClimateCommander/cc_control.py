@@ -3,8 +3,10 @@
     Identical copy of the harness prototype: apps/ClimateCommander/cc_control.py and
     .claude/audit_out/cc_harness/proto_controller.py must stay byte-identical; change both. No AppDaemon
     imports. The caller (cc_devices.py in the app, proto.py in the harness) reads the entities, fills an Inputs, calls
-    IndoorController.update() once per control run (and on window/vacation/power events) and carries out the
-    returned Decision (temperature, hvac_mode, preset, logs, save).
+    IndoorController.update() once per control run (periodic, on window/vacation/power events and, in indoor mode, on
+    new room and window sensor reports at most once per min_run_gap_minutes) and carries out the returned Decision
+    (temperature, hvac_mode, preset, logs, save, retry_s). Runs need not be evenly spaced: the integrals are weighted
+    by time, and learning and smoothing go by time, not by the number of runs.
 
     Design: PLAN_CC_indoor_control_opus.md sections 3 and 4 and DESIGN_ADDENDUM_steer.md, with the owner
     answers of 2026-10-22/23. Heating:
@@ -37,8 +39,10 @@ from dataclasses import dataclass, field
 VERSION = 1
 MIN_CHANGE_S = 720              # owner: at most one setpoint change per 12 min
 STEP = 0.5                      # the start after fan_only is this far below sp_ctrl
-ROOM_STALE_S = 3600             # room and backup sensor fresh when reported within 1 h (as classic)
+ROOM_STALE_S = 3600             # room and backup sensor fresh when reported within 1 h (as classic), unless
+                                #    room_sensor_stale_minutes / backup_sensor_stale_minutes say otherwise
 WINDOW_STALE_S = 12 * 3600      # window sensor: the live ones report only on a ~1 C change, up to 14 h apart
+                                #    (window_sensor_stale_minutes replaces this)
 EST_TAU_S = 3600                # smoothing of the internal-sensor estimate (climate sensors report in 0.5-1 steps)
 MODE_MIN_S = 1800               # HVAC: minimum time in heat / fan_only / cool before an automatic switch
 FAN_ABOVE = 0.6                 # (deg) heat -> fan_only when the room is this far above target_eff ...
@@ -76,7 +80,7 @@ TRIM_CLAMP = 2.0                # (deg) table mode: trim integral bound
 DAY_TAU_S = 24 * 3600           # out_day filter (target_table)
 TARGET_TABLE_HOLD_S = 24 * 3600 # target_table entry changes at most once a day
 SAVE_EVERY_S = 3600             # persist at most once an hour (and on power-state changes)
-BACKUP_ALPHA = 0.1              # EWMA of primary minus backup while both are fresh
+BACKUP_ALPHA = 0.1              # EWMA of primary minus backup while both are fresh, this much per interval_s (by time)
 # learned relations (LearnedGap, addendum 1.1)
 GAP_BW = 2.0                    # (deg) bin width (4 F)
 N_USE = 5                       # smallest bin used
@@ -84,7 +88,8 @@ N_VALID = 30                    # outlier rejection starts here
 N_PRIOR_WR = 10                 # prior weight of the wind / rain terms
 N_FORGET = 300                  # floor of the learning rate: 1 / N_FORGET
 REJECT = 5.0                    # (deg) outlier limit
-SAMPLE_MIN_S = 600              # at most one learning sample per control run
+SAMPLE_MIN_S = 600              # learning samples and sun-trend points: at most one per this or interval_s, the longer
+                                #    (extra runs on sensor reports must not learn faster)
 QUIET_LUX = 500                 # window baseline learns only below this lux ...
 SUN_LUX = 2000                  # ... and SUN_COOL_S after lux was last at or above this
 SUN_COOL_S = 3600
@@ -305,8 +310,11 @@ class ControlConfig:
     target_heater_temp: float | None = None
     has_fireplace: bool = False           # HVAC: heat -> fan_only at FAN_ABOVE without waiting for the lower clamp or a rise
     max_setpoint_drop: float | None = None    # HVAC heat: lowest setpoint below target, device unit (None: 3 C / 5.4 F)
-    interval_s: float = 720.0             # seconds between control runs (interval_minutes)
+    interval_s: float = 720.0             # seconds between the periodic runs (interval_minutes)
     cold_start_deficit: float | None = None   # vacation end: cold start when the room is this far below target (None: 2 C / 3.6 F)
+    room_stale_s: float | None = None     # room_sensor_stale_minutes in seconds (None: ROOM_STALE_S)
+    backup_stale_s: float | None = None   # backup_sensor_stale_minutes in seconds (None: ROOM_STALE_S)
+    window_stale_s: float | None = None   # window_sensor_stale_minutes in seconds (None: WINDOW_STALE_S)
 
 
 @dataclass
@@ -347,6 +355,7 @@ class Decision:
     hvac_mode: str | None = None          # send climate/set_hvac_mode (before the temperature)
     preset: str | None = None             # send climate/set_preset_mode
     save: bool = False                    # persist snapshot() now
+    retry_s: float | None = None          # a normal change waits for MIN_CHANGE_S: run again in this many seconds
     logs: list = field(default_factory = list)    # (level, text)
     diag: dict = field(default_factory = dict)    # terms, for shadow logging and the diagnostic sensor
 
@@ -380,6 +389,9 @@ class IndoorController:
         self.bias = LearnedGap(bw, cfg.internal_offset_table, None, self.t.n_prior, s)
         self.guard = cfg.comfort_guard if cfg.comfort_guard is not None else COMFORT_GUARD * s
         self.solar_max = cfg.solar_max if cfg.solar_max is not None else SOLAR_MAX * s
+        self.room_stale = cfg.room_stale_s if cfg.room_stale_s is not None else ROOM_STALE_S
+        self.backup_stale = cfg.backup_stale_s if cfg.backup_stale_s is not None else ROOM_STALE_S
+        self.window_stale = cfg.window_stale_s if cfg.window_stale_s is not None else WINDOW_STALE_S
         # signal state
         self.out_slow = self.out_day = None
         self.in_f = None
@@ -389,6 +401,7 @@ class IndoorController:
         self.backup_bias = None
         self.solar_f = 0.0
         self.exc_hist = []
+        self.window_prev = None           # the window reading of the last run (memory only)
         self.last_sun = None
         # controller state
         self.i_term = 0.0
@@ -484,15 +497,22 @@ class IndoorController:
             return False
         return dark and (self.last_sun is None or (now - self.last_sun).total_seconds() >= SUN_COOL_S)
 
-    def _room(self, d, inp, windy, raining):
+    def _sample_due(self, last, now):
+        """ At most one learning sample or sun-trend point per SAMPLE_MIN_S or interval_s, however often the device runs. """
+        return last is None or (now - last).total_seconds() >= max(SAMPLE_MIN_S, self.cfg.interval_s) - 1
+
+    def _room(self, d, inp, windy, raining, dt_s):
         """ (R_used, source): 'primary', 'backup' (+ learned bias), 'estimate' (internal - bias_int) or None. """
         def fresh(v, age, lim):
             return v is not None and (age is None or age <= lim)
-        p_ok = fresh(inp.room, inp.room_age_s, ROOM_STALE_S)
-        b_ok = fresh(inp.backup, inp.backup_age_s, ROOM_STALE_S)
+        p_ok = fresh(inp.room, inp.room_age_s, self.room_stale)
+        b_ok = fresh(inp.backup, inp.backup_age_s, self.backup_stale)
         if p_ok and b_ok:
             diff = inp.room - inp.backup
-            self.backup_bias = diff if self.backup_bias is None else self.backup_bias + BACKUP_ALPHA * (diff - self.backup_bias)
+            if self.backup_bias is None:
+                self.backup_bias = diff
+            else:
+                self.backup_bias += (1 - (1 - BACKUP_ALPHA) ** (dt_s / self.cfg.interval_s)) * (diff - self.backup_bias)
         if p_ok:
             R, src = inp.room, 'primary'
         elif b_ok:
@@ -547,19 +567,27 @@ class IndoorController:
         return 0.0 if r is None else clamp(r, -RATE_MAX * self.s, RATE_MAX * self.s)
 
     def _solar(self, inp, R, now, dt_s, windy, raining):
-        """ excess = window - R_used - base_w; solar_f rises at once and decays with solar_decay_s. """
-        w_ok = inp.window is not None and (inp.window_age_s is None or inp.window_age_s <= WINDOW_STALE_S)
+        """ excess = window - R_used - base_w; solar_f rises at once and decays with solar_decay_s. It rises on a new
+            window reading or a sample that is due, not on every run: excess holds the raw room reading, so a run on each
+            room report would catch every dip of the room as sun, and the term would grow with the number of runs. """
+        w_ok = inp.window is not None and (inp.window_age_s is None or inp.window_age_s <= self.window_stale)
         excess, raw = None, 0.0
+        may_rise = True
         if w_ok and R is not None and inp.out_temp is not None:
             base = self.base_w.value(inp.out_temp, windy, raining)
             excess = inp.window - R - base
             self.exc_hist = [(t, v) for t, v in self.exc_hist if (now - t).total_seconds() <= SOLAR_DERIV_S]
-            self.exc_hist.append((now, excess))
+            due = self._sample_due(self.exc_hist[-1][0] if self.exc_hist else None, now)
+            if due:
+                self.exc_hist.append((now, excess))
+            may_rise = due or inp.window != self.window_prev
             deriv = ls_slope_h(self.exc_hist, now, SOLAR_DERIV_S, 1200) or 0.0
             raw = max(0.0, excess - self.t.sun_deadband * self.s) + self.t.solar_lead_h * max(0.0, deriv)
         else:
             self.exc_hist = []
-        self.solar_f = max(raw, self.solar_f * math.exp(-dt_s / self.t.solar_decay_s))
+        self.window_prev = inp.window
+        decayed = self.solar_f * math.exp(-dt_s / self.t.solar_decay_s)
+        self.solar_f = max(raw, decayed) if may_rise else decayed
         return excess, w_ok
 
     def _learn(self, inp, now, src, w_ok, windy, raining, rate60):
@@ -569,15 +597,13 @@ class IndoorController:
         if inp.since_window_closed_s is not None and inp.since_window_closed_s < WINDOW_CLOSED_S:
             return
 
-        def due(last):
-            return last is None or (now - last).total_seconds() >= SAMPLE_MIN_S
-        if w_ok and inp.out_temp is not None and self._quiet(inp, now) and due(self.last_gap_sample):
+        if w_ok and inp.out_temp is not None and self._quiet(inp, now) and self._sample_due(self.last_gap_sample, now):
             self.base_w.sample(inp.out_temp, inp.window - inp.room, windy, raining)
             self.last_gap_sample = now
         settled = (rate60 is not None and abs(rate60) <= SETTLED_RATE * self.s and self.sp_since is not None
                    and (now - self.sp_since).total_seconds() >= SETTLED_SP_S[self.cfg.kind])
         if (inp.internal is not None and inp.hvac_mode == 'heat' and self.out_slow is not None and settled
-                and due(self.last_bias_sample)):
+                and self._sample_due(self.last_bias_sample, now)):
             self.bias.sample(self.out_slow, inp.internal - inp.room, windy, raining)
             self.last_bias_sample = now
 
@@ -642,20 +668,27 @@ class IndoorController:
 
     def _send(self, d, inp, now, sp, bypass = False):
         """ Output stage: sends round_half(sp). Normal: only when |sp - setpoint| >= SEND_HYST, at most one change per
-            MIN_CHANGE_S. bypass (overrides, power-state edges, mode switches): now. """
+            MIN_CHANGE_S; a change that has to wait asks for a run when it may go (retry_s). bypass (overrides,
+            power-state edges, mode switches): now. """
         cur = inp.setpoint
         want = round_half(sp)
         new = None
         if cur is None or bypass:
             new = want
-        elif abs(sp - cur) >= self.t.send_hyst * self.s and (
-                self.last_change is None or (now - self.last_change).total_seconds() >= MIN_CHANGE_S - 1):
-            new = want
+        elif abs(sp - cur) >= self.t.send_hyst * self.s:
+            if self._send_open(now):
+                new = want
+            elif want != cur:
+                d.retry_s = MIN_CHANGE_S - (now - self.last_change).total_seconds()
         if new is not None and new != cur:
             d.temperature = new
             self.last_commanded = new
             self.last_change = now
             self.sp_since = now
+
+    def _send_open(self, now):
+        """ The last normal change is at least MIN_CHANGE_S old. """
+        return self.last_change is None or (now - self.last_change).total_seconds() >= MIN_CHANGE_S - 1
 
     def _mode(self, d, now, mode, forced = False):
         d.hvac_mode = mode
@@ -706,7 +739,7 @@ class IndoorController:
         self.vac_prev = bool(inp.vacation)
         windy = inp.since_windy_s is not None and inp.since_windy_s < WINDY_S
         raining = bool(inp.raining)
-        R, src = self._room(d, inp, windy, raining)
+        R, src = self._room(d, inp, windy, raining, dt_s)
         self._indoor(inp, R, src, now, dt_s)
         real = src in ('primary', 'backup')
         rate = self._rate(now, self.t.rate_window_s) if real else 0.0
@@ -789,9 +822,12 @@ class IndoorController:
         self.started = True
 
     def _manual(self, d, inp, mode = 'heat'):
-        """ A setpoint that is not the last one sent was changed by hand (or by another app): follow it. """
+        """ A setpoint that is not the last one sent was changed by hand (or by another app): follow it. Not while
+            the last change is younger than MIN_CHANGE_S: Home Assistant may still show the setpoint from before it
+            (a run can come seconds after a send), and no normal change can overwrite a hand change meanwhile. """
         if (not self.started or inp.setpoint is None or self.last_commanded is None
-                or inp.setpoint == self.last_commanded or inp.windows_open or inp.vacation):
+                or inp.setpoint == self.last_commanded or inp.windows_open or inp.vacation
+                or not self._send_open(inp.now)):
             return False
         d.logs.append(('INFO', "setpoint changed by hand to %s: followed." % inp.setpoint))
         if self.pw_state != 'normal' and self.pw_base is not None:

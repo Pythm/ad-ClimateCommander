@@ -31,23 +31,24 @@ APP_LEVEL_KEYS = (
 INDOOR_INTERVAL = 1800  # seconds between runs, indoor-target mode (30 min; was 12 min before 1.4.0 dev, interval_minutes: 12 gives that back)
 TABLE_INTERVAL = 900    # seconds between runs, table mode (as the ElectricalManagement heaters)
                         # (interval_minutes replaces both for one device)
+MIN_RUN_GAP = 300       # seconds: runs started by a sensor report or a person at most this often (min_run_gap_minutes)
 
 UNIT_DEFAULTS = {
     'C': {'max_vacation_temp': 30, 'vacation_temp': 16, 'screening_temp': 8,
           'getting_cold': 18, 'target_indoor_temp': 22.7,
           'unit': 'C', 'comfort_guard': 1.5, 'solar_max': 3.0, 'max_setpoint_drop': 3.0,
-          'cold_start_deficit': 2.0},
+          'cold_start_deficit': 2.0, 'window_trigger_delta': 1.0},
     'F': {'max_vacation_temp': 86, 'vacation_temp': 61, 'screening_temp': 47,
           'getting_cold': 65, 'target_indoor_temp': 72.8,
           'unit': 'F', 'comfort_guard': 2.7, 'solar_max': 5.4, 'max_setpoint_drop': 5.4,
-          'cold_start_deficit': 3.6},
+          'cold_start_deficit': 3.6, 'window_trigger_delta': 1.8},
 }
 
 CONTROLLERS = ('classic', 'shadow', 'adaptive')
 # Keys that only the shadow / adaptive controller reads (classic ignores them with one INFO line)
 ADAPTIVE_KEYS = (
     'window_offset_table', 'internal_offset_table', 'target_table', 'outdoor_gain', 'solar_gain',
-    'solar_max', 'comfort_guard', 'diagnostic_sensor',
+    'solar_max', 'comfort_guard', 'diagnostic_sensor', 'window_trigger_delta',
 )
 OFFSET_LIMIT = 30   # an offset table value further from 0 than this is a typo (no sign or unit assumption)
 ENTITY_ID = re.compile(r'^[a-z0-9_]+\.[a-z0-9_]+$')
@@ -222,6 +223,11 @@ class DeviceConfig(_Model):
     options: List[str] = Field(default_factory=list)   # flags: vacation_keep_off, has_fireplace (unknown names ignored)
 
     interval_minutes: float | None = Field(default=None, ge=1, le=120)   # None: 30 min indoor, 15 min table
+    min_run_gap_minutes: float = Field(default=MIN_RUN_GAP / 60, ge=1, le=30)   # runs started by a report or a person: at most one per this
+    room_sensor_stale_minutes: float | None = Field(default=None, ge=5, le=1440)     # after this without a report: unavailable. None: 60
+    backup_sensor_stale_minutes: float | None = Field(default=None, ge=5, le=1440)   # None: 60 with adaptive, no limit with classic
+    window_sensor_stale_minutes: float | None = Field(default=None, ge=5, le=4320)   # None: 720 with adaptive, no limit with classic
+    window_trigger_delta: float | None = Field(default=None, ge=0, le=20)   # adaptive: a run when window_sensor_temp moved this far. None: UNIT_DEFAULTS, 0: off
     trend_hold_hours: float = Field(default=2.0, ge=0, le=12)   # classic: no setpoint move while the room reaches target within this
     max_setpoint_drop: float | None = Field(default=None, gt=0, le=15)   # HVAC heat, indoor: lowest setpoint target - this. None: UNIT_DEFAULTS
     cold_start_deficit: float | None = Field(default=None, ge=0.5, le=10)   # indoor: vacation end with the room this far below target: cold start. None: UNIT_DEFAULTS
@@ -270,6 +276,14 @@ class DeviceConfig(_Model):
     @classmethod
     def _lists(cls, value: Any) -> Any:
         return _as_list(value)
+
+    @field_validator('window_trigger_delta', mode='before')
+    @classmethod
+    def _window_trigger(cls, value: Any) -> Any:
+        """ false means off (0); true means the default for the unit. """
+        if isinstance(value, bool):
+            return None if value else 0
+        return value
 
     @field_validator('controller', mode='before')
     @classmethod
@@ -338,12 +352,20 @@ class DeviceConfig(_Model):
         def dump(items) -> list:
             return [i.model_dump(exclude_unset=True) for i in items]
 
+        def seconds(minutes) -> int | None:
+            return None if minutes is None else int(round(minutes * 60))
+
         return {
             'climate': self.climate,
             'namespace': self.namespace or hass_namespace,
             'target_mode': target_mode,
             'interval': interval,
             'start_delay': 10 + zlib.crc32(self.climate.encode()) % interval,
+            'min_run_gap': seconds(self.min_run_gap_minutes),
+            'room_stale_s': seconds(self.room_sensor_stale_minutes),
+            'backup_stale_s': seconds(self.backup_sensor_stale_minutes),
+            'window_stale_s': seconds(self.window_sensor_stale_minutes),
+            'window_trigger_delta': self.window_trigger_delta if self.window_trigger_delta is not None else defaults['window_trigger_delta'],
             'indoor_sensor_temp': self.indoor_sensor_temp,
             'backup_indoor_sensor_temp': self.backup_indoor_sensor_temp,
             'window_temp': self.window_temp,

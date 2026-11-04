@@ -23,6 +23,13 @@
     cc_control.py instead of the step rules and learned setpoints (indoor mode, and table mode for heaters).
     'shadow' keeps classic in control and only computes and logs what adaptive would do.
 
+    When a device runs. Every controller: on window, vacation, target and power-state changes, 5 seconds after every
+    start and stop of a daytime_savings / daytime_increasing period, and when a person in a period's presence list comes
+    home or leaves. Classic and shadow (every run adds the full adjustment, so more runs would mean more gain) and table
+    mode: every interval. Adaptive in indoor mode: on every report from the room sensor and on a bigger change at the
+    window temperature sensor, at most once per min_run_gap_minutes; a report inside that gap gets one run at its end. The
+    interval is then the longest time without a run. The backup sensor and the climate's own sensor never start a run.
+
     @Pythm / https://github.com/Pythm
 """
 
@@ -37,10 +44,12 @@ from cc_control import ControlConfig, IndoorController, Inputs, ROOM_STALE_S, ls
 UNAVAIL = ('unavailable', 'unknown')
 POWER_STATES = ('normal', 'save', 'spend', 'reduce')
 DEFAULT_POWER_STATE_MINUTES = 45   # a power state without a refresh falls back to 'normal' after this
-STALE_SENSOR = datetime.timedelta(hours = 1)
 STABLE_CORRECTION_MIN_DIFF = 0.3   # indoor mode: correct a steady room that is this far off target
 STABLE_CORRECTION_AFTER = datetime.timedelta(minutes = 30)
 CONTROL_WRITE_EVERY = datetime.timedelta(minutes = 30)   # shadow / adaptive: JSON written at most this often (and on power-state changes)
+DIAG_WRITE_EVERY = datetime.timedelta(minutes = 10)      # shadow / adaptive: diagnostic_sensor at most this often, at once when the setpoint or mode changes
+PERIOD_RUN_DELAY = 5               # seconds after the start or stop of a daytime period: the run that acts on it
+PERIOD_WAIT_STEP = 3600            # seconds: the wait for a period time is checked against the local clock at least this often
 STEP = 0.5                         # one setpoint step (climate entities take 0.5 steps)
 TREND_WINDOW = datetime.timedelta(minutes = 60)   # room trend: least squares over the reports of the last hour ...
 TREND_MIN_POINTS = 3                               # ... with at least this many reports ...
@@ -73,6 +82,19 @@ def to_float(value):
         return None
 
 
+def clock_times(periods:list) -> list:
+    """ The sorted start and stop times of a list of periods, as time strings. """
+    times = set()
+    for period in periods:
+        for key in ('start', 'stop'):
+            value = period.get(key)
+            if isinstance(value, int) and 0 <= value < 86400:      # YAML 1.1 reads an unquoted 22:00:00 as 79200
+                value = f"{value // 3600:02d}:{value % 3600 // 60:02d}:{value % 60:02d}"
+            if isinstance(value, str):
+                times.add(value)
+    return sorted(times)
+
+
 class Heater:
     """ Controls one climate entity that only heats (floor heating, panel heater, heat pump in heat). """
 
@@ -87,6 +109,10 @@ class Heater:
         self.namespace:str = cfg['namespace']
         self.target_mode:str = cfg['target_mode']
         self.interval:int = cfg['interval']
+        self.min_run_gap = datetime.timedelta(seconds = cfg['min_run_gap'])
+        self._last_run = None              # when the device last ran, whatever started the run
+        self._run_timer = None             # the one waiting run (end of the minimum gap, or the interval) ...
+        self._run_due = None               # ... and when it is due
         self.controller:str = 'classic'
         self.ctrl = None                   # cc_control.IndoorController with controller shadow / adaptive
         self.unit_scale:float = 1.8 if cfg.get('unit') == 'F' else 1.0   # C-based temperature differences x this in F
@@ -96,6 +122,11 @@ class Heater:
         self.indoor_sensor_temp = cfg.get('indoor_sensor_temp')
         self.backup_indoor_sensor_temp = cfg.get('backup_indoor_sensor_temp')
         self.window_temp = cfg.get('window_temp')
+        self.room_stale = datetime.timedelta(seconds = cfg['room_stale_s'] if cfg.get('room_stale_s') is not None else ROOM_STALE_S)
+        self.backup_stale_s = cfg.get('backup_stale_s')   # None: no limit with classic, the controller's own default with shadow / adaptive
+        self.window_stale_s = cfg.get('window_stale_s')   # the same
+        self.window_trigger_delta:float = cfg['window_trigger_delta']
+        self._window_at_run = None         # the window sensor value the last controller run used
         self.window_offset:float = cfg['window_offset']
         self.rain_level:float = cfg['rain_level']
         self.anemometer_speed = cfg['anemometer_speed']
@@ -251,9 +282,10 @@ class Heater:
 
         if not self.hvac:
             self._setup_controller(cfg)   # Aircondition does it at the end of its own __init__
+            self._setup_run_triggers()
 
             # Periodic run. Spread over the interval so many devices do not all call HA in the same second.
-        self.ADapi.run_every(self._set_indoortemp, f"now+{cfg['start_delay']}", self.interval)
+        self.ADapi.run_every(self._periodic_run, f"now+{cfg['start_delay']}", self.interval)
 
     # ------------------------------------------------------------------ #
     # Power state API for ElectricalManagement (may be called from another app's thread:
@@ -324,8 +356,11 @@ class Heater:
         self.ADapi.run_in(self._set_indoortemp, 5)
 
     def _room_reported(self, entity, attribute, old, new, **kwargs) -> None:
-        self._note_room(kwargs.get('source', 'primary'), entity)
-        self._room_screens(kwargs.get('source', 'primary'))
+        source = kwargs.get('source', 'primary')
+        self._note_room(source, entity)
+        self._room_screens(source)
+        if source == 'primary' and to_float(new) is not None and self._reports_start_runs():
+            self._request_run()
 
     def _updateTarget(self, entity, attribute, old, new, **kwargs) -> None:
         value = to_float(new)
@@ -371,6 +406,134 @@ class Heater:
             s.check_if_try_screen_open()
 
     # ------------------------------------------------------------------ #
+    # What starts a run: the periodic tick, sensor reports, persons, period boundaries
+    # ------------------------------------------------------------------ #
+
+    def _setup_run_triggers(self) -> None:
+        """ Called when the controller is known. Period boundaries and persons for every controller; the window
+            temperature sensor where sensor reports start runs. Open and close of `windowsensors` have their own listeners. """
+        self._schedule_period_runs()
+        persons = set()
+        for period in self.daytime_savings + self.daytime_increasing:
+            persons.update(period.get('presence') or [])
+        for person in sorted(persons):
+            self.ADapi.listen_state(self._person_changed, person,
+                namespace = self.namespace
+            )
+        if self.window_temp and self.window_trigger_delta > 0 and self._event_driven():
+            self.ADapi.listen_state(self._window_temp_reported, self.window_temp,
+                namespace = self.namespace
+            )
+
+    def _event_driven(self) -> bool:
+        """ Adaptive in indoor mode. Classic and shadow keep the fixed interval: every classic run adds the full
+            adjustment, so more runs on a chatty sensor would mean more gain. Table mode keeps it too: its setpoint comes
+            from the outdoor table, and its sends have no minimum time between them. """
+        return self.controller == 'adaptive' and self.target_mode == 'indoor'
+
+    def _reports_start_runs(self) -> bool:
+        """ An open window or a vacation has its own setpoint, and the interval is enough for that. """
+        return self._event_driven() and not self.windows_is_open and not self.vacation_state
+
+    def _periodic_run(self, **kwargs) -> None:
+        """ The tick of run_every. Classic: always a run. Event driven: a safety net for a silent sensor, weather and
+            expiring power states, so the interval is the longest time without a run: a run came in between, so the
+            next one is due one interval after it. """
+        if self._event_driven() and self._last_run is not None:
+            due = self._last_run + datetime.timedelta(seconds = self.interval)
+            if self.ADapi.datetime(aware=True) < due - datetime.timedelta(seconds = 1):
+                self._arm_run(due)
+                return
+        self._set_indoortemp()
+
+    def _request_run(self) -> None:
+        """ A report or a person wants a run: at once, or at the end of the minimum gap since the last run. A report
+            inside the gap is never dropped, the waiting run reads the newest values. """
+        now = self.ADapi.datetime(aware=True)
+        self._arm_run(now if self._last_run is None else max(now, self._last_run + self.min_run_gap))
+
+    def _arm_run(self, due) -> None:
+        """ One waiting run per device; the earliest time wanted counts. """
+        if self._run_timer is not None:
+            if self._run_due <= due:
+                return
+            self.ADapi.cancel_timer(self._run_timer, silent = True)
+        self._run_due = due
+        self._run_timer = self.ADapi.run_in(self._waiting_run, math.ceil((due - self.ADapi.datetime(aware=True)).total_seconds()))
+
+    def _waiting_run(self, **kwargs) -> None:
+        self._run_timer = None
+        self._set_indoortemp()
+
+    def _mark_run(self) -> None:
+        """ At the start of every run, whatever started it. The minimum gap counts from here, and a waiting run has
+            nothing left to do: this run reads the same values. """
+        self._last_run = self.ADapi.datetime(aware=True)
+        if self._run_timer is not None:
+            self.ADapi.cancel_timer(self._run_timer, silent = True)
+            self._run_timer = None
+
+    def _window_temp_reported(self, entity, attribute, old, new, **kwargs) -> None:
+        """ window_sensor_temp: a run when the value moved window_trigger_delta since the run that last used it. """
+        value = to_float(new)
+        if value is None or not self._reports_start_runs():
+            return
+        if self._window_at_run is None or round(abs(value - self._window_at_run), 3) >= self.window_trigger_delta:
+            self._request_run()
+
+    def _person_changed(self, entity, attribute, old, new, **kwargs) -> None:
+        """ Periods only ask whether a person is home. Classic: only while a period with that person applies by the
+            clock, so a person coming and going adds no classic runs (each run adds the full adjustment). """
+        if (old == 'home') == (new == 'home'):
+            return
+        if self.controller != 'adaptive' and not self._person_period_now(entity):
+            return
+        self._request_run()
+
+    def _person_period_now(self, person:str) -> bool:
+        for period in self.daytime_savings + self.daytime_increasing:
+            if person in (period.get('presence') or []):
+                if 'start' not in period or 'stop' not in period:
+                    return True
+                if self.ADapi.now_is_between(period['start'], period['stop']):
+                    return True
+        return False
+
+    def _schedule_period_runs(self) -> None:
+        for value in clock_times(self.daytime_savings + self.daytime_increasing):
+            self._arm_period_time(value)
+
+    def _arm_period_time(self, value:str) -> None:
+        """ Waits for the next time this clock time comes, and is set again when it comes. """
+        try:
+            when = self.ADapi.parse_datetime(value)
+            now = self.ADapi.datetime()
+            while when <= now:
+                when += datetime.timedelta(days = 1)
+        except (ValueError, TypeError, NotImplementedError):
+            self.ADapi.log(f"{self.heater}: period time '{value}' not understood. The period starts and stops at the next run.", level = 'WARNING')
+            return
+        self._period_wait(clock = value, when = when)
+
+    def _period_wait(self, *args, **kwargs) -> None:
+        """ Compares with the local wall clock in steps of at most PERIOD_WAIT_STEP, so the time holds on the days
+            daylight saving time changes: 10:00 stays 10:00. A time inside the hour the clock skips comes right after the skip. """
+        left = (kwargs['when'] - self.ADapi.datetime()).total_seconds()
+        if left > 0:
+            self.ADapi.run_in(self._period_wait, min(math.ceil(left), PERIOD_WAIT_STEP), clock = kwargs['clock'], when = kwargs['when'])
+            return
+        self._arm_period_time(kwargs['clock'])
+        self._period_boundary()
+
+    def _period_boundary(self) -> None:
+        """ A period started or stopped: a decision point, so no minimum gap. The run comes a few seconds later, when
+            now_is_between gives the new answer, and takes the place of any run that was waiting. """
+        if self._run_timer is not None:
+            self.ADapi.cancel_timer(self._run_timer, silent = True)
+            self._run_timer = None
+        self._arm_run(self.ADapi.datetime(aware=True) + datetime.timedelta(seconds = PERIOD_RUN_DELAY))
+
+    # ------------------------------------------------------------------ #
     # Screens between runs: the room trigger (a report from the room sensor in use)
     # ------------------------------------------------------------------ #
 
@@ -390,15 +553,15 @@ class Heater:
 
     def _screen_room(self):
         """ (room value, 'primary' / 'backup') for the room trigger, read only. Controller adaptive: the indoor sensor
-            when it reported within ROOM_STALE_S, else the backup plus the controller's learned bias, never the
+            when it reported within its stale limit, else the backup plus the controller's learned bias, never the
             estimate. Classic and shadow: the sensor the classic run would use (_room_now). (None, None) without one. """
         if self.controller != 'adaptive' or self.ctrl is None:
             return self._room_now()
         room, age = self._sensor_reading(self.indoor_sensor_temp)
-        if room is not None and age <= ROOM_STALE_S:
+        if room is not None and age <= self.ctrl.room_stale:
             return room, 'primary'
         backup, age = self._sensor_reading(self.backup_indoor_sensor_temp)
-        if backup is not None and age <= ROOM_STALE_S:
+        if backup is not None and age <= self.ctrl.backup_stale:
             return backup + (self.ctrl.backup_bias or 0.0), 'backup'
         return None, None
 
@@ -450,17 +613,21 @@ class Heater:
     # ------------------------------------------------------------------ #
 
     def _sensor_stamp(self, entity):
-        """ When the sensor last reported, or None. last_reported changes on every report, also when
-            the value is the same; last_updated only when it changes. """
-        stamp = self.ADapi.get_state(entity, attribute = 'last_reported', namespace = self.namespace)
-        if not stamp:
-            stamp = self.ADapi.get_state(entity, attribute = 'last_updated', namespace = self.namespace)
-        if not stamp:
-            return None
-        try:
-            return self.ADapi.convert_utc(stamp)
-        except (TypeError, ValueError):
-            return None
+        """ When the sensor last reported, or None: the latest of the stamps the entity has. A namespace other than
+            Home Assistant may only have last_changed. Home Assistant sends AppDaemon no event for a report with an
+            unchanged value, so the stamps can be one heartbeat old: room_sensor_stale_minutes is what allows for that. """
+        latest = None
+        for attribute in ('last_reported', 'last_updated', 'last_changed'):
+            stamp = self.ADapi.get_state(entity, attribute = attribute, namespace = self.namespace)
+            if not stamp:
+                continue
+            try:
+                stamp = self.ADapi.convert_utc(stamp)
+            except (TypeError, ValueError):
+                continue
+            if latest is None or stamp > latest:
+                latest = stamp
+        return latest
 
     def _sensor_age(self, entity):
         """ Time since the sensor last reported. """
@@ -514,23 +681,35 @@ class Heater:
 
     def _room_now(self):
         """ (value, source) of the room sensor the run uses, with no side effects: the indoor sensor when it has a value
-            and reported within STALE_SENSOR, else the backup sensor ('backup'); without a usable backup the stale
-            indoor value ('primary', better than nothing); (None, None) when there is no value at all. """
+            and reported within room_stale, else the backup sensor ('backup', within backup_stale_s when that is set);
+            without a usable backup the stale indoor value ('primary', better than nothing); (None, None) when there is
+            no value at all. """
         in_temp = None
         if self.indoor_sensor_temp is not None:
             in_temp = to_float(self.ADapi.get_state(self.indoor_sensor_temp, namespace = self.namespace))
-            stale = in_temp is not None and self._sensor_age(self.indoor_sensor_temp) > STALE_SENSOR
+            stale = in_temp is not None and self._sensor_age(self.indoor_sensor_temp) > self.room_stale
             if in_temp is not None and not stale:
                 return in_temp, 'primary'
         if self.backup_indoor_sensor_temp is not None:
             backup = to_float(self.ADapi.get_state(self.backup_indoor_sensor_temp, namespace = self.namespace))
-            if backup is not None:
+            if backup is not None and not self._older_than(self.backup_indoor_sensor_temp, self.backup_stale_s):
                 return backup, 'backup'
         return in_temp, ('primary' if in_temp is not None else None)
 
+    def _older_than(self, entity, limit_s) -> bool:
+        """ The sensor has not reported for limit_s seconds. Without a limit: False. """
+        return limit_s is not None and self._sensor_age(entity).total_seconds() > limit_s
+
+    def _window_reading(self):
+        """ Classic: the window temperature, None when unavailable or silent for window_sensor_stale_minutes (if set). """
+        value = to_float(self.ADapi.get_state(self.window_temp, namespace = self.namespace))
+        if value is None or self._older_than(self.window_temp, self.window_stale_s):
+            return None
+        return value
+
     def get_in_temp(self):
         """ Indoor temperature from the indoor sensor. Uses the backup sensor when the indoor sensor
-            is unavailable or has not reported for an hour. None when there is no usable value.
+            is unavailable or has not reported within room_sensor_stale_minutes. None when there is no usable value.
             Remembers the sensor used (_in_source, for the trend) and logs the backup use. """
         in_temp, source = self._room_now()
         self._in_source = 'primary'
@@ -648,6 +827,8 @@ class Heater:
             self.ADapi.log(f"{self.heater}: the entity is back ({state}).", level = 'INFO')
 
     def _set_indoortemp(self, **kwargs) -> None:
+        if 'classic_only' not in kwargs:
+            self._mark_run()
         if self.ctrl is not None and 'classic_only' not in kwargs:
             self._controller_cycle()
             return
@@ -878,7 +1059,7 @@ class Heater:
         now = self.ADapi.datetime(aware=True)
 
         if self.window_temp is not None:
-            window_temp = to_float(self.ADapi.get_state(self.window_temp, namespace = self.namespace))
+            window_temp = self._window_reading()
             if window_temp is None:
                 window_temp = self.target_indoor_temp + self.window_offset
                 self.ADapi.log(f"{self.window_temp} has no temperature. Probably offline", level = 'DEBUG')
@@ -1169,7 +1350,7 @@ class Heater:
 
         adjust = 0
         if self.window_temp is not None:
-            window_temp = to_float(self.ADapi.get_state(self.window_temp, namespace = self.namespace))
+            window_temp = self._window_reading()
             if window_temp is None:
                 window_temp = self.target_indoor_temp + self.window_offset   # at the threshold: no correction
                 self.ADapi.log(f"{self.window_temp} has no temperature. Probably offline", level = 'DEBUG')
@@ -1304,11 +1485,16 @@ class Heater:
             max_setpoint_drop = cfg.get('max_setpoint_drop'),
             interval_s = self.interval,
             cold_start_deficit = cfg.get('cold_start_deficit'),
+            room_stale_s = cfg.get('room_stale_s'),
+            backup_stale_s = cfg.get('backup_stale_s'),
+            window_stale_s = cfg.get('window_stale_s'),
         ))
         self.diagnostic_sensor = cfg.get('diagnostic_sensor')
         self._virtual_setpoint = None      # shadow: the setpoint and mode the controller proposed last,
         self._virtual_mode = None          # fed back to it instead of the real ones
         self._ctrl_last_write = None
+        self._diag_last_write = None       # when and what the diagnostic sensor last got
+        self._diag_last = None
         self._lux_seen = False             # lux stays 0 without any lux source: use day / night until one reports
         if self.store is None:
             self.ADapi.log(f"{self.heater}: controller '{controller}' without json_path: the learned window and climate "
@@ -1331,6 +1517,7 @@ class Heater:
         room, room_age = self._sensor_reading(self.indoor_sensor_temp)
         backup, backup_age = self._sensor_reading(self.backup_indoor_sensor_temp)
         window, window_age = self._sensor_reading(self.window_temp)
+        self._window_at_run = window
         if self.weather.lux > 0:
             self._lux_seen = True
         increasing, after_increase = self.DaytimeIncreasing()
@@ -1439,6 +1626,9 @@ class Heater:
             mode = dec.hvac_mode or state
             self._window_notifications(dec.diag.get('R'))
             self._controller_screens(dec.diag.get('R'), mode)
+            if dec.retry_s is not None:
+                # The change waits for the minimum time between changes: it must not depend on the next report
+                self._arm_run(inp.now + datetime.timedelta(seconds = dec.retry_s))
 
         self._controller_persist(dec, pw_before, inp.now)
         self._controller_report(dec, holds, mode, classic_setpoint, classic_mode)
@@ -1498,6 +1688,10 @@ class Heater:
         self.ADapi.log(text, level = 'DEBUG')
         if not self.diagnostic_sensor:
             return
+        now = self.ADapi.datetime(aware=True)
+        if (holds, mode) == self._diag_last and self._diag_last_write is not None and now - self._diag_last_write < DIAG_WRITE_EVERY:
+            return
+        self._diag_last, self._diag_last_write = (holds, mode), now
         attributes = {k: num(d[k], 3) for k in DIAG_KEYS if k in d}
         attributes.update(
             controller = self.controller,
@@ -1554,6 +1748,7 @@ class Aircondition(Heater):
 
         self._schedule_silence()
         self._setup_controller(cfg)
+        self._setup_run_triggers()
 
     def _set_hvac_mode(self, mode:str) -> None:
         self.ADapi.call_service('climate/set_hvac_mode',
@@ -1735,21 +1930,15 @@ class Aircondition(Heater):
     def _schedule_silence(self) -> None:
         """ One daily timer at every start and stop time of the silence periods, so the fan mode changes on time
             and not at the next run. """
-        times = set()
-        for period in self.silence:
-            for key in ('start', 'stop'):
-                value = period.get(key)
-                if isinstance(value, int) and 0 <= value < 86400:      # YAML 1.1 reads an unquoted 22:00:00 as 79200
-                    value = f"{value // 3600:02d}:{value % 3600 // 60:02d}:{value % 60:02d}"
-                if isinstance(value, str):
-                    times.add(value)
-        for value in sorted(times):
+        for value in clock_times(self.silence):
             try:
                 self.ADapi.run_daily(self._silence_timer, value)
             except (ValueError, TypeError, NotImplementedError):
                 self.ADapi.log(f"{self.heater}: silence time '{value}' not understood. Silence changes at the next run.", level = 'WARNING')
 
     def _set_indoortemp(self, **kwargs) -> None:
+        if 'classic_only' not in kwargs:
+            self._mark_run()
         if self.ctrl is not None and 'classic_only' not in kwargs:
             self._controller_cycle()
             return
