@@ -15,7 +15,7 @@
         solar      = min(solar_max, solar_gain * solar_f)  (rises at once, decays slowly)
         sp_ctrl    = clamp(target_eff + ff + i_term + Kp * (target_eff - (in_f + rate * lead)) - solar)
     The power-state layer (with the comfort guard), the window/vacation overrides and the HVAC mode choice
-    sit on top. Normal changes: at most one per MIN_CHANGE_S, one STEP at a time.
+    sit on top. Normal changes: at most one per MIN_CHANGE_S, straight to the computed value.
 
     Nothing here is tuned to one house: the window baseline and the internal-sensor bias are learned by
     outdoor temperature (LearnedGap), with no sign assumption; optional YAML tables only seed them.
@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------------------------------- #
 VERSION = 1
 MIN_CHANGE_S = 720              # owner: at most one setpoint change per 12 min
-STEP = 0.5                      # owner: setpoint grid, and the largest normal change per send
+STEP = 0.5                      # the start after fan_only is this far below sp_ctrl
 ROOM_STALE_S = 3600             # room and backup sensor fresh when reported within 1 h (as classic)
 WINDOW_STALE_S = 12 * 3600      # window sensor: the live ones report only on a ~1 C change, up to 14 h apart
 EST_TAU_S = 3600                # smoothing of the internal-sensor estimate (climate sensors report in 0.5-1 steps)
@@ -46,9 +46,6 @@ FAN_RISE = 0.2                  # (deg per h) ... and the setpoint is at its low
                                 #    (has_fireplace: at FAN_ABOVE alone)
 MAX_DROP = 3.0                  # (deg) HVAC heat: lowest setpoint this far below target when max_setpoint_drop is not set (as
                                 #    classic): the unit idles below its own sensor reading, lower only slows the way back
-RETURN_JUMP = 4.0               # (deg) HVAC heat: once the setpoint was lowered for an overshoot (room above target + FAN_ABOVE,
-                                #    no fan_only), the first change with the room at or below target may skip the STEP
-                                #    limit, up to the setpoint before the lowering and at most target + this
 COLD_START_DEFICIT = 2.0        # (deg) vacation end with the room at least this far below target_eff (cold_start_deficit):
                                 #    cold start ...
 COLD_START_MAX = 6.0            # (deg) owner: ... at target_eff + the deficit, at most this above it (and max_temp), sent at
@@ -405,7 +402,6 @@ class IndoorController:
         self.pw_ended = None              # when the last power state ended
         self.last_commanded = None
         self.last_change = None
-        self.pre_lower = None             # HVAC heat: setpoint before it was lowered for an overshoot (RETURN_JUMP)
         self.mode_seen = None
         self.mode_since = None
         self.mode_forced = False          # the current mode was set by an override (window / vacation)
@@ -644,10 +640,9 @@ class IndoorController:
             return sign * (self.cfg.save_temp_offset if self.cfg.save_temp_offset is not None else SAVE_OFFSET)
         return sign * self.cfg.spend_temp_offset
 
-    def _send(self, d, inp, now, sp, bypass = False, step_limit = True, jump_to = None):
-        """ Output stage. Normal: only when |sp - setpoint| >= SEND_HYST, at most one change per MIN_CHANGE_S,
-            at most STEP per change. bypass (overrides, power-state edges, mode switches): round_half(sp) now.
-            jump_to (RETURN_JUMP): an upward change may skip the STEP limit, up to jump_to. """
+    def _send(self, d, inp, now, sp, bypass = False):
+        """ Output stage: sends round_half(sp). Normal: only when |sp - setpoint| >= SEND_HYST, at most one change per
+            MIN_CHANGE_S. bypass (overrides, power-state edges, mode switches): now. """
         cur = inp.setpoint
         want = round_half(sp)
         new = None
@@ -655,12 +650,7 @@ class IndoorController:
             new = want
         elif abs(sp - cur) >= self.t.send_hyst * self.s and (
                 self.last_change is None or (now - self.last_change).total_seconds() >= MIN_CHANGE_S - 1):
-            if not step_limit:
-                new = want
-            elif jump_to is not None and want > cur + STEP:
-                new = max(round_half(cur + STEP), min(want, round_half(jump_to)))
-            else:
-                new = round_half(cur + clamp(want - cur, -STEP, STEP))
+            new = want
         if new is not None and new != cur:
             d.temperature = new
             self.last_commanded = new
@@ -785,7 +775,7 @@ class IndoorController:
             if first and self.in_f is not None and abs(tgt - self.in_f) > self.t.i_band * self.s:
                 # Start (or restart) with the room far from target: the integral is NOT set to hold the current
                 # setpoint (that would leave it stuck while the room does not move). It starts at 0 and the output
-                # stage walks the setpoint towards sp_ctrl one 0.5 step per 12 min, so nothing jumps.
+                # stage sends sp_ctrl.
                 setattr(self, attr, 0.0)
                 self.last_commanded = inp.setpoint
                 self.started = True
@@ -858,7 +848,6 @@ class IndoorController:
         vac = cfg.vacation_temp if cfg.vacation_temp is not None else 10.0
         if inp.windows_open or inp.vacation:
             self._clear_pw()
-            self.pre_lower = None
             self.cold_start = None
             if cfg.kind == 'hvac' and inp.windows_open:
                 self._mode(d, now, 'fan_only', forced = True)
@@ -908,18 +897,7 @@ class IndoorController:
         if active:
             self._send(d, inp, now, self.pw_base + self.power_offset(inp.power_state, 'heat'), bypass = True)
             return
-        back = None
-        if cfg.kind == 'hvac' and self.pre_lower is not None and self.in_f is not None and self.in_f <= tgt:
-            back = min(self.pre_lower, base + RETURN_JUMP * s)
-        self._send(d, inp, now, sp_ctrl, bypass = edge, jump_to = back)
-        cur, sent = inp.setpoint, d.temperature
-        if cfg.kind != 'hvac' or cur is None:
-            return
-        if self.pre_lower is not None and (cur >= self.pre_lower or (back is not None and sent is not None and sent > cur)):
-            self.pre_lower = None                   # the way back is done
-        elif (self.pre_lower is None and sent is not None and sent < cur and self.in_f is not None
-              and self.in_f > tgt + FAN_ABOVE * s):
-            self.pre_lower = cur                    # lowered for an overshoot instead of fan_only
+        self._send(d, inp, now, sp_ctrl, bypass = edge)
 
     def _cold_begin(self, d, inp, now, tgt) -> bool:
         """ First run after a vacation ended, room at least cold_start_deficit below tgt: the cold start setpoint
@@ -932,7 +910,7 @@ class IndoorController:
         if deficit < (cfg.cold_start_deficit if cfg.cold_start_deficit is not None else COLD_START_DEFICIT * s):
             return False
         start = round_half(min(cfg.max_temp, tgt + min(deficit, COLD_START_MAX * s)))
-        self.cold_start, self.cold_sp, self.pre_lower = now, start, None
+        self.cold_start, self.cold_sp = now, start
         if inp.power_state != 'normal':
             self.pw_base = start
         d.logs.append(('INFO', "vacation ended with the room %.1f below target: cold start at %s until the room is near "
@@ -975,7 +953,6 @@ class IndoorController:
         cfg, s = self.cfg, self.s
         tgt = self.target_eff(base, inp, windy, raining, 'cool')
         real = src in ('primary', 'backup')
-        self.pre_lower = None
         self.cold_start = None
         if inp.windows_open:
             self._clear_pw()

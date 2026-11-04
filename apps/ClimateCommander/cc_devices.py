@@ -150,7 +150,6 @@ class Heater:
         self._cold_start:bool = False      # the cold start setpoint after a vacation is held (memory only)
         self._cold_start_since = None
         self._heat_setpoint_before_vacation = None
-        self._window_closed:bool = False   # heater: all windows closed, the next normal move is not limited to one step
 
         self.daytime_savings:list = cfg.get('daytime_savings') or []
         self.daytime_increasing:list = cfg.get('daytime_increasing') or []
@@ -354,7 +353,6 @@ class Heater:
         if self.windowsopened() == 0:
             if self.windows_is_open:
                 self.notify_hot_armed = True
-                self._window_closed = not self.hvac   # an HVAC returns through fan_only -> heat (restart setpoint)
             self.window_last_closed = self.ADapi.datetime(aware=True)
             self.windows_is_open = False
             self.ADapi.run_in(self._set_indoortemp, 60)
@@ -739,7 +737,6 @@ class Heater:
         cold = self._cold_start and mode == 'heat'
         if offset == 0:
             base = heater_temp
-            ending = self._applied_offset != 0   # a power state just ended: the move is not limited to one step
             if self._applied_offset != 0 and self._base_setpoint is not None:
                 if self._last_commanded is not None and heater_temp != self._last_commanded:
                     base = heater_temp - self._applied_offset   # changed by hand during the state
@@ -749,10 +746,9 @@ class Heater:
             if cold:
                 return self._cold_start_step(base, in_temp)
             new_temperature = self.adjust_set_temperature_by(heater_set_temp = base, in_temp = in_temp)
-            if ending or self._window_closed or self.target_mode != 'indoor':
-                self._window_closed = False
+            if self.target_mode != 'indoor':
                 return new_temperature
-            return self._capped(heater_temp, new_temperature)
+            return round_half(new_temperature)   # indoor mode: the whole move at once, on the 0.5 grid
 
         if self._applied_offset == 0 or self._base_setpoint is None:
             self._base_setpoint = heater_temp
@@ -763,10 +759,6 @@ class Heater:
         self._applied_offset = offset
         self.prev_in_temp = in_temp
         return self._base_setpoint + offset
-
-    def _capped(self, current:float, new:float) -> float:
-        """ Indoor mode: a normal setpoint move is at most STEP per run, on the 0.5 grid. """
-        return round_half(current + max(-STEP, min(STEP, new - current)))
 
     # ------------------------------------------------------------------ #
     # After a vacation (indoor mode): cold start, way down
@@ -1648,7 +1640,7 @@ class Aircondition(Heater):
     def _fan_only_now(self, heater_temp:float) -> bool:
         """ heat -> fan_only at target + 0.6: at once with has_fireplace, in table mode and in a power state. Else only
             when the setpoint is at _lowest_heat() or the room still rises FAN_RISE per hour; until then the setpoint
-            is lowered one step per run and the unit stays in heat. """
+            is lowered by the computed adjustment and the unit stays in heat. """
         if self.has_fireplace or self.target_mode != 'indoor' or self.power_state != 'normal':
             return True
         return heater_temp <= self._lowest_heat() or self._room_rate() >= FAN_RISE * self.unit_scale
@@ -1877,8 +1869,8 @@ class Aircondition(Heater):
                             self._set_hvac_mode('fan_only')
                             self.ADapi.run_in(self._set_indoortemp, 5) # To set silence to new fan mode, if time for it
                             return
-                        # Lower by the computed adjustment, at most one step and not below the lowest setpoint
-                        lowered = min(heater_temp, max(new_temperature, heater_temp - STEP, self._lowest_heat()))
+                        # Lower by the computed adjustment, not below the lowest setpoint
+                        lowered = min(heater_temp, max(new_temperature, self._lowest_heat()))
                         if round_half(lowered) < heater_temp and self._last_heat_setpoint_before_lowering is None:
                             self._last_heat_setpoint_before_lowering = heater_temp
                         new_temperature = lowered
