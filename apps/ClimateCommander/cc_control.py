@@ -30,6 +30,7 @@ from __future__ import annotations
 import bisect
 import datetime
 import math
+import statistics
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------------------------------- #
@@ -64,6 +65,10 @@ I_CLAMP = 6.0                   # (deg) integral bound (floor thermostats read 5
 SP_SPAN = 8.0                   # (deg) setpoint within target +- this (as classic)
 RATE_MAX = 2.0                  # (deg per h) trend clamp
 RATE_MIN_POINTS = 3             # trend needs this many room reports in its window (else 0)
+RATE_WIDE_GAPS = 9              # diagnostic rate_wide (never read by control): window = RATE_WIDE_FACTOR x the median of this many
+RATE_WIDE_FACTOR = 3            #    gaps between primary room reports, at least the normal window ...
+RATE_WIDE_MAX_S = 4 * 3600      #    ... at most this ...
+RATE_WIDE_KEEP = 300            #    ... and at most this many reports kept (4 h of runs at the shortest min_run_gap_minutes, with room)
 WINDOW_CLOSED_S = 3600          # integral and learning wait this long after the last window close
 WINDY_S = 1800                  # wind flag: wind >= anemometer_speed within 30 min (as classic)
 FAN_WIND_S = 2700               # no heat -> fan_only within 45 min of wind (as classic)
@@ -396,6 +401,9 @@ class IndoorController:
         self.out_slow = self.out_day = None
         self.in_f = None
         self.hist = []                    # (report time, value) of real room readings
+        self.wide_hist = []               # the same reports kept for rate_wide; hist drops them after the normal window
+        self.wide_gaps = []               # seconds between the last primary reports, for the rate_wide window
+        self.wide_prim_t = None           # time of the last primary report
         self.last_rep_t = None
         self.src_prev = None
         self.backup_bias = None
@@ -543,28 +551,53 @@ class IndoorController:
             t_rep = now - datetime.timedelta(seconds = age) if age is not None else now
             if self.src_prev not in ('primary', 'backup') or self.in_f is None or self.last_rep_t is None:
                 self.in_f, self.hist, self.last_rep_t = R, [(t_rep, R)], t_rep
+                self._wide_reset()
+                self._wide_note(t_rep, R, src)
             elif (t_rep - self.last_rep_t).total_seconds() >= 1:
                 dtr = (t_rep - self.last_rep_t).total_seconds()
                 a = dtr / (self.t.tau_in_s + dtr) if self.t.tau_in_s > 0 else 1.0
                 self.in_f += a * (R - self.in_f)
                 self.hist.append((t_rep, R))
                 self.last_rep_t = t_rep
+                self._wide_note(t_rep, R, src)
             keep = max(self.t.rate_window_s, 3600) + 600
             self.hist = [(t, v) for t, v in self.hist if (now - t).total_seconds() <= keep]
         elif src == 'estimate':
             if self.src_prev != 'estimate':
                 self.hist = []
+                self._wide_reset()
             if self.in_f is None:
                 self.in_f = R
             else:
                 self.in_f += dt_s / (EST_TAU_S + dt_s) * (R - self.in_f)
         else:
             self.hist = []
+            self._wide_reset()
         self.src_prev = src
 
     def _rate(self, now, window_s):
         r = ls_slope_h(self.hist, now, window_s, 900, RATE_MIN_POINTS)
         return 0.0 if r is None else clamp(r, -RATE_MAX * self.s, RATE_MAX * self.s)
+
+    def _wide_reset(self):
+        self.wide_hist, self.wide_gaps, self.wide_prim_t = [], [], None
+
+    def _wide_note(self, t_rep, R, src):
+        kept = [(t, v) for t, v in self.wide_hist if (t_rep - t).total_seconds() <= RATE_WIDE_MAX_S]
+        self.wide_hist = kept[-(RATE_WIDE_KEEP - 1):] + [(t_rep, R)]
+        if src == 'primary':
+            if self.wide_prim_t is not None:
+                self.wide_gaps = (self.wide_gaps + [(t_rep - self.wide_prim_t).total_seconds()])[-RATE_WIDE_GAPS:]
+            self.wide_prim_t = t_rep
+
+    def _rate_wide(self, now):
+        """ The room trend over a window that follows the sensor's report gaps, for the diagnostics only: control must not
+            read it. None (not 0.0, which would read as a flat room): too few reports in the window. """
+        window_s = self.t.rate_window_s
+        if self.wide_gaps:
+            window_s = max(window_s, RATE_WIDE_FACTOR * statistics.median(self.wide_gaps))
+        r = ls_slope_h(self.wide_hist, now, min(window_s, RATE_WIDE_MAX_S), 900, RATE_MIN_POINTS)
+        return None if r is None else clamp(r, -RATE_MAX * self.s, RATE_MAX * self.s)
 
     def _solar(self, inp, R, now, dt_s, windy, raining):
         """ excess = window - R_used - base_w; solar_f rises at once and decays with solar_decay_s. It rises on a new
@@ -748,8 +781,8 @@ class IndoorController:
         excess, w_ok = self._solar(inp, R, now, dt_s, windy, raining)
         self._learn(inp, now, src, w_ok, windy, raining, rate60)
         solar = min(self.solar_max, cfg.solar_gain * self.solar_f)
-        d.diag = dict(src = src, R = R, in_f = self.in_f, rate = rate, excess = excess, solar = solar,
-                      out_slow = self.out_slow, out_day = self.out_day,
+        d.diag = dict(src = src, R = R, in_f = self.in_f, rate = rate, rate_wide = self._rate_wide(now),
+                      excess = excess, solar = solar, out_slow = self.out_slow, out_day = self.out_day,
                       base_w = self.base_w.value(inp.out_temp, windy, raining) if inp.out_temp is not None else None,
                       bias_int = self.bias.value(self.out_slow, windy, raining) if self.out_slow is not None else None)
         args = (d, inp, now, dt_s, R, src, base, solar, rate, windy, raining)

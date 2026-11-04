@@ -65,7 +65,7 @@ COLD_GOAL_ABOVE = 1.0              # way down without a held or learned setpoint
 ROOM_SCREEN_EVERY = datetime.timedelta(minutes = 5)   # room trigger (_room_screens): at most one screen-close attempt per device
                                    # this often. A room sensor in the airflow reports every few seconds, and every attempt
                                    # reads several HA states per screen; one try per 5 min is still 6 times the run cadence.
-DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
+DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'rate_wide', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
              'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl')
 
 
