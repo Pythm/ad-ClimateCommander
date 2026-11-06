@@ -47,7 +47,7 @@ One app controls one climate entity: a heater (floor heating, panel heater) or a
   - A missing or unavailable climate entity is logged once (WARNING for missing, INFO for unavailable), not silently.
   - An HVAC in table mode without `vacation_temp` no longer fails on vacation (falls back to 10).
 - **Save / spend / reduce from ElectricalManagement** (optional, ElectricalManagement 1.0.6 or later), see [ElectricalManagement](#electricalmanagement).
-- **The app now has three more files**, `cc_devices.py`, `cc_config.py` and `cc_control.py`, next to `climateCommander.py` and `weather_data.py`. Copy the whole app folder when you update (HACS does).
+- **The app now has three more files**, `cc_devices.py`, `cc_config.py` and `cc_control.py`, next to `climateCommander.py` and `weather_data.py`. Copy the whole app folder when you update (`git pull` does).
 - **New, optional: `controller: shadow` / `controller: adaptive`**, a different way to find the setpoint, per device. The default `classic` is the controller described in this README. See [Adaptive controller](#adaptive-controller-optional).
 - **The configuration is validated with pydantic** (`cc_config.py`). A value of the wrong type (for example `window_offset: abc`, or a table entry without `out`) now logs an ERROR naming the key: an invalid device is skipped, an invalid app-level key stops that app. Before, such a value was silently used or crashed later (`vacation_temp: abc` used to fall back to 10). A single entity where a list is expected (for example `windowsensors: binary_sensor.x`) is accepted as a one-item list. See [Validation](#validation).
 - **Screens react to the room sensor** between runs, see [Room trigger](#room-trigger). Nothing to configure. In short: screens close within seconds of the room getting warm (and bright) instead of up to one interval later, and on borderline days with a sensor in the airflow they may close more often than before.
@@ -155,15 +155,13 @@ climate_living_room:
 ---
 ## Installation
 
-**With HACS**: install Climate Commander from HACS (AppDaemon category). HACS copies the whole app folder and updates it.
-
-**By hand**: clone the repository into your AppDaemon apps folder:
+Clone the repository into your AppDaemon apps folder:
 
 ```bash
 git clone https://github.com/Pythm/ad-ClimateCommander.git /path/to/appdaemon/apps/ad-ClimateCommander
 ```
 
-When you update by hand, copy all four files (`climateCommander.py`, `cc_devices.py`, `cc_config.py`, `weather_data.py`). An old `climateCommander.py` next to new helper files, or the other way round, does not work.
+Update with `git pull` in the clone. If you copy files by hand instead, copy all five (`climateCommander.py`, `cc_devices.py`, `cc_config.py`, `cc_control.py`, `weather_data.py`). An old `climateCommander.py` next to new helper files, or the other way round, does not work.
 
 ---
 ## Quick start
@@ -284,7 +282,7 @@ After a time without a report a sensor counts as unavailable, and the normal fal
 
 Home Assistant sends no event when a sensor reports an unchanged value, so a heartbeat with the same value looks like silence to the app. A sensor with a 55 minute heartbeat can show 110 minutes without a report. With the default of 60 minutes that sensor is treated as offline now and then: the backup or the estimate is used for a while, with the WARNING `no fresh room sensor`.
 
-Set the key to about 1.5 times the longest normal gap of that sensor: for the 110 minutes above, `room_sensor_stale_minutes: 165`. `tools/ha_report_cadence.py` in [Pythm_AppdaemonApps](https://github.com/Pythm/Pythm_AppdaemonApps) finds the gaps in the sensor's history and suggests the value (`python3 tools/ha_report_cadence.py sensor.x`, read-only). The price of a higher value: a sensor that really stopped is believed for longer, and the controller keeps acting on its last value until then.
+Set the key to about 1.5 times the longest normal gap of that sensor: for the 110 minutes above, `room_sensor_stale_minutes: 165`. `tools/ha_report_cadence.py` in this repository finds the gaps in the sensor's history and suggests the value (`python3 tools/ha_report_cadence.py sensor.x`, read-only). The price of a higher value: a sensor that really stopped is believed for longer, and the controller keeps acting on its last value until then.
 
 The time of a report is the latest of the entity's `last_reported`, `last_updated` and `last_changed`.
 
