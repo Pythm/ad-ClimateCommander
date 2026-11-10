@@ -74,7 +74,10 @@ WINDY_S = 1800                  # wind flag: wind >= anemometer_speed within 30 
 FAN_WIND_S = 2700               # no heat -> fan_only within 45 min of wind (as classic)
 BOOST_WIND_S = 1500             # boost preset within 25 min of wind ...
 BOOST_BELOW = 0.7               # (deg) ... and the room this far below target (as classic)
-SHIFT_DAY = 0.5                 # (deg) daytime increasing / saving target shift (as classic)
+SHIFT_DAY = 0.5                 # (deg) daytime saving target shift (as classic)
+SHIFT_INCREASE = 0.3            # (deg) owner: daytime increasing target shift (0.5 held the room too warm afterwards)
+HOLD_SUN = 1.0                  # (deg) the hold after an increase ends early when the sun term is this large ...
+HOLD_ROOM = 1.0                 # (deg) ... or the room is this far above the fan_only line (a lit fireplace)
 SHIFT_WEATHER = 0.3             # (deg) wind / rain target shift (as classic)
 SAVE_OFFSET = -0.3              # save/reduce offset when save_temp_offset is not set (as classic, not unit-scaled)
 COMFORT_GUARD = 1.5             # (deg) owner: power-state offset dropped when the room is this far on the wrong side
@@ -348,7 +351,7 @@ class Inputs:
     vacation: bool = False
     power_state: str = 'normal'
     increasing: bool = False              # daytime_increasing active
-    after_increase: bool = False          # within 1 h after a daytime_increasing period
+    after_increase: bool = False          # within increase_hold_hours (default 2 h) after a daytime_increasing period
     saving: bool = False                  # daytime_savings active
     preset: str | None = None
     boost_available: bool = False         # 'boost' in preset_modes and fan_mode is not 'Silence'
@@ -658,11 +661,12 @@ class IndoorController:
     def target_eff(self, base, inp, windy, raining, mode = 'heat'):
         """ The deliberate shifts of classic, as target shifts. Cooling turns the daytime signs (as classic). """
         s, sign = self.s, (-1 if mode == 'cool' else 1)
-        t = base + (sign * SHIFT_DAY * s if inp.increasing else 0.0)
-        if inp.saving:
-            t -= sign * SHIFT_DAY * s
-        elif windy or raining:
-            t += SHIFT_WEATHER * s
+        if inp.saving:      # savings replace an increase: from +0.3 straight to -0.5, not +0.3 - 0.5
+            t = base - sign * SHIFT_DAY * s
+        else:
+            t = base + (sign * SHIFT_INCREASE * s if inp.increasing else 0.0)
+            if windy or raining:
+                t += SHIFT_WEATHER * s
         return t
 
     def _ff(self, base, windy, raining):
@@ -936,10 +940,13 @@ class IndoorController:
                 held = self.pw_ended is not None and (now - self.pw_ended).total_seconds() < POWER_END_HOLD_S
                 if (self.in_f > tgt + FAN_ABOVE * s + extra and (cfg.has_fireplace or sp_ctrl <= lo + 1e-9 or rate >= FAN_RISE * s)
                         and not held and (inp.since_windy_s is None or inp.since_windy_s > FAN_WIND_S)
-                        and not inp.after_increase and self._mode_time_ok(now)):
-                    self._clear_pw()
-                    self._mode(d, now, 'fan_only')
-                    return
+                        and self._mode_time_ok(now)):
+                    if self._increase_hold(inp, tgt, solar):
+                        d.diag['increase_hold'] = True    # fan_only waits: the room is still coming down after an increase
+                    else:
+                        self._clear_pw()
+                        self._mode(d, now, 'fan_only')
+                        return
             boost = (inp.since_windy_s is not None and inp.since_windy_s < BOOST_WIND_S
                      and self.in_f is not None and self.in_f < tgt - BOOST_BELOW * s)
             if boost and inp.boost_available and inp.preset != 'boost':
@@ -967,6 +974,17 @@ class IndoorController:
             self._send(d, inp, now, self.pw_base + self.power_offset(inp.power_state, 'heat'), bypass = True)
             return
         self._send(d, inp, now, sp_ctrl, bypass = edge)
+
+    def _increase_hold(self, inp, tgt, solar) -> bool:
+        """ The time after a daytime_increasing period (increase_hold_hours): no heat -> fan_only, so the room can fall
+            back to the target by itself, also when a daytime_savings period starts inside it. Ends early when the sun term of
+            the window sensor is HOLD_SUN or more, or the room is HOLD_ROOM above the fan_only line (fireplace). """
+        if not inp.after_increase:
+            return False
+        s = self.s
+        if solar >= HOLD_SUN * s:
+            return False
+        return not (self.in_f is not None and self.in_f > tgt + (FAN_ABOVE + HOLD_ROOM) * s)
 
     def _cold_begin(self, d, inp, now, tgt) -> bool:
         """ First run after a vacation ended, room at least cold_start_deficit below tgt: the cold start setpoint

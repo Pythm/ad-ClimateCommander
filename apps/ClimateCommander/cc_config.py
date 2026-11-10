@@ -126,8 +126,9 @@ class DayPeriod(BaseModel):
     start: str | None = None
     stop: str | None = None
     presence: List[str] | None = None
+    mode: List[str] | None = None   # daytime_savings / daytime_increasing: applies only while the house is in one of these modes
 
-    @field_validator('presence', mode='before')
+    @field_validator('presence', 'mode', mode='before')
     @classmethod
     def _presence_list(cls, value: Any) -> Any:
         return None if value is None else _as_list(value)
@@ -228,6 +229,8 @@ class DeviceConfig(_Model):
     backup_sensor_stale_minutes: float | None = Field(default=None, ge=5, le=1440)   # None: 60 with adaptive, no limit with classic
     window_sensor_stale_minutes: float | None = Field(default=None, ge=5, le=4320)   # None: 720 with adaptive, no limit with classic
     window_trigger_delta: float | None = Field(default=None, ge=0, le=20)   # adaptive: a run when window_sensor_temp moved this far. None: UNIT_DEFAULTS, 0: off
+    increase_hold_hours: float = Field(default=2.0, ge=0, le=12)   # no heat -> fan_only this long after a daytime_increasing period
+    mode_app: str | None = None   # ModeManagement app name: its current_mode is read when a period names a `mode`
     trend_hold_hours: float = Field(default=2.0, ge=0, le=12)   # classic: no setpoint move while the room reaches target within this
     max_setpoint_drop: float | None = Field(default=None, gt=0, le=15)   # HVAC heat, indoor: lowest setpoint target - this. None: UNIT_DEFAULTS
     cold_start_deficit: float | None = Field(default=None, ge=0.5, le=10)   # indoor: vacation end with the room this far below target: cold start. None: UNIT_DEFAULTS
@@ -396,6 +399,8 @@ class DeviceConfig(_Model):
             'vacation_keep_off': self.vacation_keep_off or 'vacation_keep_off' in self.options,
             'has_fireplace': self.has_fireplace,
             'trend_hold_hours': self.trend_hold_hours,
+            'increase_hold_hours': self.increase_hold_hours,
+            'mode_app': self.mode_app,
             'max_setpoint_drop': self.max_setpoint_drop if self.max_setpoint_drop is not None else defaults['max_setpoint_drop'],
             'cold_start_deficit': self.cold_start_deficit if self.cold_start_deficit is not None else defaults['cold_start_deficit'],
             'notify_receiver': [self.notify_receiver] if isinstance(self.notify_receiver, str) else self.notify_receiver,

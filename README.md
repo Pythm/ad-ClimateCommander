@@ -69,7 +69,10 @@ One app controls one climate entity: a heater (floor heating, panel heater) or a
 - **Upgrading, HVAC in heat (indoor mode):** without `has_fireplace` an HVAC now lowers its setpoint before it switches to `fan_only` (it switches at once only when the setpoint is at its lowest or the room still rises; a sensor that reports less often than about every 25 minutes does not show the rise, see [Sensors that report rarely](#sensors-that-report-rarely)). A room with a fireplace, or another heat source that makes the room overshoot fast, sets `options: [has_fireplace]` to keep the old behaviour (`fan_only` at once at target + 0.6).
 - **Upgrading, `controller: adaptive` in indoor mode:** the device now runs when the room sensor reports, not only every 30 minutes, see [When a device runs](#when-a-device-runs). Nothing to configure. The interval is now the longest time without a run. Expect more runs and about the same number of setpoint changes.
 - **Upgrading, every controller:** a device also runs 5 seconds after every start and stop of a `daytime_savings` / `daytime_increasing` period, and when a person in a period's `presence` list comes home or leaves. Classic keeps its fixed interval and does not run on sensor reports.
-- **New, optional keys** `interval_minutes` (time between runs, default 30 / 15 minutes; it was 12 minutes for indoor mode before this version, `interval_minutes: 12` gives that back), `min_run_gap_minutes` (default 5), `room_sensor_stale_minutes`, `backup_sensor_stale_minutes`, `window_sensor_stale_minutes`, `window_trigger_delta`, `trend_hold_hours` (default 2), `max_setpoint_drop` (HVAC, default 3 C / 5.4 F), `cold_start_deficit` (default 2 C / 3.6 F) and the option `has_fireplace`, see [Device keys](#device-keys).
+- **`daytime_increasing` is +0.3 (was +0.5)**, hard-coded, in classic and adaptive (and -0.3 when cooling). The 0.5 held the room too warm after the period. `daytime_savings` stays 0.5. When a `daytime_savings` period is active at the same time as a `daytime_increasing` one, the savings replace the increase (the target goes from +0.3 straight to -0.5; before, the two were added). Nothing to configure; a room with an increase now ends about 0.2 C lower than before.
+- **Hold after an increase fixed and configurable**: the hold after a `daytime_increasing` period in which HVAC does not go from heat to `fan_only` was one hour and was lost at midnight (a period ending before midnight, asked after it, counted as ended the evening before). It now works across midnight, and `increase_hold_hours` (default 2 hours, 0 to 12) sets its length: more for a well insulated house, fewer for a leaky one. A period that ends shortly before a `daytime_savings` period starts is the case it is for. With `controller: adaptive` the hold ends early on a large sun term or a room 1 C above the `fan_only` line, see [After an increase](#after-an-increase-increase_hold_hours). Upgrading: the default hold is now 2 hours instead of 1; set `increase_hold_hours: 1` for the old length.
+- **New, optional: `mode` in `daytime_savings` / `daytime_increasing` entries and the key `mode_app`**, start the savings from the house mode (`night`, `away`) of Lightwand / ModeManagement, see [House modes in periods](#house-modes-in-periods-mode). Without a `mode` key nothing changes and nothing is listened to. New file `cc_modes.py` in the app folder.
+- **New, optional keys** `interval_minutes` (time between runs, default 30 / 15 minutes; it was 12 minutes for indoor mode before this version, `interval_minutes: 12` gives that back), `min_run_gap_minutes` (default 5), `room_sensor_stale_minutes`, `backup_sensor_stale_minutes`, `window_sensor_stale_minutes`, `window_trigger_delta`, `trend_hold_hours` (default 2), `max_setpoint_drop` (HVAC, default 3 C / 5.4 F), `cold_start_deficit` (default 2 C / 3.6 F), `increase_hold_hours` (default 2), `mode_app` and the option `has_fireplace`, see [Device keys](#device-keys).
 - Window notifications are sent once per event: "Window open" (getting cold) once after windows are opened, "Window closed" (getting hot, `getting_hot_offset` above target) once after they are closed. Before, "Window open" was sent once per app start and "Window closed" never. HVAC now uses the same rule as heaters: "Window open" also needs the outdoor temperature to be below `getting_cold`.
 - Outdoor values are kept per app, not shared between all ClimateCommander apps (they used to overwrite each other). At startup the last values sent by the Weather app are used.
 - The periodic runs of the devices (every 30 minutes, 15 minutes in table mode, or `interval_minutes`) are spread over the interval, so many devices do not call Home Assistant in the same second.
@@ -302,8 +305,8 @@ The target is `target_indoor_temp`, or the value of `target_indoor_input` (an `i
 **Indoor temperature.** The `indoor_sensor_temp` is used. When it is unavailable or has not reported for an hour (`room_sensor_stale_minutes`, see [Sensors that report rarely](#sensors-that-report-rarely)), `backup_indoor_sensor_temp` is used. Without a backup the last value is used even if it is old. Without any value, nothing is done in that run.
 
 **Adjustments to the indoor value before the calculation** (the setpoint is calculated as if the room had this temperature):
-- `daytime_increasing` active: the room counts as 0.5 colder, so the room is held 0.5 warmer.
-- `daytime_savings` active: the room counts as 0.5 warmer, so the room is held 0.5 cooler. While daytime savings is active, rain and wind are not used.
+- `daytime_increasing` active: the room counts as 0.3 colder, so the room is held 0.3 warmer.
+- `daytime_savings` active (also while `daytime_increasing` is, the increase then does not count): the room counts as 0.5 warmer, so the room is held 0.5 cooler. While daytime savings is active, rain and wind are not used.
 - Otherwise, wind at or above `anemometer_speed` in the last 30 minutes, or (without wind) rain at or above `rain_level`: the room counts as 0.3 colder.
 
 **Window sensor temperature.** With `window_sensor_temp` (for example a sensor in a sunny window): when it is above `target_indoor_temp + window_offset`, the setpoint is lowered by the difference.
@@ -401,10 +404,41 @@ Each period is a list entry with `start`, `stop` and optionally `presence` (a li
 | Key | Active when | Effect |
 |---|---|---|
 | `daytime_savings` | between `start` and `stop`, and nobody in `presence` is `home`. An entry with only `presence` (no times) is active whenever nobody in it is `home`. | Indoor mode: room held 0.5 cooler when heating, 0.5 warmer when cooling. Table mode: the save temperature. |
-| `daytime_increasing` | between `start` and `stop`, and (with `presence`) someone in `presence` is `home` | Indoor mode: room held 0.5 warmer when heating; 0.5 cooler when cooling. Ignored in table mode. During the hour after `stop`, HVAC does not switch from heat to `fan_only`. |
+| `daytime_increasing` | between `start` and `stop`, and (with `presence`) someone in `presence` is `home` | Indoor mode: room held 0.3 warmer when heating; 0.3 cooler when cooling. Ignored in table mode. During `increase_hold_hours` after `stop` (default 2 hours, also past midnight), HVAC does not switch from heat to `fan_only`, see [After an increase](#after-an-increase-increase_hold_hours). |
 | `silence` (HVAC) | between `start` and `stop`, not on vacation, and (with `presence`) someone in `presence` is `home`. Only the first period that matches the time is checked. | Fan mode `Silence`, see [HVAC modes](#hvac-modes-fan-and-preset). |
 
 A device runs 5 seconds after every `start` and `stop` of `daytime_savings` and `daytime_increasing`, so a period acts at its time and not at the next run. It also runs when a person in their `presence` lists comes home or leaves. `silence` only sets the fan mode and has its own timers at its times; it starts no run, and its `presence` is read at the next run.
+
+#### After an increase (`increase_hold_hours`)
+
+After a `daytime_increasing` period the room is warmer than the target, and the target then drops (the increase ends, and a `daytime_savings` period may start right after it). The unit would see a room above the `fan_only` line and switch to `fan_only`, and the room would fall below the target before it heats again. So for `increase_hold_hours` after `stop` (default 2) an HVAC does not switch from heat to `fan_only`; the savings start at their own time, only the `fan_only` switch waits. The hour counts from the `stop` time of the period, also when the check is made after midnight (a period ending 23:30 holds until 01:30 with the default; before this version the hold was lost at midnight). A better insulated house cools more slowly and may need more hours, a leaky one can set fewer.
+
+With `controller: adaptive` the hold ends early, so the fireplace and the sun still work:
+- the sun term of the window sensor is 1 C (1.8 F) or more (the same limit that keeps `fan_only` from going back to heat), or
+- the room is more than 1 C (1.8 F) above the normal `fan_only` line (target + 0.6), for example with a fireplace lit.
+
+Open windows (`windowsensors`) switch to `fan_only` at once, whatever the hold says. The classic controller has the hold but not the early end. The device runs again when the hold ends (adaptive), so `fan_only` is not left waiting for the next sensor report. The diagnostic sensor shows `increase_hold: true` while a switch to `fan_only` is waiting.
+
+#### House modes in periods (`mode`)
+
+An entry in `daytime_savings` or `daytime_increasing` can name a house mode (a word or a list) that it applies in. The mode is the one from the `MODE_CHANGE` event that [Lightwand](https://github.com/Pythm/ad-Lightwand) and [ModeManagement](https://github.com/Pythm/ad-ModeManagement) use, so a house that already has them can start the savings with `night` or `away`:
+
+```yaml
+  mode_app: manageModes        # optional: ModeManagement's app name, read at startup
+  daytime_savings:
+    - mode: night
+      stop: '05:00:00'         # heat up again before the morning
+    - mode: away
+      stop: '15:30:00'         # and before anyone comes home
+```
+
+- The entry applies while the house mode is one of the names. `night` also matches every mode that starts with the night word (`night`, `nightKid`, ...). The names are Lightwand's mode keys (`automagical`, `morning`, `night`, `away`, `off`, ...) and are translated if Lightwand's language file is installed (`night` in the YAML matches `natt` in a Norwegian house); any other text is compared as written, for example `family`.
+- Times are optional. With `start` and `stop` it applies in that window while the mode is on. With only `stop` the window starts 12 hours before it; with only `start` it ends 12 hours after it. With no times it lasts as long as the mode. **`stop` is how you give the room time to heat up again**: the savings end at `stop` even if the mode is still `night` or `away`, and the target goes back to normal.
+- When the mode changes the device runs 5 seconds later, so the savings start or end at once (someone coming home ends `away` savings, the morning mode ends `night` savings).
+- `presence` still works in the same entry: the mode and the person rule must both apply.
+- The house mode is learned from `MODE_CHANGE` events. `mode_app` (optional, the name of the ModeManagement app) also gives it after a restart; without it the mode is unknown until the next mode change, and an unknown mode matches nothing. A `mode_app` name that does not exist logs one WARNING.
+- Nothing is needed from Lightwand or ModeManagement unless an entry has a `mode`: without it no listener is created and nothing changes. Do not put `mode_translation` or the ModeManagement app under `dependencies:` unless they exist (a name that does not exist stops apps from starting); `mode_app` is read when needed and needs no dependency.
+- A period that ends with its mode (no `stop`) gives no hold after it.
 
 ---
 ## Adaptive controller (optional)
@@ -527,7 +561,7 @@ climate_living_room:
 - No trend hold (`trend_hold_hours` is classic only), no steady-room correction, no extra -1 after 4 hours turned down (D2), no fixed ±4 around a learned value.
 - The trend uses the real room reading and the real time between reports. The daytime and wind / rain shifts move the target, not the reading.
 - The window sensor counts relative to its learned level, not to `target + window_offset`, and it is not added up run after run.
-- HVAC modes: heat to `fan_only` when the room is 0.6 above the effective target (plus the spend offset during `spend`) and the setpoint is at its lowest (`max_setpoint_drop` below the target) or the room still rises 0.2 C (0.36 F) per hour (not seen on a sensor that reports less often than about every 25 minutes, see [Sensors that report rarely](#sensors-that-report-rarely)); with `options: [has_fireplace]` at 0.6 above alone. `fan_only` to heat at or below the effective target, not while the sun term is large, starting half a degree below the calculated setpoint. The 0.6 hysteresis now holds during daytime periods too. At least 30 minutes in a mode before an automatic switch (window and vacation switch at once). No heat to `fan_only` within 45 minutes of wind, in the hour after `daytime_increasing` or in the hour after a power state ended. Cooling uses the classic thresholds.
+- HVAC modes: heat to `fan_only` when the room is 0.6 above the effective target (plus the spend offset during `spend`) and the setpoint is at its lowest (`max_setpoint_drop` below the target) or the room still rises 0.2 C (0.36 F) per hour (not seen on a sensor that reports less often than about every 25 minutes, see [Sensors that report rarely](#sensors-that-report-rarely)); with `options: [has_fireplace]` at 0.6 above alone. `fan_only` to heat at or below the effective target, not while the sun term is large, starting half a degree below the calculated setpoint. The 0.6 hysteresis now holds during daytime periods too. At least 30 minutes in a mode before an automatic switch (window and vacation switch at once). No heat to `fan_only` within 45 minutes of wind, in the `increase_hold_hours` after `daytime_increasing` (ends early with a large sun term or a room 1 C above the line, see [After an increase](#after-an-increase-increase_hold_hours)) or in the hour after a power state ended. Cooling uses the classic thresholds.
 - The comfort guard during power states. With the defaults (`cold_start_deficit` 2, `comfort_guard` 1.5) a cold start after a vacation (below) is far enough below the target for the guard, so `save` / `reduce` do not lower it.
 - **Cold start after vacation** (indoor mode): when the vacation ends with the filtered room at least `cold_start_deficit` below the effective target, the setpoint is the effective target plus the difference (at most 6 C / 10.8 F above, at most `max_temp`), sent at once and held with the integral frozen; once the room is within 1 C (1.8 F) of the effective target, or after 8 hours, one move to the controller's own calculated setpoint, with the integral set so that it stays there. Ends early on a window, a new vacation, `fan_only` / cool, or a setpoint changed by hand; not kept over a restart. In `shadow` the controller only proposes it (virtual setpoint, diagnostic sensor); classic does its own cold start on the climate.
 - The room estimate from the climate's own sensor when the room sensor is gone.
@@ -556,7 +590,7 @@ An HVAC device runs as described in [When a device runs](#when-a-device-runs) an
 - Vacation: setpoint `vacation_temp`. When the room is above `target_indoor_temp - 3` and above `vacation_temp + 3`: switch to `fan_only`.
 - Otherwise the setpoint comes from the indoor rules (or the table), and:
   - wind at or above `anemometer_speed` in the last 25 minutes and the room more than 0.7 below the target: preset `boost`, if the climate offers it and the fan mode is not `Silence`. When that is no longer the case, a `boost` preset is set back to `none`;
-  - room more than 0.6 above the target, no wind in the last 45 minutes, and not in the hour after a `daytime_increasing` period:
+  - room more than 0.6 above the target, no wind in the last 45 minutes, and not in the `increase_hold_hours` (default 2) after a `daytime_increasing` period ([After an increase](#after-an-increase-increase_hold_hours)):
     - with `options: [has_fireplace]`, in table mode, or while ElectricalManagement sends `save`, `spend` or `reduce`: switch to `fan_only`;
     - otherwise switch to `fan_only` only when the setpoint is already at its lowest (`target_indoor_temp - max_setpoint_drop`, at least the climate's `min_temp`) or the room still rises 0.2 C (0.36 F) per hour or more (not seen on a sensor that reports less often than about every 25 minutes, see [Sensors that report rarely](#sensors-that-report-rarely)). Else the setpoint is lowered by the adjustment, at once and not below the lowest, and the unit stays in heat;
   - after such a lowering: once the room is at or below the target and does not reach it within `trend_hold_hours` by itself, the setpoint goes back in one move to the value from before the lowering, at most the learned setpoint and the target + 4.
@@ -752,6 +786,8 @@ In a one-device app these go at the top level. In the deprecated list style they
 | `room_sensor_stale_minutes` | number | no | 60 | After this long without a report `indoor_sensor_temp` counts as unavailable, 5 to 1440. See [Sensors that report rarely](#sensors-that-report-rarely). |
 | `backup_sensor_stale_minutes` | number | no | 60 with `adaptive` and `shadow`, no limit with `classic` | The same for `backup_indoor_sensor_temp`, 5 to 1440. |
 | `window_sensor_stale_minutes` | number | no | 720 with `adaptive` and `shadow`, no limit with `classic` | The same for `window_sensor_temp`, 5 to 4320. |
+| `increase_hold_hours` | number | no | 2 | No heat to `fan_only` for this many hours after a `daytime_increasing` period ends, 0 to 12 (0: no hold). See [After an increase](#after-an-increase-increase_hold_hours). |
+| `mode_app` | string | no | none | Name of the ModeManagement app. Only used by periods with a `mode`: its `current_mode` is read, so the house mode is known after a restart. See [House modes in periods](#house-modes-in-periods-mode). |
 | `trend_hold_hours` | number | no | 2 | Indoor mode (classic): the setpoint is kept while the room reaches the target within this many hours at its trend, 0 to 12 (0: never kept). See [the step rules](#indoor-mode-keep-a-fixed-indoor-temperature). |
 | `max_setpoint_drop` | number | no | 3 C / 5.4 F | HVAC in heat, indoor mode: lowest setpoint is `target_indoor_temp` minus this (at least the climate's `min_temp`). Above 0, at most 15. Also used by `controller: adaptive`. |
 | `cold_start_deficit` | number | no | 2 C / 3.6 F | Indoor mode: when a vacation ends with the room at least this far below the target, the heating starts with the target plus the difference, see [Cold start after vacation](#cold-start-after-vacation). 0.5 to 10. Also used by `controller: adaptive`. |
@@ -816,9 +852,10 @@ Each entry in `daytime_savings`, `daytime_increasing` and `silence`:
 
 | Key | Type | Required | Default | Meaning |
 |---|---|---|---|---|
-| `start` | string | yes (except `daytime_savings` with only `presence`) | | Start time, quoted, for example `'10:00:00'`. |
+| `start` | string | yes (except `daytime_savings` with only `presence`, and entries with a `mode`) | | Start time, quoted, for example `'10:00:00'`. |
 | `stop` | string | yes (same) | | Stop time, quoted. |
 | `presence` | list | no | none | `person` entities, see [Periods](#periods-daytime-savings-daytime-increasing-silence). |
+| `mode` | string or list | no | none | `daytime_savings` / `daytime_increasing` only: the house mode(s) the entry applies in. With a `mode`, `start` and `stop` are optional. See [House modes in periods](#house-modes-in-periods-mode). |
 
 ---
 ## Full example configurations
@@ -948,7 +985,7 @@ The configuration is checked with pydantic models (`AppConfig` and `DeviceConfig
 - Table entries: only `out` is checked; `offset`, `normal`, `save` and `vacation` are used as written.
 - `automate` must be an entity id; `true` / `false` are accepted but ignored.
 - A `target_mode` other than `indoor` or `table` is ignored, and the mode is chosen from the keys.
-- `interval_minutes` must be 1 to 120, `min_run_gap_minutes` 1 to 30, `room_sensor_stale_minutes` and `backup_sensor_stale_minutes` 5 to 1440, `window_sensor_stale_minutes` 5 to 4320, `window_trigger_delta` 0 to 20 or `true` / `false`, `trend_hold_hours` 0 to 12, `max_setpoint_drop` above 0 and at most 15, `cold_start_deficit` 0.5 to 10 (in the unit of the device: in F at most 10 F). Flags go in `options` (`options: [has_fireplace]`); `has_fireplace: true` as its own key is an unknown key and is ignored.
+- `interval_minutes` must be 1 to 120, `min_run_gap_minutes` 1 to 30, `room_sensor_stale_minutes` and `backup_sensor_stale_minutes` 5 to 1440, `window_sensor_stale_minutes` 5 to 4320, `window_trigger_delta` 0 to 20 or `true` / `false`, `trend_hold_hours` 0 to 12, `increase_hold_hours` 0 to 12, `max_setpoint_drop` above 0 and at most 15, `cold_start_deficit` 0.5 to 10 (in the unit of the device: in F at most 10 F). Flags go in `options` (`options: [has_fireplace]`); `has_fireplace: true` as its own key is an unknown key and is ignored.
 - The [adaptive controller keys](#keys) are checked strictly: `controller` must be `classic`, `shadow` or `adaptive`; `outdoor_gain` 0 to 0.6, `solar_gain` 0 to 5, `solar_max` and `comfort_guard` above 0; `diagnostic_sensor` must look like an entity id; table entries may only have their documented keys, offsets between -30 and 30, no `out` twice, and `target_table` entries exactly one of `target` / `offset`.
 
 ---

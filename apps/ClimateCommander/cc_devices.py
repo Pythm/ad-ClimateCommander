@@ -39,7 +39,8 @@ import bisect
 import datetime
 import math
 
-from cc_control import ControlConfig, IndoorController, Inputs, ROOM_STALE_S, ls_slope_h
+from cc_control import ControlConfig, IndoorController, Inputs, ROOM_STALE_S, SHIFT_INCREASE, ls_slope_h
+from cc_modes import load_translations, mode_matches, track
 
 UNAVAIL = ('unavailable', 'unknown')
 POWER_STATES = ('normal', 'save', 'spend', 'reduce')
@@ -51,6 +52,7 @@ DIAG_WRITE_EVERY = datetime.timedelta(minutes = 10)      # shadow / adaptive: di
 PERIOD_RUN_DELAY = 5               # seconds after the start or stop of a daytime period: the run that acts on it
 PERIOD_WAIT_STEP = 3600            # seconds: the wait for a period time is checked against the local clock at least this often
 STEP = 0.5                         # one setpoint step (climate entities take 0.5 steps)
+MODE_WINDOW_HOURS = 12             # a period with a `mode` and only one of start / stop: the other end is this far away
 TREND_WINDOW = datetime.timedelta(minutes = 60)   # room trend: least squares over the reports of the last hour ...
 TREND_MIN_POINTS = 3                               # ... with at least this many reports ...
 TREND_MIN_SPAN = datetime.timedelta(minutes = 20)  # ... spanning at least this (else the trend is unknown, 0)
@@ -66,7 +68,7 @@ ROOM_SCREEN_EVERY = datetime.timedelta(minutes = 5)   # room trigger (_room_scre
                                    # this often. A room sensor in the airflow reports every few seconds, and every attempt
                                    # reads several HA states per screen; one try per 5 min is still 6 times the run cadence.
 DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'rate_wide', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
-             'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl')
+             'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl', 'increase_hold')
 
 
 def round_half(value: float) -> float:
@@ -184,7 +186,19 @@ class Heater:
 
         self.daytime_savings:list = cfg.get('daytime_savings') or []
         self.daytime_increasing:list = cfg.get('daytime_increasing') or []
+        self.increase_hold = datetime.timedelta(hours = cfg.get('increase_hold_hours', 2.0))
         self.automate = cfg.get('automate')
+
+            # House mode (optional): periods with a `mode` key
+        self.mode_app_name = cfg.get('mode_app')
+        self._tracked_mode = None          # the house mode seen in MODE_CHANGE events (used when mode_app gives none)
+        self._mode_app_missing_logged = False
+        self._translations = None
+        if any(period.get('mode') for period in self.daytime_savings + self.daytime_increasing):
+            self._translations = load_translations()
+            self.ADapi.listen_event(self._mode_event, self._translations.MODE_CHANGE,
+                namespace = self.namespace
+            )
 
             # Indoor temperature trend
         self.trend_hold_hours:float = cfg.get('trend_hold_hours', 2.0)
@@ -500,8 +514,25 @@ class Heater:
         return False
 
     def _schedule_period_runs(self) -> None:
-        for value in clock_times(self.daytime_savings + self.daytime_increasing):
+        for value in self._period_clock_times():
             self._arm_period_time(value)
+
+    def _period_clock_times(self) -> list:
+        """ The clock times that start a run: every start and stop, the end of a period with a mode and only one of them,
+            and (adaptive) the end of the hold after a daytime_increasing stop, where fan_only may be allowed again. """
+        times = set(clock_times(self.daytime_savings + self.daytime_increasing))
+        for period in self.daytime_savings + self.daytime_increasing:
+            if period.get('mode') and (period.get('start') is None) != (period.get('stop') is None):
+                if period.get('start') is None:
+                    times.add(self._shift_clock(period['stop'], -MODE_WINDOW_HOURS))
+                else:
+                    times.add(self._shift_clock(period['start'], MODE_WINDOW_HOURS))
+        if self.controller == 'adaptive' and self.increase_hold.total_seconds() > 0:
+            for period in self.daytime_increasing:
+                if period.get('stop') is not None and (period.get('start') is not None or period.get('mode')):
+                    times.add(self._shift_clock(period['stop'], self.increase_hold.total_seconds() / 3600))
+        times.discard(None)
+        return sorted(times)
 
     def _arm_period_time(self, value:str) -> None:
         """ Waits for the next time this clock time comes, and is set again when it comes. """
@@ -732,30 +763,48 @@ class Heater:
         """ Checks if it is time during day to increase temperature.
             Also returns a boolean if is has been increased to prevent setting fan_only or cooling after increasing periode. """
         doDaytimeIncreasing = False
-        afterDaytimeIncrease = False
-        now = self.ADapi.datetime()
         for daytime in self.daytime_increasing:
+            daytime = self._mode_period(daytime)
+            if daytime is None:
+                continue
             if 'start' in daytime and 'stop' in daytime:
                 if self.ADapi.now_is_between(daytime['start'], daytime['stop']):
                     doDaytimeIncreasing = True
                     if 'presence' in daytime:
-                        doDaytimeIncreasing = False
-                        for presence in daytime['presence']:
-                            if self.ADapi.get_state(presence, namespace = self.namespace) == 'home':
-                                doDaytimeIncreasing = True
-                end_time_increase = self.ADapi.parse_datetime(daytime['stop'])
+                        doDaytimeIncreasing = self._anyone_home(daytime['presence'])
+            elif daytime.get('_always'):
+                doDaytimeIncreasing = True
+                if 'presence' in daytime:
+                    doDaytimeIncreasing = self._anyone_home(daytime['presence'])
 
-                if now > end_time_increase + datetime.timedelta(hours = 1):
-                    end_time_increase += datetime.timedelta(days = 1)
+        return doDaytimeIncreasing, self._after_increase()
 
-                if end_time_increase < now < end_time_increase + datetime.timedelta(hours = 1):
-                    afterDaytimeIncrease = True
-
-        return doDaytimeIncreasing, afterDaytimeIncrease
+    def _after_increase(self) -> bool:
+        """ Within increase_hold_hours after the stop of a daytime_increasing period. The last stop may be yesterday's (a
+            stop before midnight, asked after it), and a period ending with its mode has no clock stop and no hold. """
+        if self.increase_hold.total_seconds() <= 0:
+            return False
+        now = self.ADapi.datetime()
+        for daytime in self.daytime_increasing:
+            stop = daytime.get('stop')
+            if stop is None or ('start' not in daytime and not daytime.get('mode')):
+                continue
+            try:
+                end = self.ADapi.parse_datetime(self._clock_str(stop))
+            except (ValueError, TypeError, NotImplementedError):
+                continue
+            if end > now:
+                end -= datetime.timedelta(days = 1)
+            if end <= now < end + self.increase_hold:
+                return True
+        return False
 
     def DaytimeSaving(self) -> bool:
         doDaytimeSaving = False
         for daytime in self.daytime_savings:
+            daytime = self._mode_period(daytime)
+            if daytime is None:
+                continue
             if 'start' in daytime and 'stop' in daytime:
                 if self.ADapi.now_is_between(daytime['start'], daytime['stop']):
                     doDaytimeSaving = True
@@ -770,7 +819,78 @@ class Heater:
                     if self.ADapi.get_state(presence, namespace = self.namespace) == 'home':
                         doDaytimeSaving = False
 
+            elif daytime.get('_always'):
+                doDaytimeSaving = True
+
         return doDaytimeSaving
+
+    def _anyone_home(self, persons) -> bool:
+        for person in persons:
+            if self.ADapi.get_state(person, namespace = self.namespace) == 'home':
+                return True
+        return False
+
+    # ------------------------------------------------------------------ #
+    # House mode (periods with a `mode` key)
+    # ------------------------------------------------------------------ #
+
+    def _mode_event(self, event_name, data, **kwargs) -> None:
+        """ MODE_CHANGE: follows the house mode and starts a run, so a period with that mode acts at once. """
+        mode = track(data.get('mode') if isinstance(data, dict) else None, self._translations)
+        if not mode or mode == self._tracked_mode:
+            return
+        self._tracked_mode = mode
+        self._period_boundary()
+
+    def _house_mode(self):
+        """ The house mode: ModeManagement's current_mode (mode_app) when it has one, else the last house mode seen in a
+            MODE_CHANGE event, else None (unknown matches no mode). """
+        if self.mode_app_name:
+            app = self.ADapi.get_app(self.mode_app_name)
+            mode = getattr(app, 'current_mode', None) if app is not None else None
+            if isinstance(mode, str) and mode:
+                return mode
+            if app is None and not self._mode_app_missing_logged:
+                self._mode_app_missing_logged = True
+                self.ADapi.log(f"{self.heater}: mode_app '{self.mode_app_name}' not found. Following MODE_CHANGE events only.", level = 'WARNING')
+        return self._tracked_mode
+
+    def _mode_period(self, period:dict):
+        """ The period as it applies now, or None when it does not. Without a `mode` it is the period itself. With one, the
+            house mode must match; a period with only `stop` starts MODE_WINDOW_HOURS before it, one with only `start` ends
+            that long after it, and one with neither lasts as long as the mode (marked `_always`). """
+        modes = period.get('mode')
+        if not modes:
+            return period
+        if self._translations is None or not mode_matches(self._house_mode(), modes, self._translations):
+            return None
+        start, stop = period.get('start'), period.get('stop')
+        if start is None and stop is None:
+            return {**period, '_always': True}
+        if start is None:
+            start = self._shift_clock(stop, -MODE_WINDOW_HOURS)
+        elif stop is None:
+            stop = self._shift_clock(start, MODE_WINDOW_HOURS)
+        if start is None or stop is None:
+            return None
+        return {**period, 'start': self._clock_str(start), 'stop': self._clock_str(stop)}
+
+    @staticmethod
+    def _clock_str(value):
+        """ YAML 1.1 reads an unquoted 22:00:00 as the number 79200: back to a clock string. """
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 86400:
+            return f"{value // 3600:02d}:{value % 3600 // 60:02d}:{value % 60:02d}"
+        return value
+
+    def _shift_clock(self, value, hours:float):
+        """ A clock time moved by hours (over midnight), as HH:MM:SS; None when the time is not understood. """
+        try:
+            at = self.ADapi.parse_time(self._clock_str(value))
+        except (ValueError, TypeError, NotImplementedError):
+            self.ADapi.log(f"{self.heater}: period time '{value}' not understood.", level = 'WARNING')
+            return None
+        seconds = (at.hour * 3600 + at.minute * 60 + at.second + int(round(hours * 3600))) % 86400
+        return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
     # ------------------------------------------------------------------ #
     # Notifications
@@ -850,11 +970,12 @@ class Heater:
 
         shifted = False   # target moved by daytime increasing/saving: do not learn the setpoint
         doDaytimeIncreasing, afterDaytimeIncrease = self.DaytimeIncreasing()
-        if doDaytimeIncreasing:
-            in_temp -= 0.5
+        saving = self.DaytimeSaving()
+        if doDaytimeIncreasing and not saving:   # savings replace an increase, they do not add to it
+            in_temp -= SHIFT_INCREASE
             shifted = True
 
-        if self.DaytimeSaving():
+        if saving:
             in_temp += 0.5
             shifted = True
         else:
@@ -1978,11 +2099,12 @@ class Aircondition(Heater):
 
             shifted = False
             doDaytimeIncreasing, afterDaytimeIncrease = self.DaytimeIncreasing()
-            if doDaytimeIncreasing:
-                in_temp -= 0.5
+            saving = self.DaytimeSaving()
+            if doDaytimeIncreasing and not saving:   # savings replace an increase, they do not add to it
+                in_temp -= SHIFT_INCREASE
                 shifted = True
 
-            if self.DaytimeSaving():
+            if saving:
                 in_temp += 0.5
                 shifted = True
             else:
@@ -2080,10 +2202,11 @@ class Aircondition(Heater):
                 return
 
             doDaytimeIncreasing, afterDaytimeIncrease = self.DaytimeIncreasing()
-            if doDaytimeIncreasing:
-                in_temp += 0.5
+            saving = self.DaytimeSaving()
+            if doDaytimeIncreasing and not saving:
+                in_temp += SHIFT_INCREASE
 
-            if self.DaytimeSaving():
+            if saving:
                 in_temp -= 0.5
             else:
                 # Wind/rain: same direction as in heating, less cooling needed (deliberate)
