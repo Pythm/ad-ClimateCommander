@@ -57,7 +57,7 @@ COLD_BACK_WITHIN = 1.0          # (deg) owner: ... until the room is this close 
 COLD_START_MAX_H = 8            # owner: ... or this many hours (safety); then one move to sp_ctrl, the integral set to it
 POWER_END_HOLD_S = 3600         # no automatic heat -> fan_only this long after a power state ended (the room was
                                 #    moved on purpose by spend; without this a small room went to fan_only right after spend)
-DB_ABOVE = 0.1                  # (deg) D1: integrate when the room is above target_eff by more than this
+DB_ABOVE = 0.1                  # (deg) deadband: integrate when the room is above target_eff by more than this
 DB_BELOW = 0.25                 # (deg) ... or below it by more than this
 I_CLAMP = 6.0                   # (deg) integral bound (floor thermostats read 5+ above the room)
 SP_SPAN = 8.0                   # (deg) setpoint within target +- this (as classic)
@@ -135,7 +135,7 @@ def clamp(x, lo, hi):
 
 def table_entry(table, x):
     """ The entry that applies at x: the last one with out <= x; below the first entry, the first one
-        (bisect_right, the same rule as 'temperatures', T1). None without a table or x. """
+        (bisect_right, the same rule as 'temperatures'). None without a table or x. """
     if not table or x is None:
         return None
     outs = [e['out'] for e in table]
@@ -355,11 +355,11 @@ class Inputs:
     internal: float | None = None         # climate current_temperature
     out_temp: float | None = None
     lux: float | None = None
-    daytime: bool | None = None           # classic 'sunrise'..'sunset - 00:30' (E1); sun flag when lux is None
+    daytime: bool | None = None           # classic 'sunrise'..'sunset - 00:30'; sun flag when lux is None
     since_windy_s: float | None = None    # seconds since wind >= anemometer_speed
     wind_now: bool = False                # table mode: wind >= anemometer_speed right now
     raining: bool = False                 # rain >= rain_level
-    rain: float = 0.0                     # rain amount (E5: cool -> fan_only at night when > 0)
+    rain: float = 0.0                     # rain amount (as classic: cool -> fan_only at night when > 0)
     windows_open: bool = False
     since_window_closed_s: float | None = None
     vacation: bool = False
@@ -574,7 +574,7 @@ class IndoorController:
 
     def _indoor(self, inp, R, src, now, dt_s):
         """ in_f (filtered room) and the report history for the trend. Real readings are keyed by their report
-            time, so a stale value is not a new sample and extra runs do not fake a trend (C3, C4, C5). """
+            time, so a stale value is not a new sample and extra runs do not fake a trend. """
         if src in ('primary', 'backup'):
             age = inp.room_age_s if src == 'primary' else inp.backup_age_s
             t_rep = now - datetime.timedelta(seconds = age) if age is not None else now
@@ -855,7 +855,7 @@ class IndoorController:
 
     def _pi(self, tgt, ff, solar, rate, base, dt_s, integrate, attr = 'i_term'):
         """ sp_ctrl = clamp(tgt + ff + i + p - solar). The integral (attr) runs only when allowed, outside the
-            D1 deadband, and not further into a clamp (anti-windup). """
+            deadband (DB_BELOW / DB_ABOVE), and not further into a clamp (anti-windup). """
         s = self.s
         lo, hi = self.limits(base, 'cool' if attr == 'i_cool' else 'heat')
         if self.in_f is None:
@@ -872,7 +872,7 @@ class IndoorController:
 
     def _bumpless(self, d, inp, tgt, ff, solar, rate, attr = 'i_term', mode = 'heat', first = False):
         """ At start, after a restart and after a manual change: the integral is set so that sp_ctrl equals the
-            current setpoint (without a power offset that is in it), so nothing jumps (S9). """
+            current setpoint (without a power offset that is in it), so nothing jumps. """
         if inp.setpoint is not None and not inp.windows_open and not inp.vacation:
             if first and self.in_f is not None and abs(tgt - self.in_f) > self.t.i_band * self.s:
                 # Start (or restart) with the room far from target: the integral is NOT set to hold the current
@@ -1065,7 +1065,7 @@ class IndoorController:
         if self.in_f <= tgt and solar < 1.0 * s:
             self._mode(d, now, 'heat')
             if not self._cold_begin(d, inp, now, tgt):
-                self._send(d, inp, now, sp_ctrl - STEP, bypass = True)   # replaces D5
+                self._send(d, inp, now, sp_ctrl - STEP, bypass = True)   # instead of classic's start after fan_only (offset -1)
             self.started = True
 
     def _cool(self, d, inp, now, dt_s, R, src, base, solar, rate, windy, raining):
@@ -1088,7 +1088,7 @@ class IndoorController:
         if first or self._manual(d, inp, 'cool'):
             self._bumpless(d, inp, tgt, 0.0, solar, rate, 'i_cool', 'cool', first = first)
         freeze = self._freeze(inp, src, tgt)
-        # cooling: no feed-forward, the sun term adds cooling (lower setpoint), never learned (E2)
+        # cooling: no feed-forward, the sun term adds cooling (lower setpoint), never learned (as classic)
         sp_ctrl, p = self._pi(tgt, 0.0, solar, rate, base, dt_s, freeze is None, 'i_cool')
         d.diag.update(mode = 'cool', target_eff = tgt, i = self.i_cool, p = p, sp_ctrl = sp_ctrl, frozen = freeze)
         active, edge = self._power_layer(d, inp, tgt, 'cool')
@@ -1100,7 +1100,8 @@ class IndoorController:
     def _table(self, d, inp, now, dt_s, R, src, base, solar, rate, windy, raining):
         """ Heater table mode with the adaptive trim: table base + rain/wind 1 -
             min(3, sun + room above target) + trim_i, then save / spend / vacation / min_temp as classic. The
-            room term uses R_used (an estimate counts); without any room value it is dropped (C19). """
+            room term uses R_used (an estimate counts); without any room value it is dropped (classic counts the
+            climate's current_temperature as the room then, which on a floor thermostat is the floor). """
         cfg, s = self.cfg, self.s
         if inp.out_temp is None or inp.hvac_mode in (None, 'off'):
             return
