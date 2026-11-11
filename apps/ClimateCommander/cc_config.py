@@ -186,14 +186,6 @@ class AppConfig(_Model):
     def _lists(cls, value: Any) -> Any:
         return _as_list(value)
 
-    def deprecated_keys(self) -> List[str]:
-        """ Deprecated keys that are present in the config. """
-        present = []
-        for key in ('outside_temperature', 'rain_sensor', 'anemometer', 'away_state'):
-            if key in self.model_fields_set:
-                present.append(key)
-        return present
-
 
 class DeviceConfig(_Model):
     """ One climate entity. """

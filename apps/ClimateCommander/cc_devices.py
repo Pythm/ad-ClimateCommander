@@ -187,6 +187,8 @@ class Heater:
         self.daytime_savings:list = cfg.get('daytime_savings') or []
         self.daytime_increasing:list = cfg.get('daytime_increasing') or []
         self.increase_hold = datetime.timedelta(hours = cfg.get('increase_hold_hours', 2.0))
+        self._increase_applied:dict = {}   # daytime_increasing index -> the stop (local) of the last period that applied
+        self._started_local = self.ADapi.datetime()   # a period that stopped before this was not seen (restart)
         self.automate = cfg.get('automate')
 
             # House mode (optional): periods with a `mode` key
@@ -481,11 +483,12 @@ class Heater:
 
     def _mark_run(self) -> None:
         """ At the start of every run, whatever started it. The minimum gap counts from here, and a waiting run has
-            nothing left to do: this run reads the same values. """
+            nothing left to do: this run reads the same values. The daytime_increasing periods that apply are noted. """
         self._last_run = self.ADapi.datetime(aware=True)
         if self._run_timer is not None:
             self.ADapi.cancel_timer(self._run_timer, silent = True)
             self._run_timer = None
+        self._increasing_now()
 
     def _window_temp_reported(self, entity, attribute, old, new, **kwargs) -> None:
         """ window_sensor_temp: a run when the value moved window_trigger_delta since the run that last used it. """
@@ -762,8 +765,13 @@ class Heater:
     def DaytimeIncreasing(self) -> tuple[bool, bool]:
         """ Checks if it is time during day to increase temperature.
             Also returns a boolean if is has been increased to prevent setting fan_only or cooling after increasing periode. """
+        return self._increasing_now(), self._after_increase()
+
+    def _increasing_now(self) -> bool:
+        """ Whether a daytime_increasing period applies now (its times, mode and presence). Notes the stop of every period
+            that applies, for the hold after it. Every run calls it (_mark_run), whatever the run does next. """
         doDaytimeIncreasing = False
-        for daytime in self.daytime_increasing:
+        for index, daytime in enumerate(self.daytime_increasing):
             daytime = self._mode_period(daytime)
             if daytime is None:
                 continue
@@ -772,20 +780,33 @@ class Heater:
                     doDaytimeIncreasing = True
                     if 'presence' in daytime:
                         doDaytimeIncreasing = self._anyone_home(daytime['presence'])
+                    if doDaytimeIncreasing:
+                        self._note_increase_applied(index, daytime['stop'])
             elif daytime.get('_always'):
                 doDaytimeIncreasing = True
                 if 'presence' in daytime:
                     doDaytimeIncreasing = self._anyone_home(daytime['presence'])
+        return doDaytimeIncreasing
 
-        return doDaytimeIncreasing, self._after_increase()
+    def _note_increase_applied(self, index:int, stop) -> None:
+        """ Period `index` applies now: its stop (today's, or tomorrow's for a period past midnight) gets a hold. """
+        try:
+            end = self.ADapi.parse_datetime(self._clock_str(stop))
+        except (ValueError, TypeError, NotImplementedError):
+            return
+        if end < self.ADapi.datetime():
+            end += datetime.timedelta(days = 1)
+        self._increase_applied[index] = end
 
     def _after_increase(self) -> bool:
-        """ Within increase_hold_hours after the stop of a daytime_increasing period. The last stop may be yesterday's (a
-            stop before midnight, asked after it), and a period ending with its mode has no clock stop and no hold. """
+        """ Within increase_hold_hours after the stop of a daytime_increasing period that applied: at some run between its
+            start and its stop its mode matched and someone in its presence list was home (when it has them). A period whose
+            conditions never held has no hold. The last stop may be yesterday's (a stop before midnight, asked after it), and a
+            period ending with its mode has no clock stop and no hold. """
         if self.increase_hold.total_seconds() <= 0:
             return False
         now = self.ADapi.datetime()
-        for daytime in self.daytime_increasing:
+        for index, daytime in enumerate(self.daytime_increasing):
             stop = daytime.get('stop')
             if stop is None or ('start' not in daytime and not daytime.get('mode')):
                 continue
@@ -795,9 +816,20 @@ class Heater:
                 continue
             if end > now:
                 end -= datetime.timedelta(days = 1)
-            if end <= now < end + self.increase_hold:
+            if end <= now < end + self.increase_hold and self._increase_did_apply(index, daytime, end):
                 return True
         return False
+
+    def _increase_did_apply(self, index:int, period:dict, end) -> bool:
+        """ The period ending at `end` applied. Started (or restarted) after that stop, the app has not seen the period:
+            then its mode and presence now decide, the same gate as while it runs. """
+        if self._increase_applied.get(index) == end:
+            return True
+        if self._started_local < end:
+            return False
+        if self._mode_period(period) is None:
+            return False
+        return 'presence' not in period or self._anyone_home(period['presence'])
 
     def DaytimeSaving(self) -> bool:
         doDaytimeSaving = False
@@ -1719,6 +1751,8 @@ class Heater:
         inp = self._controller_inputs(state, setpoint)
         pw_before = self.ctrl.pw_state
         dec = self.ctrl.update(inp)
+        if not shadow:
+            self._vacation_ended = False   # the controller makes its own start after a vacation (cold start) in this run
         for level, text in dec.logs:
             self.ADapi.log(f"{self.heater}: {'[shadow] ' if shadow else ''}{text}", level = level)
 

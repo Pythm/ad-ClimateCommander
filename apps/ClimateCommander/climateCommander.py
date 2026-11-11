@@ -250,6 +250,7 @@ class Climate(ad.ADBase):
         last_sent = getattr(weather_app, 'last_sent', None) if weather_app is not None else None
         if isinstance(last_sent, dict):
             self.weather_event('WEATHER_CHANGE', last_sent)
+            self.weather_lux.weather_event('WEATHER_CHANGE', last_sent)   # and the lux
 
     def terminate(self):
         """ Called by AppDaemon before a reload or stop: writes the state of shadow / adaptive controllers. """

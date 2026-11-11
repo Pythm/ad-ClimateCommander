@@ -1,15 +1,13 @@
 """ Adaptive indoor-temperature controller for ClimateCommander (controller: shadow / adaptive), pure Python.
 
-    Identical copy of the harness prototype: apps/ClimateCommander/cc_control.py and
-    .claude/audit_out/cc_harness/proto_controller.py must stay byte-identical; change both. No AppDaemon
-    imports. The caller (cc_devices.py in the app, proto.py in the harness) reads the entities, fills an Inputs, calls
-    IndoorController.update() once per control run (periodic, on window/vacation/power events and, in indoor mode, on
-    new room and window sensor reports at most once per min_run_gap_minutes) and carries out the returned Decision
-    (temperature, hvac_mode, preset, logs, save, retry_s). Runs need not be evenly spaced: the integrals are weighted
-    by time, and learning and smoothing go by time, not by the number of runs.
+    No AppDaemon imports, so it also runs outside AppDaemon (in a simulation). The caller (cc_devices.py) reads the
+    entities, fills an Inputs, calls IndoorController.update() once per control run (periodic, on window/vacation/power
+    events and, in indoor mode, on new room and window sensor reports at most once per min_run_gap_minutes) and carries
+    out the returned Decision (temperature, hvac_mode, preset, logs, save, retry_s). Runs need not be evenly spaced: the
+    integrals are weighted by time, and learning and smoothing go by time, not by the number of runs.
 
-    Design: PLAN_CC_indoor_control_opus.md sections 3 and 4 and DESIGN_ADDENDUM_steer.md, with the owner
-    answers of 2026-10-22/23. Heating:
+    Design: a PI controller on the room sensor with feed-forward, a learned window-sensor baseline for the sun term
+    and a learned climate-sensor offset, with the owner decisions of 2026-10-22/23. Heating:
         target_eff = target (or target_table(out_day)) + daytime increasing/saving + wind/rain shift
         R_used     = primary room sensor | backup + learned backup bias | internal - bias_int | None
         ff         = ff_bias_weight * bias_int(out_slow, windy, raining) + outdoor_gain * (target - out_slow)
@@ -34,8 +32,8 @@ import statistics
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------------------------------- #
-# Constants. [tuned] = chosen by the R2 scripted search in the simulation (cc_harness/r2/tune_search.py);
-# the others are owner decisions or design values from the plan / addendum.
+# Constants. [tuned] = chosen by a scripted search in a thermal simulation of rooms fitted to measured history;
+# the others are owner decisions or design values.
 # ---------------------------------------------------------------------------------------------------- #
 VERSION = 1
 MIN_CHANGE_S = 720              # owner: at most one setpoint change per 12 min
@@ -58,7 +56,7 @@ COLD_START_MAX = 6.0            # (deg) owner: ... at target_eff + the deficit, 
 COLD_BACK_WITHIN = 1.0          # (deg) owner: ... until the room is this close to target_eff ...
 COLD_START_MAX_H = 8            # owner: ... or this many hours (safety); then one move to sp_ctrl, the integral set to it
 POWER_END_HOLD_S = 3600         # no automatic heat -> fan_only this long after a power state ended (the room was
-                                #    moved on purpose by spend; found in R2 on room_B S7)
+                                #    moved on purpose by spend; without this a small room went to fan_only right after spend)
 DB_ABOVE = 0.1                  # (deg) D1: integrate when the room is above target_eff by more than this
 DB_BELOW = 0.25                 # (deg) ... or below it by more than this
 I_CLAMP = 6.0                   # (deg) integral bound (floor thermostats read 5+ above the room)
@@ -88,24 +86,27 @@ TRIM_CLAMP = 2.0                # (deg) table mode: trim integral bound
 DAY_TAU_S = 24 * 3600           # out_day filter (target_table)
 TARGET_TABLE_HOLD_S = 24 * 3600 # target_table entry changes at most once a day
 SAVE_EVERY_S = 3600             # persist at most once an hour (and on power-state changes)
-BACKUP_ALPHA = 0.1              # EWMA of primary minus backup while both are fresh, this much per interval_s (by time)
-# learned relations (LearnedGap, addendum 1.1)
+BACKUP_ALPHA = 0.1              # EWMA of primary minus backup while both are fresh, this much per SAMPLE_S (by time)
+# learned relations (LearnedGap)
 GAP_BW = 2.0                    # (deg) bin width (4 F)
 N_USE = 5                       # smallest bin used
 N_VALID = 30                    # outlier rejection starts here
 N_PRIOR_WR = 10                 # prior weight of the wind / rain terms
 N_FORGET = 300                  # floor of the learning rate: 1 / N_FORGET
 REJECT = 5.0                    # (deg) outlier limit
-SAMPLE_MIN_S = 600              # learning samples and sun-trend points: at most one per this or interval_s, the longer
-                                #    (extra runs on sensor reports must not learn faster)
+SAMPLE_S = 720                  # learning samples and sun-trend points: at most one per this. The counts above (N_USE ...
+                                #    N_FORGET, N_PRIOR) and BACKUP_ALPHA were tuned with one run, and one sample, per 12 min.
+                                #    With a longer interval_s a sample weighs the time since the last one in SAMPLE_S (at most
+                                #    interval_s / SAMPLE_S), so learning goes by time; extra runs on sensor reports learn no faster
+SAMPLE_MIN_S = 600              # interval_s below SAMPLE_S: at most one sample per this or interval_s, the longer, weight 1
 QUIET_LUX = 500                 # window baseline learns only below this lux ...
 SUN_LUX = 2000                  # ... and SUN_COOL_S after lux was last at or above this
 SUN_COOL_S = 3600
 SETTLED_RATE = 0.3              # (deg per h) internal bias learns only while the room moves less than this ...
 SETTLED_SP_S = dict(hvac = 3600, heater = 7200)   # ... and the setpoint is this old
 SOLAR_DERIV_S = 3600            # window of the excess derivative
-# [tuned] per device kind, by r2/tune_search.py (seeded random search + coordinate refinement in thermal_sim,
-# hvac trained on room_A, heater on floor + floor_table; see r2/tune_search_both.txt). Rounded from r2/tuned.json.
+# [tuned] per device kind (seeded random search + coordinate refinement in the thermal simulation; hvac tuned on a
+# living room with a heat pump, heater on a floor heater in indoor and in table mode). Rounded.
 KP = dict(hvac = 1.01, heater = 1.5)   # per deg
 KI_H = dict(hvac = 1.64, heater = 1.73)   # per hour
 TREND_LEAD_H = dict(hvac = 0.0, heater = 0.08)   # h: P acts on in_f + rate * lead
@@ -155,6 +156,19 @@ def ls_slope_h(points, now, window_s, min_span_s, min_points = 2):
     if sxx <= 0:
         return None
     return sum((x - mx) * (v - my) for x, (_, v) in zip(xs, pts)) / sxx
+
+
+def _count_out(n):
+    """ A learned count for the JSON: whole counts as int (as before weighted samples), else rounded. """
+    return n if isinstance(n, int) else round(n, 3)
+
+
+def _count_in(n):
+    """ A learned count from the JSON: int when whole, else float (weighted samples). """
+    n = float(n)
+    if not math.isfinite(n):
+        raise ValueError(n)
+    return int(n) if n.is_integer() else n
 
 
 class LearnedGap:
@@ -229,9 +243,9 @@ class LearnedGap:
     def usable(self, x) -> bool:
         return self.dry(x) is not None
 
-    def sample(self, x, y, windy = False, raining = False) -> bool:
-        """ Learns one sample; wind wins over rain. Returns False when rejected (outlier, or a wind/rain sample
-            without a dry value to compare with). """
+    def sample(self, x, y, windy = False, raining = False, w = 1) -> bool:
+        """ Learns one sample of weight w (counts as w samples); wind wins over rain. Returns False when rejected
+            (outlier, or a wind/rain sample without a dry value to compare with). """
         if x is None or y is None:
             return False
         if windy or raining:
@@ -246,23 +260,23 @@ class LearnedGap:
             v, est = y, t[0]
         if t[1] >= N_VALID and abs(v - est) > self.reject:
             return False
-        a = max(1.0 / (t[1] + 1), 1.0 / N_FORGET)
+        a = max(w / (t[1] + w), min(1.0, w / N_FORGET))
         t[0] += a * (v - t[0])
-        t[1] += 1
+        t[1] += w
         return True
 
     def to_dict(self) -> dict:
-        return dict(bw = self.bw, bins = dict((str(k), [round(m, 4), n]) for k, (m, n) in sorted(self.bins.items())),
-                    wind = [round(self.wind[0], 4), self.wind[1]], rain = [round(self.rain[0], 4), self.rain[1]])
+        return dict(bw = self.bw, bins = dict((str(k), [round(m, 4), _count_out(n)]) for k, (m, n) in sorted(self.bins.items())),
+                    wind = [round(self.wind[0], 4), _count_out(self.wind[1])], rain = [round(self.rain[0], 4), _count_out(self.rain[1])])
 
     def load(self, d) -> bool:
         """ Restores to_dict() output. False (nothing loaded) when the bin width differs or the data is bad. """
         try:
             if float(d['bw']) != self.bw:
                 return False
-            bins = dict((int(k), [float(m), int(n)]) for k, (m, n) in d['bins'].items())
-            wind = [float(d['wind'][0]), int(d['wind'][1])]
-            rain = [float(d['rain'][0]), int(d['rain'][1])]
+            bins = dict((int(k), [float(m), _count_in(n)]) for k, (m, n) in d['bins'].items())
+            wind = [float(d['wind'][0]), _count_in(d['wind'][1])]
+            rain = [float(d['rain'][0]), _count_in(d['rain'][1])]
         except (KeyError, TypeError, ValueError, IndexError):
             return False
         self.bins, self.wind, self.rain = bins, wind, rain
@@ -271,7 +285,7 @@ class LearnedGap:
 
 @dataclass
 class Tuning:
-    """ The [tuned] constants for one device kind. R3 uses Tuning.default(kind); the harness search passes others. """
+    """ The [tuned] constants for one device kind. The app uses Tuning.default(kind); a tuning search passes others. """
     kp: float
     ki_h: float
     lead_h: float
@@ -295,7 +309,7 @@ class Tuning:
 
 @dataclass
 class ControlConfig:
-    """ Per device, from the app YAML (cc_config DeviceConfig in R3). """
+    """ Per device, from the app YAML (cc_config DeviceConfig). """
     kind: str = 'hvac'                    # 'hvac' (heat / cool / fan_only) or 'heater'
     target_mode: str = 'indoor'           # 'indoor', or 'table' (heaters only)
     unit: str = 'C'
@@ -436,6 +450,8 @@ class IndoorController:
         self.last_run = None
         self.last_gap_sample = None
         self.last_bias_sample = None
+        self.gap_off = None               # the last run where the window baseline could not learn (memory only) ...
+        self.bias_off = None              # ... and the internal bias
         self.last_save = None
         self.started = False              # bumpless start done
         self.vac_prev = None              # vacation flag of the last run (memory only: no cold start after a restart)
@@ -509,8 +525,18 @@ class IndoorController:
         return dark and (self.last_sun is None or (now - self.last_sun).total_seconds() >= SUN_COOL_S)
 
     def _sample_due(self, last, now):
-        """ At most one learning sample or sun-trend point per SAMPLE_MIN_S or interval_s, however often the device runs. """
-        return last is None or (now - last).total_seconds() >= max(SAMPLE_MIN_S, self.cfg.interval_s) - 1
+        """ At most one learning sample or sun-trend point per SAMPLE_S (a shorter interval_s: per interval_s, at least
+            SAMPLE_MIN_S), however often the device runs. """
+        return last is None or (now - last).total_seconds() >= max(SAMPLE_MIN_S, min(self.cfg.interval_s, SAMPLE_S)) - 1
+
+    def _sample_weight(self, last, off, now):
+        """ The weight of a learning sample in samples of SAMPLE_S: the time since the last sample over SAMPLE_S, at least
+            1 and at most interval_s / SAMPLE_S (always 1 with interval_s up to SAMPLE_S). 1 for the first sample and for the
+            first after a run that could not learn (off): how long the conditions held before this run is unknown. """
+        hi = self.cfg.interval_s / SAMPLE_S
+        if hi <= 1 or last is None or (off is not None and off >= last):
+            return 1
+        return max(1, min((now - last).total_seconds() / SAMPLE_S, hi))
 
     def _room(self, d, inp, windy, raining, dt_s):
         """ (R_used, source): 'primary', 'backup' (+ learned bias), 'estimate' (internal - bias_int) or None. """
@@ -523,7 +549,7 @@ class IndoorController:
             if self.backup_bias is None:
                 self.backup_bias = diff
             else:
-                self.backup_bias += (1 - (1 - BACKUP_ALPHA) ** (dt_s / self.cfg.interval_s)) * (diff - self.backup_bias)
+                self.backup_bias += (1 - (1 - BACKUP_ALPHA) ** (dt_s / SAMPLE_S)) * (diff - self.backup_bias)
         if p_ok:
             R, src = inp.room, 'primary'
         elif b_ok:
@@ -627,20 +653,26 @@ class IndoorController:
         return excess, w_ok
 
     def _learn(self, inp, now, src, w_ok, windy, raining, rate60):
-        """ Window baseline and internal bias, each from the PRIMARY sensor only, in normal operation. """
-        if src != 'primary' or inp.windows_open or inp.vacation or inp.power_state != 'normal':
-            return
-        if inp.since_window_closed_s is not None and inp.since_window_closed_s < WINDOW_CLOSED_S:
-            return
-
-        if w_ok and inp.out_temp is not None and self._quiet(inp, now) and self._sample_due(self.last_gap_sample, now):
-            self.base_w.sample(inp.out_temp, inp.window - inp.room, windy, raining)
+        """ Window baseline and internal bias, each from the PRIMARY sensor only, in normal operation. A run where one
+            of them cannot learn is noted (gap_off / bias_off): its next sample has weight 1. """
+        gap_ok = bias_ok = False
+        if (src == 'primary' and not inp.windows_open and not inp.vacation and inp.power_state == 'normal'
+                and (inp.since_window_closed_s is None or inp.since_window_closed_s >= WINDOW_CLOSED_S)):
+            gap_ok = w_ok and inp.out_temp is not None and self._quiet(inp, now)
+            settled = (rate60 is not None and abs(rate60) <= SETTLED_RATE * self.s and self.sp_since is not None
+                       and (now - self.sp_since).total_seconds() >= SETTLED_SP_S[self.cfg.kind])
+            bias_ok = inp.internal is not None and inp.hvac_mode == 'heat' and self.out_slow is not None and settled
+        if not gap_ok:
+            self.gap_off = now
+        elif self._sample_due(self.last_gap_sample, now):
+            self.base_w.sample(inp.out_temp, inp.window - inp.room, windy, raining,
+                               self._sample_weight(self.last_gap_sample, self.gap_off, now))
             self.last_gap_sample = now
-        settled = (rate60 is not None and abs(rate60) <= SETTLED_RATE * self.s and self.sp_since is not None
-                   and (now - self.sp_since).total_seconds() >= SETTLED_SP_S[self.cfg.kind])
-        if (inp.internal is not None and inp.hvac_mode == 'heat' and self.out_slow is not None and settled
-                and self._sample_due(self.last_bias_sample, now)):
-            self.bias.sample(self.out_slow, inp.internal - inp.room, windy, raining)
+        if not bias_ok:
+            self.bias_off = now
+        elif self._sample_due(self.last_bias_sample, now):
+            self.bias.sample(self.out_slow, inp.internal - inp.room, windy, raining,
+                             self._sample_weight(self.last_bias_sample, self.bias_off, now))
             self.last_bias_sample = now
 
     # ---- control terms ----------------------------------------------------------------------------- #
@@ -1015,7 +1047,7 @@ class IndoorController:
         self.cold_start = None
         real = src in ('primary', 'backup')
         if inp.windows_open or not real:
-            return    # no mode change on an estimate (addendum 1.4)
+            return    # no mode change on an estimate
         vac = cfg.vacation_temp if cfg.vacation_temp is not None else 10.0
         if inp.vacation:
             if self.in_f <= inp.target - 5 * s or self.in_f <= vac + 2 * s:
@@ -1066,7 +1098,7 @@ class IndoorController:
             self._send(d, inp, now, sp_ctrl, bypass = edge)
 
     def _table(self, d, inp, now, dt_s, R, src, base, solar, rate, windy, raining):
-        """ Heater table mode with the adaptive trim (addendum 4, plan 3.9): table base + rain/wind 1 -
+        """ Heater table mode with the adaptive trim: table base + rain/wind 1 -
             min(3, sun + room above target) + trim_i, then save / spend / vacation / min_temp as classic. The
             room term uses R_used (an estimate counts); without any room value it is dropped (C19). """
         cfg, s = self.cfg, self.s
