@@ -204,3 +204,7 @@ Thumbs.db
 apps/.vscode/
 # Local audit scratch output
 .claude/audit_out/
+
+# Home Assistant token for tools/ha_report_cadence.py. Never commit.
+.local/
+ha_token*
