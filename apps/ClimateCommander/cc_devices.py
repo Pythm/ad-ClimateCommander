@@ -189,6 +189,7 @@ class Heater:
         self.increase_hold = datetime.timedelta(hours = cfg.get('increase_hold_hours', 2.0))
         self._increase_on:dict = {}        # daytime_increasing index -> its next clock stop (local, None without one) while it applies
         self._increase_ended:dict = {}     # daytime_increasing index -> when it last stopped applying (local): the hold counts from here
+        self._increase_seen:dict = {}      # daytime_increasing index -> the last check (local) at which it applied
         self._started_local = self.ADapi.datetime()   # a period that stopped before this was not seen (restart)
         self.automate = cfg.get('automate')
 
@@ -773,8 +774,11 @@ class Heater:
     def _increasing_now(self) -> bool:
         """ Whether a daytime_increasing period applies now (its times, mode and presence). Every run calls it (_mark_run),
             whatever the run does next, and so do house mode and person changes: the first run or event at which a period
-            that applied no longer applies starts its hold (_increase_stopped). """
+            that applied no longer applies starts its hold (_increase_stopped). For the hold, a period also stops applying
+            when daytime_savings start: they replace the increase. The value returned does not look at the savings. """
         doDaytimeIncreasing = False
+        saving = self.DaytimeSaving()
+        now = self.ADapi.datetime()
         for index, daytime in enumerate(self.daytime_increasing):
             applies = False
             daytime = self._mode_period(daytime)
@@ -791,11 +795,13 @@ class Heater:
                 if 'presence' in daytime:
                     doDaytimeIncreasing = self._anyone_home(daytime['presence'])
                 applies = doDaytimeIncreasing
+            applies = applies and not saving
             if applies:
                 self._increase_on[index] = self._next_stop(daytime.get('stop'))
                 self._increase_ended.pop(index, None)   # it applies again: the hold comes when it stops again
+                self._increase_seen[index] = now
             elif index in self._increase_on:
-                self._increase_stopped(index, self._increase_on.pop(index))
+                self._increase_stopped(index, self._increase_on.pop(index), self._increase_seen.pop(index, None))
         return doDaytimeIncreasing
 
     def _next_stop(self, stop):
@@ -811,12 +817,41 @@ class Heater:
             end += datetime.timedelta(days = 1)
         return end
 
-    def _increase_stopped(self, index:int, stop) -> None:
-        """ Period `index` applied at the last run or event and does not now. The hold counts from its clock stop when
-            that has passed, else from now: its mode or presence ended it early. An HVAC in fan_only at this moment gets no
-            hold (it is not heating). Adaptive: a run comes at the end of a hold that does not end at a clock time. """
+    def _savings_start(self, after):
+        """ The earliest clock start (local) after `after` of the daytime_savings periods that apply now by their times,
+            mode and presence. None when no start time came after `after`: savings without times, or savings that a mode
+            or presence event started after their start time. """
+        if after is None:
+            return None
         now = self.ADapi.datetime()
-        since = stop if stop is not None and stop <= now else now
+        first = None
+        for period in self.daytime_savings:
+            period = self._mode_period(period)
+            if period is None or 'start' not in period or 'stop' not in period:
+                continue
+            if not self.ADapi.now_is_between(period['start'], period['stop']):
+                continue
+            if 'presence' in period and self._anyone_home(period['presence']):
+                continue
+            try:
+                start = self.ADapi.parse_datetime(self._clock_str(period['start']))
+            except (ValueError, TypeError, NotImplementedError):
+                continue
+            if start > now:
+                start -= datetime.timedelta(days = 1)
+            if after < start and (first is None or start < first):
+                first = start
+        return first
+
+    def _increase_stopped(self, index:int, stop, seen) -> None:
+        """ Period `index` applied at the last run or event (`seen`) and does not now. The hold counts from its clock stop
+            when that has passed, or from the clock start of daytime_savings that came after `seen` (the savings replaced
+            it), the earlier of the two; else from now: its mode or presence ended it early, or savings started by a mode
+            or presence event. An HVAC in fan_only at this moment gets no hold (it is not heating). Adaptive: a run comes
+            at the end of a hold that does not end at a clock time. """
+        now = self.ADapi.datetime()
+        moments = [t for t in (stop, self._savings_start(seen)) if t is not None and t <= now]
+        since = min(moments) if moments else now
         if self.hvac and self.ADapi.get_state(self.heater, namespace = self.namespace) == 'fan_only':
             self._increase_ended.pop(index, None)
             return
@@ -830,7 +865,8 @@ class Heater:
 
     def _after_increase(self) -> bool:
         """ Within increase_hold_hours after a daytime_increasing period stopped applying: at its clock stop, or when its
-            mode or presence ended it before that (_increase_stopped). A period whose times, mode and presence never held
+            mode or presence or the start of daytime_savings ended it before that (_increase_stopped). The hold keeps an
+            HVAC from heat -> fan_only also while the savings apply. A period whose times, mode and presence never held
             together has no hold. After a restart the app has not seen what came before: see _restart_hold. """
         if self.increase_hold.total_seconds() <= 0:
             return False
