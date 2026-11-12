@@ -54,7 +54,7 @@ Everything that is new or different:
   - An HVAC in table mode without `vacation_temp` no longer fails on vacation (falls back to 10).
   - With `controller: adaptive` the [room trigger](#room-trigger) closes screens again after a vacation. Before, it stayed off from the end of the first vacation until a restart.
   - At startup the lux from the Weather app's last values is used at once. Before, it was 0 until the next `WEATHER_CHANGE` event: screens saw lux 0, and the adaptive controller used the clock (day / night) instead of lux.
-- **Save / spend / reduce from ElectricalManagement** (optional, ElectricalManagement 1.0.6 or later), see [ElectricalManagement](#electricalmanagement).
+- **Save / spend / reduce from ElectricalManagement** (optional, ElectricalManagement 1.0.5 or later), see [ElectricalManagement](#electricalmanagement).
 - **The app now has three more files**, `cc_devices.py`, `cc_config.py` and `cc_control.py`, next to `climateCommander.py` and `weather_data.py`. Copy the whole app folder when you update (`git pull` does).
 - **New, optional: `controller: shadow` / `controller: adaptive`**, a different way to find the setpoint, per device. The default `classic` is the controller described in this README. See [Adaptive controller](#adaptive-controller-optional).
 - **The configuration is validated with pydantic** (`cc_config.py`). A value of the wrong type (for example `window_offset: abc`, or a table entry without `out`) now logs an ERROR naming the key: an invalid device is skipped, an invalid app-level key stops that app. Before, such a value was silently used or crashed later (`vacation_temp: abc` used to fall back to 10). A single entity where a list is expected (for example `windowsensors: binary_sensor.x`) is accepted as a one-item list. See [Validation](#validation).
@@ -162,7 +162,7 @@ climate_living_room:
 - The [ad-Weather](https://github.com/Pythm/ad-Weather) app, version 0.2.0 or later. ClimateCommander looks for an app named `weather`; set `weather_app` if yours has another name. An ERROR is logged at startup if it is not found.
 - All five files of the app in the same folder: `climateCommander.py`, `cc_devices.py`, `cc_config.py`, `cc_control.py` and `weather_data.py`.
 - A temperature sensor in the room (`indoor_sensor_temp`). It is required in indoor mode, and it is used to find the unit (C or F) unless you set `unit_of_measurement`.
-- Optional: [ElectricalManagement](https://github.com/Pythm/ad-ElectricalManagement) 1.0.6 or later for save / spend / reduce.
+- Optional: [ElectricalManagement](https://github.com/Pythm/ad-ElectricalManagement) 1.0.5 or later for save / spend / reduce.
 
 ---
 ## Installation
@@ -714,7 +714,7 @@ Outdoor values are kept per ClimateCommander app. Until the first outdoor temper
 ---
 ## ElectricalManagement
 
-[ElectricalManagement](https://github.com/Pythm/ad-ElectricalManagement) 1.0.6 or later can control a ClimateCommander device. List the app under `climate_commander:` in ElectricalManagement, together with the energy keys. Nothing is needed in this app. Example, in the ElectricalManagement configuration:
+[ElectricalManagement](https://github.com/Pythm/ad-ElectricalManagement) 1.0.5 or later can control a ClimateCommander device. List the app under `climate_commander:` in ElectricalManagement, together with the energy keys. Nothing is needed in this app. Example, in the ElectricalManagement configuration:
 
 ```yaml
   climate_commander:
