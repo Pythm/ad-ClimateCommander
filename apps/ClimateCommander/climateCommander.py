@@ -8,7 +8,7 @@
     @Pythm / https://github.com/Pythm
 """
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 from appdaemon import adbase as ad
 import datetime
@@ -379,6 +379,8 @@ class Climate(ad.ADBase):
     def _rainSensorUpdated(self, entity, attribute, old, new, **kwargs) -> None:
         value = to_float(new)
         if value is None:
+            # Owner decision: an unavailable rain sensor counts as 0 (no rain), unlike outdoor temperature
+            # which keeps its last value.
             self.weather.rain = 0.0
             self.ADapi.log(f"Not able to set new rain amount: {new}.", level = 'DEBUG')
             return
@@ -391,6 +393,7 @@ class Climate(ad.ADBase):
     def _anemometerUpdated(self, entity, attribute, old, new, **kwargs) -> None:
         value = to_float(new)
         if value is None:
+            # Owner decision: an unavailable anemometer counts as 0 (no wind), same as rain above.
             self.weather.wind = 0.0
             self.ADapi.log(f"Not able to set new wind amount: {new}.", level = 'DEBUG')
             return

@@ -2464,6 +2464,8 @@ class Screen:
                 self.weather.lux >= self.lux_close
                 and self.weather.cloud_cover < self.cloud_cover_limit
             ):
+                # Owner decision: closing needs the cover to report its own current_position (== 100, and equal
+                # to what we last set); a cover that never reports it is left alone rather than guessed at.
                 position = self.ADapi.get_state(self.screen, attribute='current_position', namespace = self.namespace)
                 if position == self.screen_position and position == 100:
                     self.ADapi.call_service('cover/close_cover',
