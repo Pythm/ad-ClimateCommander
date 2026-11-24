@@ -41,6 +41,7 @@ import math
 
 from cc_control import ControlConfig, IndoorController, Inputs, ROOM_STALE_S, SHIFT_INCREASE, ls_slope_h
 from cc_modes import load_translations, mode_matches, track
+from cc_solar import sun_position
 
 UNAVAIL = ('unavailable', 'unknown')
 POWER_STATES = ('normal', 'save', 'spend', 'reduce')
@@ -68,7 +69,11 @@ ROOM_SCREEN_EVERY = datetime.timedelta(minutes = 5)   # room trigger (_room_scre
                                    # this often. A room sensor in the airflow reports every few seconds, and every attempt
                                    # reads several HA states per screen; one try per 5 min is still 6 times the run cadence.
 DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'rate_wide', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
-             'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl', 'increase_hold')
+             'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl', 'increase_hold',
+             'rise', 'rise_fan', 'smoothing', 'hold', 'hold_n', 'push', 'push_g', 'learning', 'sun_elev', 'sun_az', 'cond', 'solar_exp',
+             'antic', 'step_cap')
+SUN_EXTRAPOLATE = (600, 3600)      # sun_entity: the lead position from the reading 10 to 60 min old (no location known)
+FORECAST_MAX = 72                  # forecast entries kept from one WEATHER_CHANGE event
 
 
 def round_half(value: float) -> float:
@@ -1710,7 +1715,11 @@ class Heater:
             room_stale_s = cfg.get('room_stale_s'),
             backup_stale_s = cfg.get('backup_stale_s'),
             window_stale_s = cfg.get('window_stale_s'),
+            room_tau_s = cfg.get('room_tau_s'),
+            recovery_h = cfg.get('recovery_hours', 2.0),
+            sun_anticipation = cfg.get('sun_anticipation', True),
         ))
+        self._setup_weather_inputs(cfg)
         self.diagnostic_sensor = cfg.get('diagnostic_sensor')
         self._virtual_setpoint = None      # shadow: the setpoint and mode the controller proposed last,
         self._virtual_mode = None          # fed back to it instead of the real ones
@@ -1724,6 +1733,81 @@ class Heater:
             return
         for level, text in self.ctrl.restore(self.store.device(self.heater).get('adaptive')):
             self.ADapi.log(f"{self.heater}: {text}", level = level)
+
+    def _setup_weather_inputs(self, cfg:dict) -> None:
+        """ Shadow / adaptive: the weather condition and forecast from WEATHER_CHANGE (ad-Weather 0.3.0; older versions
+            send neither, which is fine), and the sun position: computed from AppDaemon's latitude / longitude, else read
+            from the optional sun_entity (its elevation and azimuth), else none (no sun learning or anticipation). """
+        self._condition = None
+        self._forecast = []
+        self._sun_entity = cfg.get('sun_entity')
+        self._sun_readings = []            # sun_entity: (time, elevation, azimuth) of the last hour
+        self._lat = self._lon = None
+        ad_config = getattr(self.app, 'config', None)
+        if ad_config is not None:
+            get = ad_config.get if isinstance(ad_config, dict) else (lambda key: getattr(ad_config, key, None))
+            lat, lon = to_float(get('latitude')), to_float(get('longitude'))
+            if lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180:
+                self._lat, self._lon = lat, lon
+        self._sun_src = 'location' if self._lat is not None else 'entity' if self._sun_entity else None
+        if self._sun_src is None:
+            self.ADapi.log(f"{self.heater}: no latitude / longitude in the AppDaemon configuration and no sun_entity: "
+                           "no learned sun term by sun position and no sun anticipation.", level = 'INFO')
+        self.ADapi.listen_event(self._weather_inputs, 'WEATHER_CHANGE',
+            namespace = getattr(self.app, 'HASS_namespace', self.namespace)
+        )
+        cc_model = getattr(self.app, 'cc_model', None)
+        weather_app = self.ADapi.get_app(cc_model.weather_app) if cc_model is not None else None
+        last_sent = getattr(weather_app, 'last_sent', None) if weather_app is not None else None
+        if isinstance(last_sent, dict):
+            self._weather_inputs('WEATHER_CHANGE', last_sent)   # the Weather app only sends on change
+
+    def _weather_inputs(self, event_name, data, **kwargs) -> None:
+        """ condition (str or None) and forecast (list of entries with an ISO 'time' with offset) from WEATHER_CHANGE.
+            Missing keys are None / empty; entries without a valid aware time are skipped. """
+        if not isinstance(data, dict):
+            return
+        condition = data.get('condition')
+        self._condition = condition if isinstance(condition, str) and condition and condition not in UNAVAIL else None
+        forecast = []
+        raw = data.get('forecast')
+        for entry in (raw if isinstance(raw, list) else [])[:FORECAST_MAX]:
+            if not isinstance(entry, dict) or not isinstance(entry.get('time'), str):
+                continue
+            try:
+                when = datetime.datetime.fromisoformat(entry['time'])
+            except ValueError:
+                continue
+            if when.tzinfo is None:
+                continue
+            cond = entry.get('condition')
+            forecast.append({'time': when, 'temp': to_float(entry.get('temp')),
+                             'condition': cond if isinstance(cond, str) and cond else None,
+                             'cloud_cover': to_float(entry.get('cloud_cover')), 'rain': to_float(entry.get('rain')),
+                             'wind': to_float(entry.get('wind'))})
+        self._forecast = sorted(forecast, key = lambda e: e['time'])
+
+    def _sun_now(self, now):
+        """ ((elevation, azimuth) now, (elevation, azimuth) at now + the controller's lead), each None when unknown. """
+        lead = datetime.timedelta(seconds = self.ctrl.lead_s())
+        if self._lat is not None:
+            return sun_position(now, self._lat, self._lon), sun_position(now + lead, self._lat, self._lon)
+        if not self._sun_entity:
+            return None, None
+        el = to_float(self.ADapi.get_state(self._sun_entity, attribute = 'elevation', namespace = self.namespace))
+        az = to_float(self.ADapi.get_state(self._sun_entity, attribute = 'azimuth', namespace = self.namespace))
+        if el is None or az is None:
+            return None, None
+        lo, hi = SUN_EXTRAPOLATE
+        self._sun_readings = [r for r in self._sun_readings if (now - r[0]).total_seconds() <= hi] + [(now, el, az)]
+        older = [r for r in self._sun_readings if (now - r[0]).total_seconds() >= lo]
+        if not older:
+            return (el, az), None
+        t0, el0, az0 = older[-1]
+        dt_s = (now - t0).total_seconds()
+        turn = (az - az0 + 180) % 360 - 180     # the azimuth change, also across north
+        k = lead.total_seconds() / dt_s
+        return (el, az), (el + k * (el - el0), (az + k * turn) % 360)
 
     def _sensor_reading(self, entity):
         """ (value, seconds since last reported), or (None, None). """
@@ -1745,6 +1829,7 @@ class Heater:
         increasing, after_increase = self.DaytimeIncreasing()
         preset_modes = self.ADapi.get_state(self.heater, attribute = 'preset_modes', namespace = self.namespace) or []
         fan_mode = self.ADapi.get_state(self.heater, attribute = 'fan_mode', namespace = self.namespace)
+        sun, sun_lead = self._sun_now(now)
         return Inputs(
             now = now,
             target = self.target_indoor_temp,
@@ -1770,6 +1855,11 @@ class Heater:
             saving = self.DaytimeSaving(),
             preset = self.ADapi.get_state(self.heater, attribute = 'preset_mode', namespace = self.namespace),
             boost_available = 'boost' in preset_modes and fan_mode != 'Silence',
+            condition = self._condition,
+            forecast = list(self._forecast),
+            sun_elev = sun[0] if sun else None,
+            sun_az = sun[1] if sun else None,
+            sun_lead = sun_lead,
         )
 
     def _controller_cycle(self) -> None:
@@ -1923,6 +2013,7 @@ class Heater:
             hvac_mode = mode,
             send = dec.temperature,
             frozen = d.get('frozen'),
+            sun_src = self._sun_src,
             unit_of_measurement = '°F' if self.ctrl.cfg.unit == 'F' else '°C',
             friendly_name = f"{self.friendly_name()} controller",
         )

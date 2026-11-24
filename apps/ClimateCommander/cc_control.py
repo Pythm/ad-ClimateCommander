@@ -13,9 +13,12 @@
         ff         = ff_bias_weight * bias_int(out_slow, windy, raining) + outdoor_gain * (target - out_slow)
         excess     = window - R_used - base_w(out_temp, windy, raining)      (learned no-sun baseline)
         solar      = min(solar_max, solar_gain * solar_f)  (rises at once, decays slowly)
-        sp_ctrl    = clamp(target_eff + ff + i_term + Kp * (target_eff - (in_f + rate * lead)) - solar)
+        sp_ctrl    = clamp(target_eff + ff + i_term + Kp * (target_eff - (in_f + rate * lead)) + push - solar)
+    With a learned hold (setpoint - target_eff that held the room, by outdoor temperature and weather class) ff is
+    blended toward it by n / (n + N_PRIOR); push = learned gain x deficit during a recovery episode (0 until learned).
     The power-state layer (with the comfort guard), the window/vacation overrides and the HVAC mode choice
-    sit on top. Normal changes: at most one per MIN_CHANGE_S, straight to the computed value.
+    sit on top. Normal changes: at most one per MIN_CHANGE_S; in heat an increase is at most STEP_UP (STEP_UP_EDGE at a
+    period start or end), a learned sun ahead can hold it back, a decrease goes straight to the computed value.
 
     Nothing here is tuned to one house: the window baseline and the internal-sensor bias are learned by
     outdoor temperature (LearnedGap), with no sign assumption; optional YAML tables only seed them.
@@ -63,10 +66,19 @@ I_CLAMP = 6.0                   # (deg) integral bound (floor thermostats read 5
 SP_SPAN = 8.0                   # (deg) setpoint within target +- this (as classic)
 RATE_MAX = 2.0                  # (deg per h) trend clamp
 RATE_MIN_POINTS = 3             # trend needs this many room reports in its window (else 0)
-RATE_WIDE_GAPS = 9              # diagnostic rate_wide (never read by control): window = RATE_WIDE_FACTOR x the median of this many
+RATE_WIDE_GAPS = 9              # rate_wide (diagnostics) and rise (control): window = RATE_WIDE_FACTOR x the median of this many
 RATE_WIDE_FACTOR = 3            #    gaps between primary room reports, at least the normal window ...
 RATE_WIDE_MAX_S = 4 * 3600      #    ... at most this ...
 RATE_WIDE_KEEP = 300            #    ... and at most this many reports kept (4 h of runs at the shortest min_run_gap_minutes, with room)
+RISE_SPAN_S = 1800              # owner: 'rising' is judged over reports spanning at least 30 min (least squares), never between
+                                #    two reports: rise (integral, recovery push) and the heat -> fan_only shortcut
+RISE_FREEZE = 0.1               # (deg per h) [tuned] the integral does not grow while rise is at least this (None: not rising)
+FAN_RISE_WINDOW_S = 1860        # owner: heat -> fan_only shortcut on the slope of the reports of the last 30 min (+1 min for
+                                #    report-time jitter); with longer report gaps RATE_WIDE_FACTOR x their median, ...
+FAN_RISE_MAX_S = 3660           #    ... at most this (a sensor reporting less often than every 20 min stays unknown, as before);
+FAN_RISE_SPAN_S = 1200          #    at least RATE_MIN_POINTS + 1 reports spanning this, and the slope also without the newest
+                                #    one. A wider window (rate_wide: 52 min on a 10 min sensor) still read a slow 0.3 C/h
+                                #    creep as 'rising fast'; one report jumping 1.0 after flat ones gave 1.8 C/h
 WINDOW_CLOSED_S = 3600          # integral and learning wait this long after the last window close
 WINDY_S = 1800                  # wind flag: wind >= anemometer_speed within 30 min (as classic)
 FAN_WIND_S = 2700               # no heat -> fan_only within 45 min of wind (as classic)
@@ -122,6 +134,32 @@ I_BAND = dict(hvac = 1.37, heater = 3.87)   # (deg) integral only while |target_
 I_PRED = dict(hvac = 0, heater = 0)   # 1: integral on the predicted error (classic hold), 0: on the present error
 SEND_HYST = dict(hvac = 0.5, heater = 0.54)   # (deg) normal change only when |sp_ctrl - setpoint| >= this
 SUN_FREEZE = dict(hvac = 1.0, heater = 0.0)   # (deg) heating integral frozen while the sun term >= this (0 = off)
+# Step rule, learned hold and recovery push, sun anticipation (owner decisions of 2026-11-22). Heating only.
+STEP_UP = 0.5                   # (deg) owner: a normal increase in heat is at most this per change (decreases are not capped) ...
+STEP_UP_EDGE = 1.0              # (deg) owner: ... or this in one change when a daytime_savings / daytime_increasing period
+EDGE_S = MIN_CHANGE_S + 60      #    starts or ends (the first increase within this after the edge)
+HOLD_BAND = 0.3                 # (deg) hold sample: the room at most this below target_eff (at most DB_ABOVE above) ...
+HOLD_SETTLE_S = 5400            # ... for 1.5 h, the setpoint (also one set by hand) and the mode unchanged as long, ...
+HOLD_STEADY = 0.1               # (deg per h) ... and rise (when known) at most this: the setpoint holds the room it sees
+EP_START = 0.5                  # (deg) recovery episode: starts on a target_eff rise with the room more than DB_BELOW below it,
+EP_START_S = 1800               #    or with the room this far below for this long; ...
+EP_END = 0.1                    # (deg) ... ends when the room is this close to target_eff, ...
+EP_MAX_S = 6 * 3600             # ... or after this (counts as too slow)
+EP_FAST = 0.6                   # an episode faster than this x recovery_hours lowers the push gain
+EP_SUN_SHARE = 1 / 3            # not learned when the sun term was at least HOLD_SUN for more than this share of the episode
+G_MAX = 3.0                     # push gain range 0 .. G_MAX (setpoint degrees per degree of deficit) ...
+G_STEP = 1.0                    # [tuned] ... it moves at most max(G_STEP, G_STEP_REL x gain) per episode (0.3 needed about
+G_STEP_REL = 0.25               #    8 mornings to reach the gain of 2 that a simulated living room needed, 1.0 about 3)
+N_PRIOR_G = 1                   # the push gain is shrunk toward 0 by n / (n + this), n = episodes
+SUN_BW = 2.0                    # (angle degrees) learned sun term by sun elevation, one table before and one after noon (azimuth 180)
+ANTIC_LEAD_H = 1.0              # h: anticipation and forecast lead, at most recovery_hours; heaters x SOLAR_LEAD_H heater / hvac
+ANTIC_CHECK = 0.5               # anticipation stops when the sun term after the lead is below this share of what was expected ...
+ANTIC_OFF_S = 3 * 3600          # ... for this long
+FC_WEIGHT = 0.5                 # share of the forecast outdoor change (lead vs now) added to the hold / push lookup temperature
+RECOVERY_H = 2.0                # recovery_hours when not set
+COND_CLASS = dict(sunny = 'clear', **{'clear-night': 'clear'}, cloudy = 'cloudy', partlycloudy = 'cloudy', fog = 'cloudy',
+                  rainy = 'rain', pouring = 'rain', lightning = 'rain', **{'lightning-rainy': 'rain'},
+                  snowy = 'snow', **{'snowy-rainy': 'snow'})   # weather entity states -> learned classes (others: none)
 
 
 def round_half(value: float) -> float:
@@ -282,6 +320,125 @@ class LearnedGap:
         self.bins, self.wind, self.rain = bins, wind, rain
         return True
 
+    def learned_n(self, x):
+        """ learned(x) with the count interpolated as well, so a weight n / (n + prior) does not jump between bins, and
+            nothing further than one bin beyond the outermost learned bin (a hold learned at -4 is not a guess for +10). """
+        return _interp([((k + 0.5) * self.bw, m, n) for k, (m, n) in self.bins.items() if n >= N_USE], x, self.bw)
+
+
+def _interp(points, x, reach):
+    """ (value, count) at x from (centre, value, count) points: linear between the nearest point on each side, flat
+        up to reach beyond the outermost one; (None, 0) without points or further out. """
+    if x is None:
+        return None, 0
+    left = max((p for p in points if p[0] <= x), default = None)
+    right = min((p for p in points if p[0] > x), default = None)
+    if left and right:
+        f = (x - left[0]) / (right[0] - left[0])
+        return left[1] + f * (right[1] - left[1]), left[2] + f * (right[2] - left[2])
+    one = left or right
+    return (one[1], one[2]) if one and abs(x - one[0]) <= reach else (None, 0)
+
+
+def cond_class(condition):
+    """ The learned weather class of a weather entity state ('clear', 'cloudy', 'rain', 'snow'), None for others. """
+    return COND_CLASS.get(condition) if isinstance(condition, str) else None
+
+
+class CondTerms:
+    """ Additive terms per weather class on top of a learned value: the mean residual of the samples in that class,
+        shrunk toward 0 by n / (n + N_PRIOR_WR) (as the wind / rain terms), so a rare class changes little. """
+
+    def __init__(self, scale = 1.0):
+        self.reject = REJECT * scale
+        self.terms = dict()         # class -> [mean residual, n]
+
+    def value(self, cls):
+        t = self.terms.get(cls)
+        return 0.0 if t is None else t[1] * t[0] / (t[1] + N_PRIOR_WR)
+
+    def sample(self, cls, residual, w = 1):
+        if cls is None or residual is None:
+            return False
+        t = self.terms.setdefault(cls, [0.0, 0])
+        if t[1] >= N_VALID and abs(residual - t[0]) > self.reject:
+            return False
+        a = max(w / (t[1] + w), min(1.0, w / N_FORGET))
+        t[0] += a * (residual - t[0])
+        t[1] += w
+        return True
+
+    def to_dict(self) -> dict:
+        return dict((k, [round(m, 4), _count_out(n)]) for k, (m, n) in sorted(self.terms.items()))
+
+    def load(self, d) -> bool:
+        try:
+            terms = dict((str(k), [float(m), _count_in(n)]) for k, (m, n) in d.items() if k in COND_CLASS.values())
+        except (AttributeError, TypeError, ValueError):
+            return False
+        self.terms = terms
+        return True
+
+
+class PushGain:
+    """ The recovery push gain by the outdoor lookup temperature: one bin per bw degrees with the gain and its number of
+        episodes, linear between bins (flat for one bin beyond the outermost), shrunk toward 0 by n / (n + N_PRIOR_G),
+        within 0 .. G_MAX, plus a CondTerms add-on. Unlearned: 0, no push. """
+
+    def __init__(self, bw = GAP_BW):
+        self.bw = bw
+        self.bins = dict()          # bin index -> [gain, episodes]
+        self.cond = CondTerms(1.0)  # the gain has no unit
+
+    def raw(self, x):
+        return _interp([((k + 0.5) * self.bw, g, n) for k, (g, n) in self.bins.items() if n >= 1], x, self.bw)
+
+    def value(self, x, cls = None):
+        g, n = self.raw(x)
+        if g is None:
+            return 0.0
+        return clamp(n / (n + N_PRIOR_G) * (g + self.cond.value(cls)), 0.0, G_MAX)
+
+    def episodes(self, x) -> float:
+        """ Episodes learned in the bin of x (the diagnostic 'learning' while fewer than N_USE). """
+        t = self.bins.get(int(math.floor(x / self.bw))) if x is not None else None
+        return t[1] if t else 0
+
+    def seen(self, x):
+        """ One episode on time in the bin of x: counted, the gain unchanged (a new bin takes the interpolated gain). """
+        k = int(math.floor(x / self.bw))
+        g, n = self.bins[k] if k in self.bins else ((self.raw(x)[0] or 0.0), 0)
+        self.bins[k] = [g, n + 1]
+
+    def learn(self, x, needed, cls = None):
+        """ One episode: the bin of x moves toward the gain the episode needed, by at most max(G_STEP, G_STEP_REL x gain). """
+        k = int(math.floor(x / self.bw))
+        if k in self.bins:
+            g, n = self.bins[k]
+        else:
+            g, n = (self.raw(x)[0] or 0.0), 0
+        lim = max(G_STEP, G_STEP_REL * g)
+        new = clamp(g + clamp(needed - g, -lim, lim), 0.0, G_MAX)
+        self.bins[k] = [new, n + 1]
+        self.cond.sample(cls, clamp(needed, 0.0, G_MAX) - g)
+
+    def to_dict(self) -> dict:
+        return dict(bw = self.bw, bins = dict((str(k), [round(g, 4), _count_out(n)]) for k, (g, n) in sorted(self.bins.items())),
+                    cond = self.cond.to_dict())
+
+    def load(self, d) -> bool:
+        try:
+            if float(d['bw']) != self.bw:
+                return False
+            bins = dict((int(k), [clamp(float(g), 0.0, G_MAX), _count_in(n)]) for k, (g, n) in d['bins'].items())
+            cond = CondTerms(1.0)
+            if not cond.load(d.get('cond') or dict()):
+                return False
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+            return False
+        self.bins, self.cond = bins, cond
+        return True
+
 
 @dataclass
 class Tuning:
@@ -337,6 +494,9 @@ class ControlConfig:
     room_stale_s: float | None = None     # room_sensor_stale_minutes in seconds (None: ROOM_STALE_S)
     backup_stale_s: float | None = None   # backup_sensor_stale_minutes in seconds (None: ROOM_STALE_S)
     window_stale_s: float | None = None   # window_sensor_stale_minutes in seconds (None: WINDOW_STALE_S)
+    room_tau_s: float | None = None       # room_smoothing_minutes in seconds: the room reading filter (None: TAU_IN_S)
+    recovery_h: float = RECOVERY_H        # recovery_hours: the push gain aims at the target within this after a deficit starts
+    sun_anticipation: bool = True         # sun_anticipation: a learned sun ahead holds an increase back
 
 
 @dataclass
@@ -369,6 +529,11 @@ class Inputs:
     saving: bool = False                  # daytime_savings active
     preset: str | None = None
     boost_available: bool = False         # 'boost' in preset_modes and fan_mode is not 'Silence'
+    condition: str | None = None          # weather entity state from the WEATHER_CHANGE event (None: unknown)
+    forecast: list = field(default_factory = list)    # [{'time': aware datetime, 'temp', 'condition', ...}] by time
+    sun_elev: float | None = None         # sun elevation / azimuth in degrees now (None: unknown) ...
+    sun_az: float | None = None
+    sun_lead: tuple | None = None         # ... and (elevation, azimuth) at now + lead_s()
 
 
 @dataclass
@@ -414,6 +579,29 @@ class IndoorController:
         self.room_stale = cfg.room_stale_s if cfg.room_stale_s is not None else ROOM_STALE_S
         self.backup_stale = cfg.backup_stale_s if cfg.backup_stale_s is not None else ROOM_STALE_S
         self.window_stale = cfg.window_stale_s if cfg.window_stale_s is not None else WINDOW_STALE_S
+        self.tau_in = cfg.room_tau_s if cfg.room_tau_s is not None else self.t.tau_in_s
+        # learned hold setpoint (setpoint - target_eff by out_slow), recovery push gain, sun term by sun position
+        self.hold = LearnedGap(bw, None, None, self.t.n_prior, s)
+        self.hold_cond = CondTerms(s)
+        self.push_g = PushGain(bw)
+        self.sun_gain = dict(am = LearnedGap(SUN_BW, None, None, self.t.n_prior, s), pm = LearnedGap(SUN_BW, None, None, self.t.n_prior, s))
+        self.sun_cond = CondTerms(s)
+        self.last_hold_sample = self.hold_off = None
+        self.last_sun_sample = self.sun_off = None
+        self.band_since = None            # memory only: since when the room is within HOLD_BAND of an unchanged target_eff ...
+        self.band_tgt = None              # ... which one
+        self.ep = None                    # memory only: the recovery episode in progress (a restart discards it)
+        self.below_since = None           # memory only: since when the room is EP_START below target_eff
+        self.tgt_prev = None              # target_eff of the last heat run (memory only)
+        self.flags_prev = None            # (saving, increasing) of the last run (memory only) ...
+        self.edge_t = None                # ... the last change of them: a larger first step up (STEP_UP_EDGE)
+        self.edge_used = False
+        self.restore_up = False           # memory only: the first change after a window / vacation override is not capped
+        self.antic_hist = []              # memory only: (time, expected sun term at time + lead) to check one lead later ...
+        self.antic_off = None             # ... and anticipation off until this after a sun that did not come
+        self.rise = self.rise_fan = None  # per run: the room trends judged over RISE_SPAN_S / the last 30 min
+        self.cls = None                   # per run: the weather class now
+        self.key = None                   # per run: the hold / push lookup temperature
         # signal state
         self.out_slow = self.out_day = None
         self.in_f = None
@@ -434,6 +622,8 @@ class IndoorController:
         self.trim_i = 0.0
         self.ff_prev = None
         self.ff_ok_prev = None
+        self.ff_jump = 0.0                # the change of the feed-forward the integral took over this run
+        self.grow_blocked = False         # the last _pi held the integral from growing
         self.pw_state = 'normal'
         self.pw_base = None
         self.pw_tripped = False
@@ -469,6 +659,10 @@ class IndoorController:
             d[k] = getattr(self, k)
         for k in self.PERSIST_T:
             d[k] = _iso(getattr(self, k))
+        # added keys (the version stays 1: an older file loads, and these start empty)
+        d['hold'] = dict(self.hold.to_dict(), cond = self.hold_cond.to_dict())
+        d['push'] = self.push_g.to_dict()
+        d['sun_gain'] = dict(am = self.sun_gain['am'].to_dict(), pm = self.sun_gain['pm'].to_dict(), cond = self.sun_cond.to_dict())
         return d
 
     def restore(self, d) -> list:
@@ -486,7 +680,36 @@ class IndoorController:
             setattr(self, k, _dt(d.get(k)))
         self.pw_state = self.pw_state if self.pw_state in ('normal', 'save', 'spend', 'reduce') else 'normal'
         self.started = False
-        return []
+        return self._restore_added(d)
+
+    def _restore_added(self, d) -> list:
+        """ The learned hold, push gain and sun term. A missing key leaves the part empty; a key that cannot be read too,
+            with one INFO line. """
+        logs = []
+        for key, load in (('hold', self._load_hold), ('push', self.push_g.load), ('sun_gain', self._load_sun)):
+            if key not in d:
+                continue
+            try:
+                ok = isinstance(d[key], dict) and load(d[key])
+            except (AttributeError, KeyError, TypeError, ValueError, IndexError):
+                ok = False
+            if not ok:
+                logs.append(('INFO', "adaptive state: '%s' could not be read and starts empty." % key))
+        return logs
+
+    def _load_hold(self, d) -> bool:
+        hold, cond = LearnedGap(self.hold.bw, None, None, self.t.n_prior, self.s), CondTerms(self.s)
+        if not (hold.load(d) and cond.load(d.get('cond') or dict())):
+            return False
+        self.hold, self.hold_cond = hold, cond
+        return True
+
+    def _load_sun(self, d) -> bool:
+        gains, cond = dict(am = LearnedGap(SUN_BW, None, None, self.t.n_prior, self.s), pm = LearnedGap(SUN_BW, None, None, self.t.n_prior, self.s)), CondTerms(self.s)
+        if not (all(isinstance(d.get(h), dict) and gains[h].load(d[h]) for h in gains) and cond.load(d.get('cond') or dict())):
+            return False
+        self.sun_gain, self.sun_cond = gains, cond
+        return True
 
     # ---- signals ----------------------------------------------------------------------------------- #
 
@@ -584,7 +807,7 @@ class IndoorController:
                 self._wide_note(t_rep, R, src)
             elif (t_rep - self.last_rep_t).total_seconds() >= 1:
                 dtr = (t_rep - self.last_rep_t).total_seconds()
-                a = dtr / (self.t.tau_in_s + dtr) if self.t.tau_in_s > 0 else 1.0
+                a = dtr / (self.tau_in + dtr) if self.tau_in > 0 else 1.0
                 self.in_f += a * (R - self.in_f)
                 self.hist.append((t_rep, R))
                 self.last_rep_t = t_rep
@@ -619,14 +842,32 @@ class IndoorController:
                 self.wide_gaps = (self.wide_gaps + [(t_rep - self.wide_prim_t).total_seconds()])[-RATE_WIDE_GAPS:]
             self.wide_prim_t = t_rep
 
-    def _rate_wide(self, now):
-        """ The room trend over a window that follows the sensor's report gaps, for the diagnostics only: control must not
-            read it. None (not 0.0, which would read as a flat room): too few reports in the window. """
+    def _rate_wide(self, now, min_span_s = 900):
+        """ The room trend over a window that follows the sensor's report gaps. None (not 0.0, which would read as a flat
+            room): too few reports in the window. rate_wide (diagnostics) with min_span_s 900; rise (control) with
+            RISE_SPAN_S, so a rise is always judged over at least 30 min of reports. """
         window_s = self.t.rate_window_s
         if self.wide_gaps:
             window_s = max(window_s, RATE_WIDE_FACTOR * statistics.median(self.wide_gaps))
-        r = ls_slope_h(self.wide_hist, now, min(window_s, RATE_WIDE_MAX_S), 900, RATE_MIN_POINTS)
+        r = ls_slope_h(self.wide_hist, now, min(window_s, RATE_WIDE_MAX_S), min_span_s, RATE_MIN_POINTS)
         return None if r is None else clamp(r, -RATE_MAX * self.s, RATE_MAX * self.s)
+
+    def _rise_fan(self, now):
+        """ The room trend for the heat -> fan_only shortcut: least squares over the reports of the last 30 min (longer
+            for a sensor with long gaps: RATE_WIDE_FACTOR x their median), and the same without the newest report; the
+            lower of the two, so one report that jumps (a sensor in the airflow) is not a rise. None with fewer than
+            RATE_MIN_POINTS + 1 reports spanning FAN_RISE_SPAN_S: then the shortcut does not fire. """
+        window_s = FAN_RISE_WINDOW_S
+        if self.wide_gaps:
+            window_s = max(window_s, RATE_WIDE_FACTOR * statistics.median(self.wide_gaps) + 60)
+        pts = [(t, v) for t, v in self.wide_hist if (now - t).total_seconds() <= min(window_s, FAN_RISE_MAX_S)]
+        if len(pts) < RATE_MIN_POINTS + 1:
+            return None
+        r_all = ls_slope_h(pts, now, RATE_WIDE_MAX_S, FAN_RISE_SPAN_S, RATE_MIN_POINTS)
+        r_old = ls_slope_h(pts[:-1], now, RATE_WIDE_MAX_S, 0, RATE_MIN_POINTS)
+        if r_all is None or r_old is None:
+            return None
+        return clamp(min(r_all, r_old), -RATE_MAX * self.s, RATE_MAX * self.s)
 
     def _solar(self, inp, R, now, dt_s, windy, raining):
         """ excess = window - R_used - base_w; solar_f rises at once and decays with solar_decay_s. It rises on a new
@@ -675,6 +916,232 @@ class IndoorController:
                              self._sample_weight(self.last_bias_sample, self.bias_off, now))
             self.last_bias_sample = now
 
+    # ---- forecast, sun position, learned hold and recovery push (owner decisions of 2026-11-22) ---------- #
+
+    def lead_s(self) -> float:
+        """ Seconds ahead for the sun anticipation and the forecast lookup: ANTIC_LEAD_H, at most recovery_hours; heaters
+            react slower (floor mass), so their lead is longer by SOLAR_LEAD_H heater / hvac (3 h with the defaults). """
+        return min(self.cfg.recovery_h, ANTIC_LEAD_H) * SOLAR_LEAD_H[self.cfg.kind] / SOLAR_LEAD_H['hvac'] * 3600
+
+    @staticmethod
+    def _fc_at(inp, t):
+        """ The forecast entry whose time slot holds t: from its time to the next entry (at most 3 h), the last one
+            1 h. None without one, so an old or missing forecast is never used. """
+        fc = [e for e in (inp.forecast or []) if isinstance(e, dict) and isinstance(e.get('time'), datetime.datetime)]
+        for i, e in enumerate(fc):
+            end = fc[i + 1]['time'] if i + 1 < len(fc) else e['time'] + datetime.timedelta(hours = 1)
+            end = min(end, e['time'] + datetime.timedelta(hours = 3))
+            try:
+                if e['time'] <= t < end:
+                    return e
+            except TypeError:    # a naive time: not comparable with an aware now
+                return None
+        return None
+
+    def _lookup_key(self, inp, now):
+        """ The outdoor temperature for the hold and push tables: out_slow, plus FC_WEIGHT of the forecast change from
+            now to now + lead (a front ahead counts early). Without a forecast that covers the lead: out_slow. """
+        if self.out_slow is None:
+            return None
+        e = self._fc_at(inp, now + datetime.timedelta(seconds = self.lead_s()))
+        temp = e.get('temp') if e is not None else None
+        if not isinstance(temp, (int, float)) or isinstance(temp, bool) or not math.isfinite(temp) or inp.out_temp is None:
+            return self.out_slow
+        return self.out_slow + FC_WEIGHT * (temp - inp.out_temp)
+
+    def _sun_learn(self, inp, now, w_ok):
+        """ The sun term (solar_f, before solar_gain) by sun elevation, before / after noon, with a weather class term.
+            Only with a fresh window sensor, windows closed for WINDOW_CLOSED_S and the sun above the horizon. """
+        ok = (w_ok and inp.sun_elev is not None and inp.sun_az is not None and inp.sun_elev > 0 and not inp.windows_open
+              and (inp.since_window_closed_s is None or inp.since_window_closed_s >= WINDOW_CLOSED_S))
+        if not ok:
+            self.sun_off = now
+            return
+        if not self._sample_due(self.last_sun_sample, now):
+            return
+        g = self.sun_gain['am' if inp.sun_az < 180 else 'pm']
+        w = self._sample_weight(self.last_sun_sample, self.sun_off, now)
+        before = g.dry(inp.sun_elev)
+        if g.sample(inp.sun_elev, self.solar_f, w = w) and before is not None:
+            self.sun_cond.sample(self.cls, self.solar_f - before, w)
+        self.last_sun_sample = now
+
+    def _sun_expected(self, inp, now):
+        """ The learned sun term at now + lead (sun position then, forecast class then, else the class now), times
+            n / (n + N_PRIOR) of the bins used, times solar_gain, at most solar_max. None: no sun position; 0: unlearned. """
+        if inp.sun_lead is None or None in tuple(inp.sun_lead)[:2]:
+            return None
+        el, az = tuple(inp.sun_lead)[:2]
+        if el <= 0:
+            return 0.0
+        v, n = self.sun_gain['am' if az < 180 else 'pm'].learned_n(el)
+        if v is None:
+            return 0.0
+        e = self._fc_at(inp, now + datetime.timedelta(seconds = self.lead_s()))
+        cls = cond_class(e.get('condition')) if e is not None and e.get('condition') is not None else self.cls
+        w = n / (n + self.t.n_prior)
+        return min(self.solar_max, self.cfg.solar_gain * w * max(0.0, v + self.sun_cond.value(cls)))
+
+    def _antic(self, inp, now, solar):
+        """ (sun term expected beyond the one now, expected). An increase is held back by the first part. Each
+            expectation is checked one lead later: when the sun term then is below ANTIC_CHECK of it and the room does
+            not rise, the anticipation is off for ANTIC_OFF_S and the normal rules act. """
+        if not self.cfg.sun_anticipation:
+            return 0.0, None
+        exp = self._sun_expected(inp, now)
+        lead = self.lead_s()
+        self.antic_hist = [(t, e) for t, e in self.antic_hist if (now - t).total_seconds() <= 2 * lead]
+        if exp:
+            self.antic_hist.append((now, exp))
+        if not exp or (self.antic_off is not None and now < self.antic_off):
+            return 0.0, exp
+        extra = max(0.0, exp - solar)
+        due = [e for t, e in self.antic_hist if (now - t).total_seconds() >= lead - 1]
+        if extra > 0 and due and solar < ANTIC_CHECK * due[-1] and not (self.rise is not None and self.rise > 0):
+            self.antic_off, self.antic_hist = now + datetime.timedelta(seconds = ANTIC_OFF_S), []   # the sun did not come
+            return 0.0, exp
+        return extra, exp
+
+    def _hold_value(self, x, windy, raining, cls):
+        """ (learned hold offset at x with its wind, rain or weather class term, interpolated count); (None, 0) when no
+            bin has N_USE samples. """
+        v, n = self.hold.learned_n(x)
+        if v is None:
+            return None, 0
+        if windy:
+            v += self.hold.term('wind', x)
+        elif raining:
+            v += self.hold.term('rain', x)
+        else:
+            v += self.hold_cond.value(cls)
+        return v, n
+
+    def _ff_hold(self, ff, windy, raining):
+        """ (feed-forward, weight): the learned hold blended in with n / (n + N_PRIOR); no usable bin: ff as it was. """
+        v, n = self._hold_value(self.key, windy, raining, self.cls)
+        if v is None:
+            return ff, 0.0
+        w = n / (n + self.t.n_prior)
+        return ff + w * (v - ff), w
+
+    def _hold_learn(self, inp, now, R, src, tgt, ff0, solar, windy, raining, base):
+        """ One sample of the setpoint offset that holds the room: setpoint in force - the room + the sun term in force,
+            by out_slow, after the room stayed within HOLD_BAND of an unchanged target_eff for HOLD_SETTLE_S with the
+            setpoint (also one set by hand) and the mode unchanged as long, the room steady, windows closed, no power state
+            or cold start, a small sun term. The integral takes the change of the blended feed-forward, so the setpoint
+            does not jump. """
+        s = self.s
+        # Above the target (beyond DB_ABOVE) the setpoint is being lowered, not holding: in mild weather the unit idles, the
+        # room drifts slowly on its own heat and any low setpoint would pass as a hold (a simulated living room at +9.5 C learned -1.6
+        # where -0.1 holds the room)
+        if src in ('primary', 'backup') and R is not None and -HOLD_BAND * s <= R - tgt <= DB_ABOVE * s:
+            if self.band_since is None or self.band_tgt is None or abs(tgt - self.band_tgt) > 1e-6:
+                self.band_since, self.band_tgt = now, tgt
+        else:
+            self.band_since = None
+
+        def settled(t):
+            return t is not None and (now - t).total_seconds() >= HOLD_SETTLE_S
+        ok = (settled(self.band_since) and settled(self.sp_since) and settled(self.mode_since) and inp.setpoint is not None
+              and self.out_slow is not None and not inp.windows_open and not inp.vacation and inp.power_state == 'normal'
+              and self.pw_state == 'normal' and self.cold_start is None and solar < self.t.sun_deadband * s
+              and (inp.since_window_closed_s is None or inp.since_window_closed_s >= WINDOW_CLOSED_S)
+              and (self.rise is None or abs(self.rise) <= HOLD_STEADY * s)
+              and inp.setpoint > self.limits(base)[0] + STEP * s)    # not at the lower clamp
+        if not ok:
+            self.hold_off = now
+            return
+        if not self._sample_due(self.last_hold_sample, now):
+            return
+        before = self._ff_hold(ff0, windy, raining)[0]
+        # Relative to the room it held, not to target_eff: a room held steady 0.2 below the target needs about 0.2 more
+        # (in a simulated living room 'setpoint - target_eff' learned 2.3 where 2.5 holds the target, and the push stalled)
+        y, dry = inp.setpoint - R + solar, self.hold.dry(self.out_slow)
+        w = self._sample_weight(self.last_hold_sample, self.hold_off, now)
+        if self.hold.sample(self.out_slow, y, windy, raining, w) and not (windy or raining) and dry is not None:
+            self.hold_cond.sample(self.cls, y - dry, w)
+        self.last_hold_sample = now
+        self.i_term = clamp(self.i_term - (self._ff_hold(ff0, windy, raining)[0] - before), -I_CLAMP * s, I_CLAMP * s)
+
+    def _recovery(self, d, inp, now, dt_s, tgt, src, solar, manual, ff = 0.0, hold = None):
+        """ The recovery episode and its push (setpoint degrees, added to sp_ctrl). An episode starts on a target_eff
+            rise with the room more than DB_BELOW below it, or with the room EP_START below it for EP_START_S; it ends when
+            the room is EP_END below it (or after EP_MAX_S) and teaches the push gain how long it took against
+            recovery_hours. A window, vacation, power state, cold start, hand change, a new target, a mode change or a
+            restart discards it. push = gain x deficit (so it fades as the room comes), not growing while the room already
+            rises faster than recovery_hours needs, plus the part that lifts ff + integral to the learned hold when that is higher (the
+            integral is frozen during the push and may still hold a value from an earlier state, such as a savings night;
+            a push that fades with the deficit could not make up for it). That part goes into the integral when the
+            episode ends, so the setpoint does not jump. """
+        s, cfg = self.s, self.cfg
+        real = src in ('primary', 'backup') and self.in_f is not None
+        deficit = tgt - self.in_f if real else None
+        raised = self.tgt_prev is not None and tgt > self.tgt_prev + 1e-6
+        moved = self.tgt_prev is not None and abs(tgt - self.tgt_prev) > 1e-6
+        self.tgt_prev = tgt
+        stop = (not real or inp.windows_open or inp.vacation or inp.power_state != 'normal' or self.cold_start is not None
+                or manual or inp.setpoint is None)
+        self.below_since = (self.below_since or now) if real and deficit >= EP_START * s else None
+        ep = self.ep
+        if ep is not None:
+            if stop or moved:
+                self._episode_end(ep)
+                d.logs.append(('DEBUG', "recovery episode discarded (%s)." % ('new target' if moved and not stop else 'interrupted')))
+            elif deficit <= EP_END * s or (now - ep['t0']).total_seconds() >= EP_MAX_S:
+                self._episode_end(ep)
+                self._episode_learn(d, ep, now)
+            elif solar >= HOLD_SUN * s:
+                ep['sun_s'] += dt_s
+        if self.ep is None and not stop and (
+                (raised and deficit > DB_BELOW * s)
+                or (self.below_since is not None and (now - self.below_since).total_seconds() >= EP_START_S)):
+            self.ep = dict(t0 = now, key = self.key, cls = self.cls, g = self.push_g.value(self.key, self.cls), sun_s = 0.0, lift = 0.0)
+        g = self.push_g.value(self.key, self.cls)
+        d.diag.update(push_g = g, learning = self.key is None or self.push_g.episodes(self.key) < N_USE)
+        if self.ep is None or not real:
+            return 0.0
+        dp = max(0.0, deficit)
+        push = self.ep['g'] * dp
+        need = dp / max(0.25, cfg.recovery_h - (now - self.ep['t0']).total_seconds() / 3600)
+        if self.rise is not None and self.rise > need and self.ep.get('push') is not None:
+            push = min(push, self.ep['push'])    # rising faster than needed for recovery_hours: the push adds no more
+        self.ep['push'] = push
+        # the lift only with a learned gain: before that the integral recovers as before (with the rising freeze)
+        self.ep['lift'] = max(0.0, hold - (ff + self.i_term)) if hold is not None and self.ep['g'] > 0 else 0.0
+        return push + self.ep['lift']
+
+    def _episode_end(self, ep):
+        """ The episode is over: the part of the push that lifted ff + integral to the learned hold goes into the
+            integral, so the setpoint does not jump back. """
+        self.ep = None
+        if ep.get('lift'):
+            self.i_term = clamp(self.i_term + ep['lift'], -I_CLAMP * self.s, I_CLAMP * self.s)
+
+    def _episode_learn(self, d, ep, now):
+        """ The gain the episode would have needed: the setpoint drive (1 + Kp + gain) x deficit scales the recovery
+            time about inversely, so needed = (1 + Kp + gain used) x hours / recovery_hours - (1 + Kp). The gain moves only
+            when the episode was slower than recovery_hours (also a timeout) or faster than EP_FAST of it (on time: only
+            counted), and nothing is learned when the sun term carried more than EP_SUN_SHARE of it. """
+        hours = (now - ep['t0']).total_seconds() / 3600
+        if ep['key'] is None or ep['sun_s'] > EP_SUN_SHARE * hours * 3600:
+            d.logs.append(('DEBUG', "recovery in %.1f h: not learned (%s)." % (hours, 'sun' if ep['key'] is not None else 'no outdoor value')))
+            return
+        r = hours / self.cfg.recovery_h
+        if EP_FAST <= r <= 1.0:
+            self.push_g.seen(ep['key'])    # on time: counts as an episode, the gain stays
+            d.save = True
+            return
+        k0 = 1 + self.t.kp
+        self.push_g.learn(ep['key'], (k0 + ep['g']) * r - k0, ep['cls'])
+        d.save = True
+        d.logs.append(('DEBUG', "recovery in %.1f h (aim %.1f): push gain %.2f -> %.2f." % (
+            hours, self.cfg.recovery_h, ep['g'], self.push_g.value(ep['key'], ep['cls']))))
+
+    def _step_up(self, now):
+        """ The largest normal increase now: STEP_UP_EDGE once within EDGE_S after a period start or end, else STEP_UP. """
+        edge = self.edge_t is not None and not self.edge_used and (now - self.edge_t).total_seconds() <= EDGE_S
+        return round_half((STEP_UP_EDGE if edge else STEP_UP) * self.s)
+
     # ---- control terms ----------------------------------------------------------------------------- #
 
     def target_base(self, inp, now):
@@ -711,8 +1178,10 @@ class IndoorController:
                 if b is not None:
                     ok, ff = True, self.t.ff_bias_weight * b
             ff += self.cfg.outdoor_gain * (base - self.out_slow)
+        self.ff_jump = 0.0
         if self.ff_ok_prev is not None and ok != self.ff_ok_prev:
-            self.i_term += self.ff_prev - ff
+            self.ff_jump = self.ff_prev - ff
+            self.i_term += self.ff_jump
         self.ff_prev, self.ff_ok_prev = ff, ok
         return ff
 
@@ -735,10 +1204,11 @@ class IndoorController:
             return sign * (self.cfg.save_temp_offset if self.cfg.save_temp_offset is not None else SAVE_OFFSET)
         return sign * self.cfg.spend_temp_offset
 
-    def _send(self, d, inp, now, sp, bypass = False):
+    def _send(self, d, inp, now, sp, bypass = False, step_up = None):
         """ Output stage: sends round_half(sp). Normal: only when |sp - setpoint| >= SEND_HYST, at most one change per
             MIN_CHANGE_S; a change that has to wait asks for a run when it may go (retry_s). bypass (overrides,
-            power-state edges, mode switches): now. """
+            power-state edges, mode switches): now. step_up (normal heat changes): an increase goes at most this far
+            (owner); the rest follows MIN_CHANGE_S later in its own run. """
         cur = inp.setpoint
         want = round_half(sp)
         new = None
@@ -749,6 +1219,10 @@ class IndoorController:
                 new = want
             elif want != cur:
                 d.retry_s = MIN_CHANGE_S - (now - self.last_change).total_seconds()
+        if new is not None and step_up is not None and not bypass and cur is not None and new > cur + step_up + 1e-9:
+            new = math.floor((cur + step_up) * 2 + 1e-9) / 2   # on the 0.5 grid, never more than step_up
+            d.diag['step_cap'] = True
+            d.retry_s = MIN_CHANGE_S
         if new is not None and new != cur:
             d.temperature = new
             self.last_commanded = new
@@ -817,10 +1291,23 @@ class IndoorController:
         excess, w_ok = self._solar(inp, R, now, dt_s, windy, raining)
         self._learn(inp, now, src, w_ok, windy, raining, rate60)
         solar = min(self.solar_max, cfg.solar_gain * self.solar_f)
+        flags = (bool(inp.saving), bool(inp.increasing))
+        if self.flags_prev is not None and flags != self.flags_prev:
+            self.edge_t, self.edge_used = now, False    # a period started or ended: one larger step up is allowed
+        self.flags_prev = flags
+        self.rise = self._rate_wide(now, RISE_SPAN_S) if real else None
+        self.rise_fan = self._rise_fan(now) if real else None
+        self.cls = cond_class(inp.condition)
+        self.key = self._lookup_key(inp, now)
+        self._sun_learn(inp, now, w_ok)
+        if inp.hvac_mode != 'heat' or cfg.target_mode == 'table':
+            self.ep = self.below_since = self.band_since = self.tgt_prev = None
         d.diag = dict(src = src, R = R, in_f = self.in_f, rate = rate, rate_wide = self._rate_wide(now),
                       excess = excess, solar = solar, out_slow = self.out_slow, out_day = self.out_day,
                       base_w = self.base_w.value(inp.out_temp, windy, raining) if inp.out_temp is not None else None,
-                      bias_int = self.bias.value(self.out_slow, windy, raining) if self.out_slow is not None else None)
+                      bias_int = self.bias.value(self.out_slow, windy, raining) if self.out_slow is not None else None,
+                      rise = self.rise, rise_fan = self.rise_fan, smoothing = self.tau_in / 60, sun_elev = inp.sun_elev, sun_az = inp.sun_az,
+                      cond = self.cls, step_cap = False)
         args = (d, inp, now, dt_s, R, src, base, solar, rate, windy, raining)
         if cfg.target_mode == 'table' and cfg.kind == 'heater':
             self._table(*args)
@@ -853,10 +1340,12 @@ class IndoorController:
             return 'window closed < 1 h'
         return None
 
-    def _pi(self, tgt, ff, solar, rate, base, dt_s, integrate, attr = 'i_term'):
+    def _pi(self, tgt, ff, solar, rate, base, dt_s, integrate, attr = 'i_term', grow = True):
         """ sp_ctrl = clamp(tgt + ff + i + p - solar). The integral (attr) runs only when allowed, outside the
-            deadband (DB_BELOW / DB_ABOVE), and not further into a clamp (anti-windup). """
+            deadband (DB_BELOW / DB_ABOVE), and not further into a clamp (anti-windup). grow False: it does not move
+            toward more output (heat: up, cool: down), it may still unwind; self.grow_blocked tells whether that bit. """
         s = self.s
+        self.grow_blocked = False
         lo, hi = self.limits(base, 'cool' if attr == 'i_cool' else 'heat')
         if self.in_f is None:
             return clamp(tgt + ff + getattr(self, attr) - solar, lo, hi), 0.0
@@ -866,7 +1355,9 @@ class IndoorController:
         if (integrate and dt_s <= 3 * max(MIN_CHANGE_S, self.cfg.interval_s) and abs(e) <= self.t.i_band * s
                 and (ei > DB_BELOW * s or ei < -DB_ABOVE * s)):
             raw = tgt + ff + getattr(self, attr) + p - solar
-            if not ((raw >= hi and ei > 0) or (raw <= lo and ei < 0)):
+            if not grow and (ei > 0 if attr == 'i_term' else ei < 0):
+                self.grow_blocked = True
+            elif not ((raw >= hi and ei > 0) or (raw <= lo and ei < 0)):
                 setattr(self, attr, clamp(getattr(self, attr) + self.t.ki_h * ei * dt_s / 3600, -I_CLAMP * s, I_CLAMP * s))
         return clamp(tgt + ff + getattr(self, attr) + p - solar, lo, hi), p
 
@@ -937,9 +1428,14 @@ class IndoorController:
     def _heat(self, d, inp, now, dt_s, R, src, base, solar, rate, windy, raining):
         cfg, s = self.cfg, self.s
         tgt = self.target_eff(base, inp, windy, raining, 'heat')
-        ff = self._ff(base, windy, raining)
+        ff0 = self._ff(base, windy, raining)
+        self._hold_learn(inp, now, R, src, tgt, ff0, solar, windy, raining, base)
+        ff, w_hold = self._ff_hold(ff0, windy, raining)
+        if self.ff_jump and w_hold:
+            self.i_term -= w_hold * self.ff_jump    # _ff took the whole jump of ff0; only (1 - w) of it reaches ff
         first = not self.started
-        if first or self._manual(d, inp):
+        manual = not first and self._manual(d, inp)
+        if first or manual:
             self._bumpless(d, inp, tgt, ff, solar, rate, first = first)
             self.cold_start = None
         freeze = self._freeze(inp, src, tgt)
@@ -947,11 +1443,24 @@ class IndoorController:
             freeze = 'sun'
         if freeze is None and self.cold_start is not None:
             freeze = 'cold start'
-        sp_ctrl, p = self._pi(tgt, ff, solar, rate, base, dt_s, freeze is None)
+        hv, hn = self._hold_value(self.key, windy, raining, self.cls)
+        push = self._recovery(d, inp, now, dt_s, tgt, src, solar, manual, ff, hv)
+        antic, solar_exp = self._antic(inp, now, solar)
+        # owner: the integral does not grow while the push acts, while the room rises (judged over 30 min or more) and
+        # while an increase waits for the sun ahead; it may still unwind
+        block = 'push' if push > 0 else 'rising' if self.rise is not None and self.rise >= RISE_FREEZE * s else None
+        if block is None and antic > 0 and inp.setpoint is not None and self.in_f is not None:
+            lo0, hi0 = self.limits(base)
+            sp_now = clamp(tgt + ff + push + self.i_term + self.t.kp * (tgt - (self.in_f + rate * self.t.lead_h)) - solar, lo0, hi0)
+            block = 'sun ahead' if sp_now > inp.setpoint else None
+        sp_ctrl, p = self._pi(tgt, ff + push, solar, rate, base, dt_s, freeze is None, grow = block is None)
         lo, hi = self.limits(base)
-        d.diag.update(mode = 'heat', target_eff = tgt, ff = ff, i = self.i_term, p = p, sp_ctrl = sp_ctrl, frozen = freeze)
+        d.diag.update(mode = 'heat', target_eff = tgt, ff = ff, i = self.i_term, p = p, sp_ctrl = sp_ctrl,
+                      frozen = freeze or (block if self.grow_blocked else None), hold = hv, hold_n = hn, push = push,
+                      solar_exp = solar_exp, antic = 0.0)
         vac = cfg.vacation_temp if cfg.vacation_temp is not None else 10.0
         if inp.windows_open or inp.vacation:
+            self.restore_up = True    # the way back from the override is part of it: not held to STEP_UP
             self._clear_pw()
             self.cold_start = None
             if cfg.kind == 'hvac' and inp.windows_open:
@@ -970,7 +1479,8 @@ class IndoorController:
             if src in ('primary', 'backup'):
                 extra = cfg.spend_temp_offset if (inp.power_state == 'spend' and active) else 0.0
                 held = self.pw_ended is not None and (now - self.pw_ended).total_seconds() < POWER_END_HOLD_S
-                if (self.in_f > tgt + FAN_ABOVE * s + extra and (cfg.has_fireplace or sp_ctrl <= lo + 1e-9 or rate >= FAN_RISE * s)
+                rising = self.rise_fan is not None and self.rise_fan >= FAN_RISE * s    # owner: over the last 30 min
+                if (self.in_f > tgt + FAN_ABOVE * s + extra and (cfg.has_fireplace or sp_ctrl <= lo + 1e-9 or rising)
                         and not held and (inp.since_windy_s is None or inp.since_windy_s > FAN_WIND_S)
                         and self._mode_time_ok(now)):
                     if self._increase_hold(inp, tgt, solar):
@@ -1005,7 +1515,17 @@ class IndoorController:
         if active:
             self._send(d, inp, now, self.pw_base + self.power_offset(inp.power_state, 'heat'), bypass = True)
             return
-        self._send(d, inp, now, sp_ctrl, bypass = edge)
+        sp_out = sp_ctrl
+        if antic > 0 and inp.setpoint is not None and sp_ctrl > inp.setpoint:
+            sp_out = max(inp.setpoint, sp_ctrl - antic)    # the sun ahead: an increase waits or shrinks, never below the setpoint
+            d.diag['antic'] = sp_ctrl - sp_out
+        step = None if self.restore_up else self._step_up(now)
+        if self._send_open(now):
+            self.restore_up = False   # the first run that may change it after a window / vacation override
+        self._send(d, inp, now, sp_out, bypass = edge, step_up = step)
+        if (d.temperature is not None and inp.setpoint is not None and d.temperature > inp.setpoint
+                and step is not None and step > round_half(STEP_UP * s)):
+            self.edge_used = True
 
     def _increase_hold(self, inp, tgt, solar) -> bool:
         """ The time after a daytime_increasing period (increase_hold_hours): no heat -> fan_only, so the room can fall
@@ -1040,7 +1560,9 @@ class IndoorController:
     def _fan_only(self, d, inp, now, dt_s, R, src, base, solar, rate, windy, raining):
         cfg, s = self.cfg, self.s
         tgt = self.target_eff(base, inp, windy, raining, 'heat')
-        ff = self._ff(base, windy, raining)
+        ff, w_hold = self._ff_hold(self._ff(base, windy, raining), windy, raining)
+        if self.ff_jump and w_hold:
+            self.i_term -= w_hold * self.ff_jump
         sp_ctrl, p = self._pi(tgt, ff, solar, rate, base, dt_s, False)
         d.diag.update(mode = 'fan_only', target_eff = tgt, ff = ff, i = self.i_term, p = p, sp_ctrl = sp_ctrl)
         self._clear_pw()
@@ -1088,9 +1610,12 @@ class IndoorController:
         if first or self._manual(d, inp, 'cool'):
             self._bumpless(d, inp, tgt, 0.0, solar, rate, 'i_cool', 'cool', first = first)
         freeze = self._freeze(inp, src, tgt)
-        # cooling: no feed-forward, the sun term adds cooling (lower setpoint), never learned (as classic)
-        sp_ctrl, p = self._pi(tgt, 0.0, solar, rate, base, dt_s, freeze is None, 'i_cool')
-        d.diag.update(mode = 'cool', target_eff = tgt, i = self.i_cool, p = p, sp_ctrl = sp_ctrl, frozen = freeze)
+        # cooling: no feed-forward, the sun term adds cooling (lower setpoint), never learned (as classic). The integral
+        # does not grow toward more cooling while the room already falls (the mirror of the heating rule)
+        falling = self.rise is not None and self.rise <= -RISE_FREEZE * self.s
+        sp_ctrl, p = self._pi(tgt, 0.0, solar, rate, base, dt_s, freeze is None, 'i_cool', grow = not falling)
+        d.diag.update(mode = 'cool', target_eff = tgt, i = self.i_cool, p = p, sp_ctrl = sp_ctrl,
+                      frozen = freeze or ('falling' if self.grow_blocked else None))
         active, edge = self._power_layer(d, inp, tgt, 'cool')
         if active:
             self._send(d, inp, now, self.pw_base + self.power_offset(inp.power_state, 'cool'), bypass = True)

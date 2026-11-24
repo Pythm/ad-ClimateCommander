@@ -48,7 +48,8 @@ CONTROLLERS = ('classic', 'shadow', 'adaptive')
 # Keys that only the shadow / adaptive controller reads (classic ignores them with one INFO line)
 ADAPTIVE_KEYS = (
     'window_offset_table', 'internal_offset_table', 'target_table', 'outdoor_gain', 'solar_gain',
-    'solar_max', 'comfort_guard', 'diagnostic_sensor', 'window_trigger_delta',
+    'solar_max', 'comfort_guard', 'diagnostic_sensor', 'window_trigger_delta', 'room_smoothing_minutes', 'recovery_hours',
+    'sun_anticipation', 'sun_entity',
 )
 OFFSET_LIMIT = 30   # an offset table value further from 0 than this is a typo (no sign or unit assumption)
 ENTITY_ID = re.compile(r'^[a-z0-9_]+\.[a-z0-9_]+$')
@@ -252,6 +253,10 @@ class DeviceConfig(_Model):
     solar_max: float | None = Field(default=None, gt=0)              # None: UNIT_DEFAULTS
     comfort_guard: float | None = Field(default=None, gt=0)          # None: UNIT_DEFAULTS
     diagnostic_sensor: str | None = None
+    room_smoothing_minutes: float | None = Field(default=None, ge=1, le=180)   # room reading filter. None: 12 min HVAC, 15 heater
+    recovery_hours: float = Field(default=2.0, ge=0.5, le=6)         # the learned recovery push aims at the target within this
+    sun_anticipation: bool = True                                    # a learned sun ahead holds an increase back
+    sun_entity: str | None = None                                    # sun position from this entity when AppDaemon has no location
 
     @model_validator(mode='before')
     @classmethod
@@ -303,6 +308,13 @@ class DeviceConfig(_Model):
     def _entity_id(cls, value: Any) -> Any:
         if value is not None and not ENTITY_ID.match(value):
             raise ValueError("must be an entity id such as sensor.living_room_controller")
+        return value
+
+    @field_validator('sun_entity')
+    @classmethod
+    def _sun_entity_id(cls, value: Any) -> Any:
+        if value is not None and not ENTITY_ID.match(value):
+            raise ValueError("must be an entity id (domain.name) with elevation and azimuth attributes")
         return value
 
     @property
@@ -408,6 +420,10 @@ class DeviceConfig(_Model):
             'solar_max': self.solar_max if self.solar_max is not None else defaults['solar_max'],
             'comfort_guard': self.comfort_guard if self.comfort_guard is not None else defaults['comfort_guard'],
             'diagnostic_sensor': self.diagnostic_sensor,
+            'room_tau_s': seconds(self.room_smoothing_minutes),
+            'recovery_hours': self.recovery_hours,
+            'sun_anticipation': self.sun_anticipation,
+            'sun_entity': self.sun_entity,
             'adaptive_keys': [k for k in ADAPTIVE_KEYS if k in fields],
         }
 

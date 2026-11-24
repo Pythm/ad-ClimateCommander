@@ -32,6 +32,17 @@ One app controls one climate entity: a heater (floor heating, panel heater) or a
 ---
 ## 🚨 Breaking Changes
 
+### 1.4.1
+**Only `controller: adaptive` changes (and what `shadow` proposes).** Classic is unchanged. Live behaviour of adaptive devices:
+- Increases in heat are slower: at most +0.5 per change, the next one 12 minutes later. One change of +1.0 is allowed when a `daytime_savings` / `daytime_increasing` period starts or ends.
+- Decreases, open windows, vacation, power states, mode switches and the cold start still move at once.
+- The integral no longer grows while the room rises (judged over at least 30 minutes of sensor reports). It no longer winds up while the heat is still on its way to a slow wall sensor.
+- HVAC: "the room still rises" (heat to `fan_only`) is judged over the reports of the last 30 minutes, with and without the newest one. One report that jumps no longer switches the unit.
+- New learning: the setpoint that holds the room and a recovery push, by outdoor temperature and weather; the sun by its position. Until it has learned, the controller works as before plus the rules above. See [Learned hold, recovery and sun](#learned-hold-recovery-and-sun).
+- New optional keys: `recovery_hours`, `room_smoothing_minutes`, `sun_anticipation`, `sun_entity`.
+- The weather condition and forecast come from ad-Weather 0.3.0. Older versions work without them.
+- The JSON entry keeps version 1: everything learned before is kept, the new parts are added.
+
 ### 1.4.0
 **Your configuration keeps working without changes, but some defaults behave differently.** The ones you notice most, and how to get the old behaviour back:
 - Indoor mode runs every 30 minutes instead of 12: `interval_minutes: 12`.
@@ -73,7 +84,7 @@ Everything that is new or different:
   - HVAC: the setpoint in heat is never set below `target_indoor_temp - max_setpoint_drop` (default 3 C / 5.4 F). Back from `fan_only`, the setpoint starts from the last one held in heat, at most the learned setpoint minus 1 (before: always the learned setpoint minus 1). See [Heat pump cycling](#heat-pump-cycling).
   - When a vacation ends with the room at least `cold_start_deficit` (default 2 C / 3.6 F) below the target, the heating starts with a higher setpoint and comes down once the room is within 1 degree of the target, see [Cold start after vacation](#cold-start-after-vacation). Before, the setpoint went from the vacation temperature to the setpoint plus the whole difference and then on up and down by the normal rules.
 - **Upgrading, indoor mode (classic):** a vacation end heats with a higher start setpoint (cold start). Nothing to configure; `cold_start_deficit` changes when the cold start is used.
-- **Upgrading, indoor mode (classic and adaptive):** the limit of 0.5 per run (classic) and 0.5 per change (adaptive) is gone again. The setpoint goes to the computed value at once, so the start or end of `daytime_savings` / `daytime_increasing` or a new target moves it in one run. Example: target 22.6, room 21.75, setpoint 21.5, adaptive controller calculates 24.0: 24.0 is sent, not 22.0. The adaptive controller still sends at most one change per 12 minutes. The only limit left is towards a learned setpoint (classic): at most 0.5 per run, see [the step rules](#indoor-mode-keep-a-fixed-indoor-temperature). Nothing to configure.
+- **Upgrading, indoor mode (classic and adaptive):** the limit of 0.5 per run (classic) and 0.5 per change (adaptive) is gone again. The setpoint goes to the computed value at once, so the start or end of `daytime_savings` / `daytime_increasing` or a new target moves it in one run. Example: target 22.6, room 21.75, setpoint 21.5, adaptive controller calculates 24.0: 24.0 is sent, not 22.0. The adaptive controller still sends at most one change per 12 minutes. The only limit left is towards a learned setpoint (classic): at most 0.5 per run, see [the step rules](#indoor-mode-keep-a-fixed-indoor-temperature). Nothing to configure. (Adaptive, from 1.4.1: an increase is limited again, to +0.5 per change, see 1.4.1.)
 - **Upgrading, HVAC in heat (indoor mode):** without `has_fireplace` an HVAC now lowers its setpoint before it switches to `fan_only` (it switches at once only when the setpoint is at its lowest or the room still rises; a sensor that reports less often than about every 25 minutes does not show the rise, see [Sensors that report rarely](#sensors-that-report-rarely)). A room with a fireplace, or another heat source that makes the room overshoot fast, sets `options: [has_fireplace]` to keep the old behaviour (`fan_only` at once at target + 0.6).
 - **Upgrading, `controller: adaptive` in indoor mode:** the device now runs when the room sensor reports, not only every 30 minutes, see [When a device runs](#when-a-device-runs). Nothing to configure. The interval is now the longest time without a run. Expect more runs and about the same number of setpoint changes.
 - **Upgrading, `controller: adaptive` / `shadow`:** what the controller learns (the window level without sun, the offset of the climate's own sensor, the offset of the backup sensor) goes by time, also with the default interval of 30 minutes: it learns as fast as it did at 12 minutes (before, about 2.5 times slower at 30 minutes, and only one learning sample per interval even when the sensor reports started runs in between). Nothing changes with `interval_minutes: 12`. Below 12 minutes the backup offset now follows as fast as at 12 (before, faster). The sample counts in the JSON file may have decimals. Nothing to configure, see [What it learns](#what-it-does).
@@ -300,12 +311,12 @@ The time of a report is the latest of the entity's `last_reported`, `last_update
 
 **The room trend on such a sensor.** A trend needs 3 reports inside its window. For an HVAC that window is about 52 minutes (60 in classic), so `rate` stays 0.0 on a sensor that reports less often than about every 25 minutes. A real sensor with a 55 minute heartbeat read 0.0 in about 99% of the runs. Two rules depend on it:
 
-- **"The room still rises 0.2 C (0.36 F) per hour"** (heat to `fan_only`, HVAC without `has_fireplace`). On such a sensor the rise is not seen: the setpoint is lowered instead, and `fan_only` comes only at the lowest setpoint.
+- **"The room still rises 0.2 C (0.36 F) per hour"** (heat to `fan_only`, HVAC without `has_fireplace`). Classic uses its 60 minute trend. On such a sensor the rise is not seen: the setpoint is lowered instead, and `fan_only` comes only at the lowest setpoint. Adaptive (from 1.4.1) uses `rise_fan` instead of `rate`: the reports of the last 30 minutes, or 3 report gaps when they are longer (at most 1 hour), at least 4 reports, the lower of the slope with and without the newest report. A sensor that reports less often than every 20 minutes does not show the rise either.
 - **The predictive trend** (the proportional term acts on the room plus `rate` times a short lead time). Only heaters use it. Their window is about 115 minutes, so for a heater `rate` stays 0.0 on a sensor that reports less often than about every 55 minutes.
 
 For such a room with an extra heat source (fireplace, stove, strong sun through glass), use `options: [has_fireplace]` on an HVAC: it then switches to `fan_only` at target + 0.6 without needing the trend. The option does nothing on a heater.
 
-To judge the trend yourself, read `rate_wide` on the [diagnostic sensor](#start-with-shadow) (`shadow` and `adaptive`). It only shows the trend; the controller never uses it, and control keeps `rate`, because a wider window for control made normal rooms worse in simulation. Its window is 3 times the median of the last 9 gaps between reports of the room sensor, at least the normal window and at most 4 hours. With fewer than 3 reports spanning 15 minutes in that window it is empty (None), while `rate` shows 0.0, so empty means unknown and 0 means a flat room. On a sensor that reports often it equals `rate`. It uses the gaps the app has seen: a report with an unchanged value starts no run, so a frequent sensor whose value rarely changes can get a wider window too.
+To judge the trend yourself, read `rate_wide` on the [diagnostic sensor](#start-with-shadow) (`shadow` and `adaptive`). It only shows the trend; the proportional term keeps `rate`, because a wider window for it made normal rooms worse in simulation. The integral freeze uses `rise`: the same window, but with reports spanning at least 30 minutes. Its window is 3 times the median of the last 9 gaps between reports of the room sensor, at least the normal window and at most 4 hours. With fewer than 3 reports spanning 15 minutes in that window it is empty (None), while `rate` shows 0.0, so empty means unknown and 0 means a flat room. On a sensor that reports often it equals `rate`. It uses the gaps the app has seen: a report with an unchanged value starts no run, so a frequent sensor whose value rarely changes can get a wider window too.
 
 ### Indoor mode: keep a fixed indoor temperature
 
@@ -476,12 +487,20 @@ Every run (see [When a device runs](#when-a-device-runs)) the setpoint is calcul
 - **The target**: `target_indoor_temp` or `target_indoor_input`, or `target_table` (below). On top, the same shifts as classic, now applied to the target: -0.5 during `daytime_savings` (it replaces an increase); otherwise +0.3 during `daytime_increasing` and +0.3 with wind or rain.
 - **A feed-forward from the climate's own sensor**: a heat pump regulates its own sensor (`current_temperature`), which often reads 2 to 5 degrees above the room. The controller learns that offset (see below) and, for HVAC, adds half of it, so the setpoint moves with it before the room drifts. Heaters do not use it. `outdoor_gain` adds a fixed extra per degree that the slow outdoor temperature is below the target.
 - **A slow integral term**, which finds the setpoint that holds the room. It only runs while the room is near the target, outside a small band (room more than 0.1 above or 0.25 below the target, as the classic asymmetry), and it is frozen while a window is open or closed less than an hour ago, on vacation, in a power state, without a room sensor and (HVAC) while the sun term is large.
+  It also does not grow while the room rises 0.1 C (0.18 F) per hour or more, while a recovery push acts, and while an increase waits for a learned sun. It may still come down then. "Rises" is the slope of the room reports over at least 30 minutes (`rise`); unknown counts as not rising.
 - **A proportional term** on the filtered room temperature (heaters: plus `rate` times a short lead time, see [Sensors that report rarely](#sensors-that-report-rarely)).
 - **Minus a sun term**: how far the window sensor reads above its learned level without sun. It rises at once and fades over about two hours (walls and floor keep the heat), times `solar_gain`, at most `solar_max`.
+- **Once learned**: the learned hold in place of the feed-forward, and a recovery push after a deficit, see [Learned hold, recovery and sun](#learned-hold-recovery-and-sun).
 
-The result stays within the target ± 8 (an HVAC in heat at most `max_setpoint_drop` below the target, default 3 C / 5.4 F), the climate's `min_temp` and `max_temp` attributes, and never below the vacation temperature. It is rounded to 0.5 and sent **at most once per 12 minutes**, the whole change at once, when it is about 0.5 or more away from the current setpoint. Window, vacation and the start or end of a power state are sent at once. A setpoint changed by hand (or by another app) is followed: the controller continues from it.
+The result stays within the target ± 8 (an HVAC in heat at most `max_setpoint_drop` below the target, default 3 C / 5.4 F), the climate's `min_temp` and `max_temp` attributes, and never below the vacation temperature. It is rounded to 0.5 and sent **at most once per 12 minutes**, when it is about 0.5 or more away from the current setpoint.
+- A decrease goes the whole way at once.
+- In heat an increase goes at most +0.5 per change (1 F in F); the rest follows 12 minutes later in its own run.
+- The first increase within 13 minutes after a `daytime_savings` / `daytime_increasing` period starts or ends may be +1.0 (2 F).
+- Window, vacation, the start or end of a power state, mode switches and the cold start are sent at once. So is the first change after a window or vacation ended.
 
-**Start and restart.** At the first run after a start or a reload the controller takes over the climate's current setpoint, so nothing jumps. If the room is then far from the target (more than about 1.4 degrees for HVAC, 3.9 for heaters) it does not wait: the integral starts at 0 and the calculated value is sent at once. A setpoint changed by hand is followed in the same way as in classic. When the HVAC mode changes, the `Silence` fan mode (if a `silence` period is active) is set in a separate command a few seconds later, because a mode and a fan mode sent together can lose one of them.
+A setpoint changed by hand (or by another app) is followed: the controller continues from it.
+
+**Start and restart.** At the first run after a start or a reload the controller takes over the climate's current setpoint, so nothing jumps. If the room is then far from the target (more than about 1.4 degrees for HVAC, 3.9 for heaters) it does not wait: the integral starts at 0 and the calculated value is sent (an increase in +0.5 steps, as above). A setpoint changed by hand is followed in the same way as in classic. When the HVAC mode changes, the `Silence` fan mode (if a `silence` period is active) is set in a separate command a few seconds later, because a mode and a fan mode sent together can lose one of them.
 
 On top, unchanged from classic: open windows (heater: `vacation_temp`, HVAC: `fan_only`), vacation, and the power states from ElectricalManagement (the setpoint at the start of the state plus the same offsets). New: the **comfort guard** drops the power-state offset until the state changes when the room is `comfort_guard` below the target in `save` / `reduce`, or that much above it in `spend`.
 
@@ -493,7 +512,48 @@ On top, unchanged from classic: open windows (heater: `vacation_temp`, HVAC: `fa
 
 **Without a room sensor** (unavailable, or not reported within `room_sensor_stale_minutes`, default an hour, and no usable backup): the room is estimated as the climate's own sensor minus the learned offset (or `internal_offset_table`). The integral is frozen, nothing is learned and an HVAC does not change mode on an estimate. Without any offset the controller runs open loop on the feed-forward. One WARNING when this starts, one INFO when the room sensor is back. Classic does nothing in indoor mode in that case.
 
-**Table-mode heaters** keep the table: base from `temperatures`, +1 for rain or wind, then the sun term and "room above target" together lower it by at most 3, and save / spend / vacation / `min_temp` as classic. Differences: the room is the room sensor or the estimate above; **without either, the "room above target" part is left out** (classic uses the thermostat's `current_temperature`, often the floor, as the room and lowers the setpoint by up to 3). A small trim (at most ±2) moves the table value towards `target_indoor_temp` while a real room sensor reports.
+**Table-mode heaters** keep the table: base from `temperatures`, +1 for rain or wind, then the sun term and "room above target" together lower it by at most 3, and save / spend / vacation / `min_temp` as classic. Differences: the room is the room sensor or the estimate above; **without either, the "room above target" part is left out** (classic uses the thermostat's `current_temperature`, often the floor, as the room and lowers the setpoint by up to 3). A small trim (at most ±2) moves the table value towards `target_indoor_temp` while a real room sensor reports. None of the learning below applies to table mode.
+
+### Learned hold, recovery and sun
+
+Indoor mode, in heat (HVAC and heaters). Nothing here is set by hand: it is learned per climate and stored in the JSON file. **Until a part is learned it does nothing**, and the controller works as described above.
+
+**Why.** A room sensor on a wall can see the heat hours after the middle of the room. Before, the integral kept growing in that time: after the savings ended at 05:00 the setpoint climbed to 26.5, the middle of the room got too warm, and the wall sensor reached the target only after 4 to 5 hours.
+
+**The hold setpoint.** The setpoint that holds the room, as setpoint minus room plus the sun term, by outdoor temperature (2 C / 4 F steps).
+- Learned only after the room stayed between 0.3 below and 0.1 above the target for 1.5 hours, steady, with the setpoint and the HVAC mode unchanged as long. A setpoint you set by hand counts.
+- Not with a window open or closed less than an hour ago, on vacation, in a power state, during a cold start, with a large sun term or with the setpoint at its lowest.
+- Used once a step has 5 samples. It replaces the feed-forward step by step (weight n / (n + 30), heaters n / (n + 10)). At each new sample the integral takes over the change, so the setpoint does not jump.
+- Not used further than one step beyond the outdoor temperatures it has learned.
+
+**The recovery push.** When the room is more than 0.25 below a target that just rose (savings end, increase start, a new target), or 0.5 below for 30 minutes, a recovery starts.
+- The push is learned gain × deficit, added to the setpoint. It fades as the room comes. It stops growing while the room rises faster than needed to reach the target in time.
+- It also lifts the hold part to the learned hold when the integral is below it, once a gain is learned (the integral can hold a value from the savings night). At the end that part goes into the integral, so nothing jumps.
+- The integral does not grow during the push. The step rule still applies, but the push is not limited to the hold + 0.5: a cold morning can go well above it, +0.5 per 12 minutes.
+- The recovery ends at 0.1 below the target, or after 6 hours. It is not learned when it was cut short (window, vacation, power state, hand change, new target, mode change, restart) or when the sun carried more than a third of it.
+- The gain is learned per outdoor temperature from the time the room needed: longer than `recovery_hours` (default 2) raises it, shorter than 0.6 × `recovery_hours` lowers it. At most 1.0 (or a quarter) per recovery, between 0 and 3. It starts at 0: no push.
+- The diagnostic attribute `learning` is `true` while that outdoor step has fewer than 5 recoveries ("the first week").
+
+**Weather.** Both are learned with an extra term per weather class: clear (`sunny`, `clear-night`), cloudy (`cloudy`, `partlycloudy`, `fog`), rain (`rainy`, `pouring`, `lightning`, `lightning-rainy`) and snow (`snowy`, `snowy-rainy`). A class seen rarely changes little (shrunk toward 0). Other states or no condition: no term. The condition comes from ad-Weather 0.3.0 (see [Weather integration](#weather-integration)).
+
+**Forecast.** With a forecast that covers the next hour (heaters: the next 3 hours), half of the forecast change of the outdoor temperature is added to the outdoor value the hold and the push are looked up at. A front ahead counts early. Without a forecast: as before.
+
+**The sun.** The sun term is learned by the sun's elevation (2 degree steps), before and after noon, with the weather class term. Only with a fresh window sensor, windows closed for an hour and the sun above the horizon. The position comes from the `latitude` / `longitude` in AppDaemon's configuration; without them from `sun_entity` (its `elevation` and `azimuth`); without both there is no sun learning and no anticipation (one INFO line).
+
+**Sun anticipation** (`sun_anticipation`, default `true`). When the setpoint would rise, the controller looks one hour ahead (at most `recovery_hours`; heaters 3 hours): the sun position then, the forecast condition then (else the condition now), and what it has learned for them.
+- If that sun term is larger than the one now, the increase waits or shrinks by the difference. It never goes below the setpoint in force; decreases are not touched.
+- The integral does not grow meanwhile (`frozen`: `sun ahead`).
+- One lead later the expectation is checked. If the sun term is below half of it and the room does not rise, the anticipation is off for 3 hours and the normal rules act.
+- Unlearned steps count with weight 0: a new install anticipates nothing.
+
+**Keys** (all optional, adaptive and shadow only):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `recovery_hours` | 2 | How fast the room should be back at the target after a deficit starts, 0.5 to 6. Also the longest anticipation lead. |
+| `room_smoothing_minutes` | 12 HVAC, 15 heater | Time constant of the filtered room reading (`in_f`), 1 to 180. Larger reacts slower. For a sensor in the unit's airflow that jumps. |
+| `sun_anticipation` | `true` | `false`: no anticipation (the sun term is still learned). |
+| `sun_entity` | none | An entity with `elevation` and `azimuth` attributes, only needed when AppDaemon has no latitude / longitude. |
 
 ### Start with shadow
 
@@ -511,7 +571,16 @@ On top, unchanged from classic: open windows (heater: `vacation_temp`, HVAC: `fa
 | state | Setpoint the controller holds (`shadow`: would hold) |
 | `src`, `R` | Room value used: `primary`, `backup` (with a learned offset), `estimate` (climate sensor minus offset) or none |
 | `in_f`, `rate` | Filtered room temperature and its trend per hour. `rate` stays 0.0 on a sensor that reports less often than about every 25 minutes (heater: 55) |
-| `rate_wide` | Read-only: the room trend per hour over a window that follows the sensor's report gaps, for you to judge the trend. The controller never uses it. None (and left out of the DEBUG line) with too few reports. See [Sensors that report rarely](#sensors-that-report-rarely) |
+| `rate_wide` | Read-only: the room trend per hour over a window that follows the sensor's report gaps, for you to judge the trend. None (and left out of the DEBUG line) with too few reports. See [Sensors that report rarely](#sensors-that-report-rarely) |
+| `rise` | The same trend, over reports spanning at least 30 minutes. The integral does not grow while it is 0.1 C (0.18 F) per hour or more. None: unknown, not rising |
+| `rise_fan` | HVAC: the trend of the last 30 minutes for "the room still rises" (heat to `fan_only`), the lower of with and without the newest report. None: too few reports, no switch on it |
+| `smoothing` | Time constant of `in_f` in minutes (`room_smoothing_minutes`) |
+| `hold`, `hold_n` | Learned hold (setpoint minus room) at the current outdoor value, and its sample count. None: not learned there |
+| `push`, `push_g`, `learning` | Recovery push in degrees now, the learned gain, and `true` while that outdoor step has fewer than 5 recoveries |
+| `sun_elev`, `sun_az`, `sun_src` | Sun position now and where it comes from (`location`, `entity` or none) |
+| `cond` | Weather class now: `clear`, `cloudy`, `rain`, `snow` or none |
+| `solar_exp`, `antic` | Learned sun term expected one lead ahead, and how much of an increase waits for it now |
+| `step_cap` | `true` when this run's increase was cut to the +0.5 step (the rest follows 12 minutes later) |
 | `out_slow`, `out_day` | Outdoor temperature filtered over 8 to 9 hours (the walls) and over 24 hours |
 | `excess`, `base_w`, `solar` | Window sensor above its learned level (`base_w`), and the sun term |
 | `bias_int` | Learned offset of the climate's own sensor |
@@ -539,8 +608,12 @@ All optional. Only `shadow` and `adaptive` read them; with `classic` they are ig
 | `solar_max` | number above 0 | 3 C / 5.4 F | Largest sun term. |
 | `comfort_guard` | number above 0 | 1.5 C / 2.7 F | Power-state offset dropped (until the state changes) when the room is this far below the target in `save` / `reduce`, or above it in `spend`. |
 | `window_trigger_delta` | number 0 to 20, or `false` | 1 C / 1.8 F | `adaptive` in indoor mode: a run when `window_sensor_temp` has moved this far since the last run. `0` or `false`: off. See [When a device runs](#when-a-device-runs). |
+| `recovery_hours` | number 0.5 to 6 | 2 | The learned recovery push aims at the target within this. See [Learned hold, recovery and sun](#learned-hold-recovery-and-sun). |
+| `room_smoothing_minutes` | number 1 to 180 | 12 HVAC, 15 heater | Time constant of the filtered room reading. Larger reacts slower. |
+| `sun_anticipation` | bool | `true` | A learned sun ahead holds an increase back. Acts only on learned data. |
+| `sun_entity` | entity | none | Sun position (`elevation`, `azimuth` attributes) when AppDaemon's configuration has no latitude / longitude. |
 
-Fixed, not keys: one change per 12 minutes, JSON written at most every 30 minutes, the diagnostic sensor at most every 10 minutes while the setpoint and mode hold. The stale limits are keys, see [Sensors that report rarely](#sensors-that-report-rarely): the room sensor after 1 hour, the window sensor after 12 hours (window sensors often report only on a 1-degree change).
+Fixed, not keys: one change per 12 minutes, an increase in heat at most +0.5 per change (+1.0 at a period start or end), JSON written at most every 30 minutes, the diagnostic sensor at most every 10 minutes while the setpoint and mode hold. The stale limits are keys, see [Sensors that report rarely](#sensors-that-report-rarely): the room sensor after 1 hour, the window sensor after 12 hours (window sensors often report only on a 1-degree change).
 
 **Offset tables** (`window_offset_table`, `internal_offset_table`). Each entry applies from its `out` and up, like `temperatures`. They seed the learning: with data the learned values take over step by step. Leave them out unless you know the values (for example from the diagnostic sensor after weeks of shadow).
 
@@ -580,7 +653,8 @@ climate_living_room:
 - No trend hold (`trend_hold_hours` is classic only), no steady-room correction, no extra -1 after 4 hours turned down, no fixed ±4 around a learned value.
 - The trend uses the real room reading and the real time between reports. The daytime and wind / rain shifts move the target, not the reading.
 - The window sensor counts relative to its learned level, not to `target + window_offset`, and it is not added up run after run.
-- HVAC modes: heat to `fan_only` when the room is 0.6 above the effective target (plus the spend offset during `spend`) and the setpoint is at its lowest (`max_setpoint_drop` below the target) or the room still rises 0.2 C (0.36 F) per hour (not seen on a sensor that reports less often than about every 25 minutes, see [Sensors that report rarely](#sensors-that-report-rarely)); with `options: [has_fireplace]` at 0.6 above alone. `fan_only` to heat at or below the effective target, not while the sun term is large, starting half a degree below the calculated setpoint. The 0.6 hysteresis now holds during daytime periods too. At least 30 minutes in a mode before an automatic switch (window and vacation switch at once). No heat to `fan_only` within 45 minutes of wind, in the `increase_hold_hours` after `daytime_increasing` (ends early with a large sun term or a room 1 C above the line, see [After an increase](#after-an-increase-increase_hold_hours)) or in the hour after a power state ended. Cooling uses the classic thresholds.
+- Increases in heat at most +0.5 per change (+1.0 at a period start or end); the integral does not grow while the room rises; a learned hold, recovery push and sun anticipation (see [Learned hold, recovery and sun](#learned-hold-recovery-and-sun)).
+- HVAC modes: heat to `fan_only` when the room is 0.6 above the effective target (plus the spend offset during `spend`) and the setpoint is at its lowest (`max_setpoint_drop` below the target) or the room still rises 0.2 C (0.36 F) per hour. That rise is judged over the reports of the last 30 minutes (up to 1 hour for a sensor with longer gaps), at least 4 of them, and must also hold without the newest one (`rise_fan`); with too few reports it does not count. With `options: [has_fireplace]` at 0.6 above alone. `fan_only` to heat at or below the effective target, not while the sun term is large, starting half a degree below the calculated setpoint. The 0.6 hysteresis now holds during daytime periods too. At least 30 minutes in a mode before an automatic switch (window and vacation switch at once). No heat to `fan_only` within 45 minutes of wind, in the `increase_hold_hours` after `daytime_increasing` (ends early with a large sun term or a room 1 C above the line, see [After an increase](#after-an-increase-increase_hold_hours)) or in the hour after a power state ended. Cooling uses the classic thresholds.
 - The comfort guard during power states. With the defaults (`cold_start_deficit` 2, `comfort_guard` 1.5) a cold start after a vacation (below) is far enough below the target for the guard, so `save` / `reduce` do not lower it.
 - **Cold start after vacation** (indoor mode): when the vacation ends with the filtered room at least `cold_start_deficit` below the effective target, the setpoint is the effective target plus the difference (at most 6 C / 10.8 F above, at most `max_temp`), sent at once and held with the integral frozen; once the room is within 1 C (1.8 F) of the effective target, or after 8 hours, one move to the controller's own calculated setpoint, with the integral set so that it stays there. Ends early on a window, a new vacation, `fan_only` / cool, or a setpoint changed by hand; not kept over a restart. In `shadow` the controller only proposes it (virtual setpoint, diagnostic sensor); classic does its own cold start on the climate.
 - The room estimate from the climate's own sensor when the room sensor is gone.
@@ -594,6 +668,7 @@ climate_living_room:
 - The state is stored under `"adaptive"` next to the classic `"data"` for each climate in `<json_path>/<app name>.json`. Classic never reads it.
 - Switching between `classic`, `shadow` and `adaptive` is safe in both directions. What `shadow` learned is used by `adaptive`. Switch while ElectricalManagement sends `normal`: during `save` / `spend` the new controller takes the setpoint that already holds the offset as its base, so the offset counts twice until that state ends.
 - A state saved in another unit (C / F) or by another version is ignored with one INFO line, and learning starts again.
+- The learned hold, recovery push and sun term are extra keys in the same entry (`hold`, `push`, `sun_gain`). A file from before 1.4.1 loads with them empty; a key that cannot be read starts empty with one INFO line. A recovery in progress is not kept over a restart.
 - To reset only the adaptive learning: stop the app, delete the `"adaptive"` entry of that climate, start the app.
 - Without `json_path` everything learned is lost at every restart (one INFO line).
 
@@ -702,6 +777,8 @@ A screen is not opened while one of its own `windowsensors` is `on`. A cover tha
 ClimateCommander needs the [ad-Weather](https://github.com/Pythm/ad-Weather) app. It collects your weather sensors in one app and sends the `WEATHER_CHANGE` event with `temp`, `rain`, `wind`, `lux` and `cloud_cover`. Values it does not have are sent as `None` and ignored. The app name is `weather` unless you set `weather_app`. At startup ClimateCommander uses the last values the Weather app has sent, so it does not wait for the next change.
 
 Outdoor values are kept per ClimateCommander app. Until the first outdoor temperature arrives, indoor mode uses 10 and table mode waits.
+
+**Condition and forecast** (ad-Weather 0.3.0 or later; `controller: shadow` / `adaptive` only). The event may also carry `condition` (the weather entity state, such as `sunny` or `cloudy`) and `forecast`: a list of entries with `time` (ISO time with an offset), `temp`, `condition`, `cloud_cover`, `rain` and `wind`, for the next `forecast_hours` hours set in ad-Weather. The adaptive controller learns per weather class and looks the forecast up for its lead, see [Learned hold, recovery and sun](#learned-hold-recovery-and-sun). Entries without a valid time are skipped. Without `forecast_hours` the current condition is used for the lead. Older ad-Weather versions send neither: nothing changes then.
 
 **Deprecated own sensors**: `outside_temperature`, `rain_sensor` and `anemometer` (read in `HASS_namespace`) still work and log a WARNING at startup. While such a sensor has sent a new value in the last 20 minutes, the same value from the Weather app is ignored. Configure them in the Weather app instead.
 
@@ -834,6 +911,10 @@ In a one-device app these go at the top level. In the deprecated list style they
 | `solar_gain` | number | no | 1.0 | Shadow / adaptive: factor on the sun term, 0 to 5. |
 | `solar_max` | number | no | 3 C / 5.4 F | Shadow / adaptive: largest sun term. |
 | `comfort_guard` | number | no | 1.5 C / 2.7 F | Shadow / adaptive: power-state offset dropped when the room is this far off target. |
+| `recovery_hours` | number | no | 2 | Shadow / adaptive: the learned recovery push aims at the target within this many hours, 0.5 to 6. See [Learned hold, recovery and sun](#learned-hold-recovery-and-sun). |
+| `room_smoothing_minutes` | number | no | 12 HVAC, 15 heater | Shadow / adaptive: time constant of the filtered room reading, 1 to 180. Larger reacts slower. |
+| `sun_anticipation` | bool | no | `true` | Shadow / adaptive: a learned sun ahead holds an increase back. |
+| `sun_entity` | entity | no | none | Shadow / adaptive: sun `elevation` / `azimuth` when AppDaemon has no latitude / longitude. |
 
 ### Screening keys
 
@@ -1080,6 +1161,7 @@ These are intended. Please do not report them as bugs.
 - Indoor mode: a learned setpoint is approached by at most 0.5 per run, not jumped to (or by the adjustment, if that is larger). All other setpoint moves are sent at once, see [the step rules](#indoor-mode-keep-a-fixed-indoor-temperature).
 - Indoor mode: after a vacation the start setpoint can be up to 6 C above the target (the climate's `max_temp` at most) until the room is within 1 C of the target. That is the [cold start](#cold-start-after-vacation), not a fault.
 - HVAC without `has_fireplace`: at target + 0.6 the setpoint is lowered first; `fan_only` only at the lowest setpoint or while the room still rises (not seen on a sensor that reports less often than about every 25 minutes, see [Sensors that report rarely](#sensors-that-report-rarely)). HVAC: nothing is learned within 2 hours of a mode change.
+- Adaptive: in heat an increase goes +0.5 per 12 minutes (+1.0 once at a period start or end); the integral does not grow while the room rises; the heat to `fan_only` rise is judged over 30 minutes of reports. A slower morning in the first week is the recovery push still learning (`learning` on the diagnostic sensor).
 - The "no cooling when it is cold outside" rule (`fan_only` to cool only with the outdoor temperature above `target_indoor_temp - 4`) applies with and without `has_fireplace`.
 - Learned setpoints are only updated in normal operation (not on vacation, with open windows, during daytime savings / increasing, or in an ElectricalManagement state).
 - Table mode: open windows and `reduce` use the **lowest** of the save and vacation temperature.
