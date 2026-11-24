@@ -71,8 +71,9 @@ ROOM_SCREEN_EVERY = datetime.timedelta(minutes = 5)   # room trigger (_room_scre
 DIAG_KEYS = ('src', 'R', 'in_f', 'rate', 'rate_wide', 'out_slow', 'out_day', 'excess', 'base_w', 'solar', 'bias_int',
              'target_eff', 'ff', 'i', 'p', 'trim', 'room_term', 'sp_ctrl', 'increase_hold',
              'rise', 'rise_fan', 'smoothing', 'hold', 'hold_n', 'push', 'push_g', 'learning', 'sun_elev', 'sun_az', 'cond', 'solar_exp',
-             'antic', 'step_cap')
+             'antic', 'step_cap', 'sp_avg', 'boot', 'quick_down', 'floor_heat', 'mode_lost', 'sun_gate')
 SUN_EXTRAPOLATE = (600, 3600)      # sun_entity: the lead position from the reading 10 to 60 min old (no location known)
+WINDOW_COLD_BELOW = 0.3            # owner: 'Window open' once per window event when the room is this far below the target (x unit_scale)
 FORECAST_MAX = 72                  # forecast entries kept from one WEATHER_CHANGE event
 
 
@@ -270,6 +271,7 @@ class Heater:
         self.getting_hot_offset:float = cfg['getting_hot_offset']
         self.notify_cold_armed:bool = True
         self.notify_hot_armed:bool = False
+        self._window_target = None         # shadow / adaptive: the target_eff of the last run, for the 'Window open' message
         self.notify_app = app.notify_app
         self.recipients = cfg.get('notify_receiver')
 
@@ -382,6 +384,12 @@ class Heater:
         source = kwargs.get('source', 'primary')
         self._note_room(source, entity)
         self._room_screens(source)
+        if self.windows_is_open:
+            # between runs too: with a window open the adaptive runs come only every interval
+            room = to_float(new)
+            if room is not None and source == self._room_now()[1]:
+                tgt = self._window_target
+                self._window_notifications(room, tgt if self.ctrl is not None else None)
         if source == 'primary' and to_float(new) is not None and self._reports_start_runs():
             self._request_run()
 
@@ -1002,19 +1010,23 @@ class Heater:
     # Notifications
     # ------------------------------------------------------------------ #
 
-    def _window_notifications(self, in_temp) -> None:
-        """ Once per window event: 'getting cold' after windows opened, 'getting hot' after all closed. """
+    def _window_notifications(self, in_temp, target = None) -> None:
+        """ Once per window event: 'Window open' when a window is open and the room is below the target - 0.3
+            (x unit_scale; owner 2026-11-24, before: below getting_cold with the outdoor temperature below it too, which a
+            22 C room never reached), 'getting hot' after all closed. target: the effective target of the controller;
+            None: target_indoor_temp, 0.5 lower during daytime_savings. """
         if in_temp is None or self.notify_app is None:
             return
         out_temp = self.weather.out_temp
+        if target is None:
+            target = self.target_indoor_temp - (0.5 * self.unit_scale if self.DaytimeSaving() else 0.0)
         if (
             self.windows_is_open
             and self.notify_cold_armed
-            and out_temp < self.getting_cold
-            and in_temp < self.getting_cold
+            and in_temp < target - WINDOW_COLD_BELOW * self.unit_scale
         ):
             self.notify_app.send_notification(
-                message = f"Window near {self.friendly_name()} is open and inside temperature is {in_temp}°",
+                message = f"Window near {self.friendly_name()} is open and the inside temperature is {round(in_temp, 1)}°, target {round(target, 1)}°",
                 message_title = "Window open",
                 message_recipient = self.recipients,
                 also_if_not_home = False
@@ -1718,6 +1730,7 @@ class Heater:
             room_tau_s = cfg.get('room_tau_s'),
             recovery_h = cfg.get('recovery_hours', 2.0),
             sun_anticipation = cfg.get('sun_anticipation', True),
+            drop_hold_s = self.increase_hold.total_seconds(),
         ))
         self._setup_weather_inputs(cfg)
         self.diagnostic_sensor = cfg.get('diagnostic_sensor')
@@ -1938,7 +1951,9 @@ class Heater:
                 )
             holds = dec.temperature if dec.temperature is not None else setpoint
             mode = dec.hvac_mode or state
-            self._window_notifications(dec.diag.get('R'))
+            self._window_target = dec.diag.get('target_eff')
+            room = dec.diag.get('in_f') if dec.diag.get('in_f') is not None else dec.diag.get('R')
+            self._window_notifications(room, self._window_target)
             self._controller_screens(dec.diag.get('R'), mode)
             if dec.retry_s is not None:
                 # The change waits for the minimum time between changes: it must not depend on the next report
